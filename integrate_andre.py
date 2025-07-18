@@ -87,7 +87,11 @@ if __name__ == "__main__":
     data_label = input("Enter a label for the output files (e.g., sampleID_scanNumber): ").strip()
     
     # Load instrument YAML
-    instr_file = r'D:\APS_Rev.yml'
+    instr_file = filedialog.askopenfilename(
+        title="Select Instrument YAML File",
+        filetypes=[("YAML files", "*.yaml"), ("All files", "*.*")]
+    )
+    
 
     with open(instr_file, 'r') as f:
         instr_cfg = yaml.safe_load(f)
