@@ -14,16 +14,22 @@ from hexrd.projections.polar import PolarView
 "Define Integration Script"
 Data = [] 
 def integrate_em(Tiff_fold, output_folder, data_label, instr):  #Inputs of Tiff Folder, The Output Folder, And User Given Data Label, Load yaml Instrument file
-    tifs = sorted([f for f in os.listdir(Tiff_fold) if f.lower().endswith(('.tiff','.tif'))]) # Sorts through Given Tiff Folder and finds Tiff and tif files 
-    image_stack = [] # preallocate image_stack of tiff images 
-    for fname in tiff: 
-        img = tiff.imread(os.path.join(tifs, fname)) #pulls tiff files out of folder  
-        image_stack.append(img)
-        image_stack = np.array(image_stack) #Creates array of all tiff files (Z,X,Y) Z is frame number XY are the image pixel values of each diffraction immage
-        images = image_stack() 
-        nframes = np.shape(image_stack[0]) 
-
-        # Setup for polar remap
+        tifs = sorted([f for f in os.listdir(Tiff_fold) if f.lower().endswith(('.tiff','.tif'))])
+        if not tifs:
+            raise ValueError("No TIFF files found in the folder.")
+        # Read the first image to get the shape
+        first_img = tiff.imread(os.path.join(Tiff_fold, tifs[0]))
+        image_shape = first_img.shape
+        image_stack = np.empty((len(tifs), *image_shape), dtype=first_img.dtype)
+        image_stack[0] = first_img
+        for i, fname in enumerate(tifs[1:], start=1):
+            img = tiff.imread(os.path.join(Tiff_fold, fname))
+            image_stack[i] = img
+            print(f"Loaded {fname} with shape {img.shape}")
+        images = image_stack
+        nframes = images.shape[0]
+        print(f"Number of frames: {nframes}")
+                # Setup for polar remap
         tth_min = 1.         # HEXRD variables TTH is the theta range that it will create the polar mapp of. ETA is the range of ring that will be anaylized 0-360
         tth_max = 24.
         eta_min = -180.
@@ -34,7 +40,7 @@ def integrate_em(Tiff_fold, output_folder, data_label, instr):  #Inputs of Tiff 
         imsd = dict.fromkeys(det_keys)
 
         pv = PolarView(                  
-            np.r_[tth_min, tth_max], instr,                     # Using Defined HEXRD variables and given instrument file this block sets up the polor view
+            np.r_[tth_min, tth_max], instr,                     
             eta_min, eta_max,
             pixel_size=(tth_stats[1]/ndiv, eta_stats[1]/ndiv),
             cache_coordinate_map=True
@@ -46,10 +52,16 @@ def integrate_em(Tiff_fold, output_folder, data_label, instr):  #Inputs of Tiff 
             image_1 = images[i]
             image_1 = np.ma.masked_where(image_1 == (2**32 - 1), image_1)
 
+            # Assign the image to the correct detector key
+            # If you have only one detector, this works:
+            for det_key in det_keys:
+                imsd[det_key] = image_1
+
             pimg = pv.warp_image(imsd, pad_with_nans=True, do_interpolation=True)
 
             Int = np.array(np.ma.average(pimg, axis=0))  # 1D array
             all_int.append(Int)
+            print(f"Processed frame {i+1}/{nframes}")
 
         # Convert to 2D array: (Z = image/frame index, X = tth points)
         intensity_stack = np.array(all_int)  # shape = (nframes, len(tth))
@@ -66,7 +78,7 @@ def integrate_em(Tiff_fold, output_folder, data_label, instr):  #Inputs of Tiff 
 if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
-    Tiff_fold = filedialog.askdirectory(title="Select Folder Containing Tiff Images", filetypes=[("tiff", "*.tif")])
+    Tiff_fold = filedialog.askdirectory(title="Select Folder Containing Tiff Images")
    
     # Select output folder
     output_folder = filedialog.askdirectory(title="Select Output Folder")
