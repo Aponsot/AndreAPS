@@ -9,7 +9,7 @@ from tkinter import filedialog
 import yaml
 from hexrd import instrument 
 from hexrd.projections.polar import PolarView
-
+import concurrent.futures
 
 "Define Integration Script"
 Data = [] 
@@ -48,20 +48,24 @@ def integrate_em(Tiff_fold, output_folder, data_label, instr):  #Inputs of Tiff 
        
         all_int = []
 
-        for i in range(nframes):
-            image_1 = images[i]
+        def process_frame(image_1):
             image_1 = np.ma.masked_where(image_1 == (2**32 - 1), image_1)
-
-            # Assign the image to the correct detector key
-            # If you have only one detector, this works:
+    # Assign the image to the correct detector key
+            local_imsd = dict.fromkeys(det_keys)
             for det_key in det_keys:
-                imsd[det_key] = image_1
-
-            pimg = pv.warp_image(imsd, pad_with_nans=True, do_interpolation=True)
-
+                local_imsd[det_key] = image_1
+            pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
             Int = np.array(np.ma.average(pimg, axis=0))  # 1D array
-            all_int.append(Int)
-            print(f"Processed frame {i+1}/{nframes}")
+            return Int
+
+        all_int = []
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_frame, images[i]) for i in range(nframes)]
+            for idx, future in enumerate(concurrent.futures.as_completed(futures)):
+                all_int.append(future.result())
+                if (idx + 1) % 100 == 0 or (idx + 1) == nframes:
+                    print(f"Processed {idx + 1} of {nframes} frames (parallel)")
+
 
         # Convert to 2D array: (Z = image/frame index, X = tth points)
         intensity_stack = np.array(all_int)  # shape = (nframes, len(tth))
@@ -75,26 +79,13 @@ def integrate_em(Tiff_fold, output_folder, data_label, instr):  #Inputs of Tiff 
         full_path = os.path.join(file_name,Folder)
         np.savez(full_path, intensities=intensity_stack, tth=tth)
 #User inputs 
-if __name__ == "__main__":
-    root = tk.Tk()
-    root.withdraw()
-    Tiff_fold = filedialog.askdirectory(title="Select Folder Containing Tiff Images")
-   
-    # Select output folder
-    output_folder = filedialog.askdirectory(title="Select Output Folder")
+Tiff_fold = filedialog.askdirectory(title="Select Folder Containing Tiff Images")
+output_folder = filedialog.askdirectory(title="Select Output Folder")
+data_label = input("Enter a label for the output files (e.g., sampleID_scanNumber): ").strip()
+instr_file = filedialog.askopenfilename(title="Select Instrument YAML file", filetypes=[("YAML files", "*.yml")])
 
-    # Enter sample/scan label
-    data_label = input("Enter a label for the output files (e.g., sampleID_scanNumber): ").strip()
-    
-    # Load instrument YAML
-    instr_file = filedialog.askopenfilename(
-        title="Select Instrument YAML File",
-        filetypes=[("YAML files", "*.yaml"), ("All files", "*.*")]
-    )
-    
-
-    with open(instr_file, 'r') as f:
+with open(instr_file, 'r') as f:
         instr_cfg = yaml.safe_load(f)
-    instr = instrument.HEDMInstrument(instr_cfg)
+instr = instrument.HEDMInstrument(instr_cfg)
 #Run Integration 
 integrate_em(Tiff_fold, output_folder, data_label, instr)
