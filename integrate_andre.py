@@ -79,7 +79,7 @@ def integrate_em(Tiff_fold, output_folder, data_label, instr):  #Inputs of Tiff 
         full_path = os.path.join(file_name,Folder)
         np.savez(full_path, intensities=intensity_stack, tth=tth)
 #User inputs 
-Tiff_fold = filedialog.askdirectory(title="Select Folder Containing Tiff Images")
+Tiff_fold = filedialog.askdirectory(title="Select folder Containing the data") 
 output_folder = filedialog.askdirectory(title="Select Output Folder")
 data_label = input("Enter a label for the output files (e.g., sampleID_scanNumber): ").strip()
 instr_file = filedialog.askopenfilename(title="Select Instrument YAML file", filetypes=[("YAML files", "*.yml")])
