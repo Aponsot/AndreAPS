@@ -108,18 +108,18 @@ def integrate_em(tiff_folder, instr_file, plot=False):
                 h5file["intensity"][i, :] = intensity
                 h5file["frame_numbers"][i] = i
     if plot: 
-    	q_val = h5file["q"][:] 
-    	int_val = h5file["intensity"][:] 
-    	frames = intensity_data.shape[0]
-    	norm = int_val / inval.max(axis = 1 , keepdims=true) 
-        plt.figure(figsize=(10, 6))
-        plt.imshow(norm, aspect='auto', extent=[q_val.min(), q_val.max(), 0, frames],
-                   origin='lower', cmap='viridis')
-        plt.colorbar(label='Intensity')
-        plt.xlabel('q (1/Å)')
-        plt.ylabel('Frame Index')
-        plt.title(f"Time-Resolved Data: {experiment_name}")
-        plt.show()
+	q_val = h5file["q"][:] 
+	int_val = h5file["intensity"][:] 
+	frames = intensity_data.shape[0]
+	norm = int_val / inval.max(axis = 1 , keepdims=true) 
+	plt.figure(figsize=(10, 6))
+	plt.imshow(norm, aspect='auto', extent=[q_val.min(), q_val.max(), 0, frames],
+		   origin='lower', cmap='viridis')
+	plt.colorbar(label='Intensity')
+	plt.xlabel('q (1/Å)')
+	plt.ylabel('Frame Index')
+	plt.title(f"Time-Resolved Data: {experiment_name}")
+	plt.show()
 
     print(f"Integrated results saved to {output_file}")
 
