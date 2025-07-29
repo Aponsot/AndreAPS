@@ -55,7 +55,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
 
     # Setup for polar remap
     tth_min = 1.0
-    tth_max = 24.0
+    tth_max = 15.0
     eta_min = -180.0
     eta_max = 180.0
     ndiv = 1
@@ -71,7 +71,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     )
 
     def process_frame(image_1):
-        image_1 = np.ma.masked_where(image_1 == (2**32 - 1), image_1)
+        image_1 = np.ma.masked_where((image_1 == (2**32 - 1)) |  (image_1 <= 0), image_1) 
         local_imsd = dict.fromkeys(det_keys)
         for det_key in det_keys:
             local_imsd[det_key] = image_1
@@ -101,11 +101,16 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         h5_file.create_dataset(f"{experiment_name}/q_values", data=q_values)
     print(f"Polar integration completed. Results saved to {output_file}")
 
+    
+    int1 = intensity_stack  
+    int_max = np.max(intensity_stack) 
+    normalized = 100 * int1 / int_max	
     # Plot time-resolved data if the plot flag is set
     if plot:
+    	
         plt.figure(figsize=(10, 6))
-        plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
-                   origin='lower', cmap='viridis')
+        plt.imshow(normalized, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
+                   origin='lower', cmap='plasma')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)')
         plt.ylabel('Frame Index')
