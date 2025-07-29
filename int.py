@@ -10,7 +10,7 @@ import h5py
 import matplotlib.pyplot as plt
 
 
-def integrate_em(Tiff_fold, output_file, instr, plot=False):
+def integrate_em(Tiff_fold, instr_file, plot=False):
     """
     Perform polar integration of TIFF images and save results in HDF5 format.
 
@@ -37,7 +37,9 @@ def integrate_em(Tiff_fold, output_file, instr, plot=False):
 
     # Extract experiment name from TIFF files (common prefix)
     experiment_name = os.path.commonprefix(tifs).rstrip('_-')
-    print(f"Experiment name: {experiment_name}")
+    print(f"Experiment name: {experiment_name}") 
+    
+    output_file = os.path.join("/home/beams/PONSOT/Data" , f"{experiment_name}.h5") 
 
     first_img = tiff.imread(os.path.join(Tiff_fold, tifs[0]))
     image_shape = first_img.shape
@@ -115,21 +117,16 @@ if __name__ == "__main__":
     # Command-line argument parsing
     parser = argparse.ArgumentParser(description="Polar integration of diffraction experiments.")
     parser.add_argument("Tiff_fold", type=str, help="Path to the folder containing TIFF images.")
-    parser.add_argument("--output_file", type=str, default=None,
-                        help="Path to the output HDF5 file. Defaults to current working directory.")
     parser.add_argument("--instr_file", type=str, required=True, help="Path to the instrument YAML file.")
     parser.add_argument("--plot", action="store_true", help="Enable plotting of time-resolved data.")
 
     args = parser.parse_args()
 
-    # Set default output file if not provided
-    if args.output_file is None:
-        args.output_file = os.path.join("/home/beams/PONSOT/Data" , input("Enter Resulting Data File Name:"))
-
+  
     # Load instrument configuration
     with open(args.instr_file, 'r') as f:
         instr_cfg = yaml.safe_load(f)
     instr = instrument.HEDMInstrument(instr_cfg)
 
     # Run integration
-    integrate_em(args.Tiff_fold, args.output_file, instr, plot=args.plot)
+    integrate_em(args.Tiff_fold, args.instr_file, plot=args.plot)
