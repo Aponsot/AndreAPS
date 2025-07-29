@@ -76,9 +76,10 @@ def integrate_em(tiff_folder, instr_file, plot=False):
             image,
             npt=npt,
             unit="q_nm^-1",  # q values in nm^-1
-            radial_range=None,  # Default radial range
-            azimuth_range=None,  # Default azimuthal range
-            mask=None  # Add a mask here if needed
+            radial_range=0,10,  # Default radial range
+            azimuth_range=-none,  # Default azimuthal range
+            mask=np.zeros_like(sam , dtype =bool) 
+            mask{sam <threshold] = true  # Add a mask here if needed
         )
 
         q = result.radial  # q values (nm^-1)
@@ -87,6 +88,7 @@ def integrate_em(tiff_folder, instr_file, plot=False):
         
         return q, intensity
     sam = images[0] 
+    print(ai)
     q, intensity = process_frame(sam) 
     print(f"sample int res") 
     print(f"q range: {q.min()} to {q.max()}")
