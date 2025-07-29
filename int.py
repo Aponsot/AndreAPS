@@ -21,7 +21,7 @@ def integrate_em(Tiff_fold, output_file, instr, plot=False):
     - plot: Boolean flag to enable plotting of time-resolved data.
     """
     # Extract energy from the instrument configuration
-    energy = instr.beam.energy  # Energy in keV
+    energy = 61.335  # Energy in keV
     h = 4.135667696e-18  # Planck's constant in keV·s
     c = 2.99792458e10  # Speed of light in cm/s
     wavelength = h * c / energy  # Wavelength in cm
@@ -124,7 +124,7 @@ if __name__ == "__main__":
 
     # Set default output file if not provided
     if args.output_file is None:
-        args.output_file = os.path.join(os.getcwd(), "polar_integration_results.h5")
+        args.output_file = os.path.join("/home/beams/PONSOT/Data" , input("Enter Resulting Data File Name:"))
 
     # Load instrument configuration
     with open(args.instr_file, 'r') as f:
