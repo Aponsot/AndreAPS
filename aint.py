@@ -1,15 +1,17 @@
 import argparse
-import os
-import h5py
-import yaml
-from hexrd import instrument
-from concurrent.futures import ProcessPoolExecutor
-import numpy as np
-import tifffile as tiff
-import pyFAI
-import matplotlib.pyplot as plt
 
 def integrate_em(tiff_folder, instr_file, plot=False):
+    
+    import os
+    import h5py
+    import yaml
+    from hexrd import instrument
+    from concurrent.futures import ProcessPoolExecutor
+    import numpy as np
+    import tifffile as tiff
+    import pyFAI
+    import matplotlib.pyplot as plt
+
     # Load instrument configuration
     with open(instr_file, 'r') as f:
         instr_cfg = yaml.safe_load(f)
@@ -18,7 +20,9 @@ def integrate_em(tiff_folder, instr_file, plot=False):
     # Extract instrument parameters
     detector_distance = instr_cfg["detectors"]["detector_1"]["transform"]["translation"][2]  # in meters
     pixel_size = instr_cfg["detectors"]["detector_1"]["pixels"]["size"]  # [pixel_size_x, pixel_size_y] in meters
-    beam_center = instr_cfg["detectors"]["detector_1"]["pixels"]["center"]
+    cols = instr_cfg["detectors"]["detector_1"]["pixels"]["columns"]
+    rows = instr_cfg["detectors"]["detector_1"]["pixels"]["rows"] 
+    beam_center = np.array([cols / 2, rows / 2])  
     energy = instr_cfg["beam"]["energy"]  # Energy in keV
 
     # Calculate wavelength in meters
@@ -32,11 +36,12 @@ def integrate_em(tiff_folder, instr_file, plot=False):
     ai.set_pixel1(pixel_size[1])  # Pixel size in the vertical direction (meters)
     ai.set_pixel2(pixel_size[0])  # Pixel size in the horizontal direction (meters)
     ai.set_wavelength(wavelength_m)  # Wavelength in meters
-    ai.set_distance(detector_distance)  # Detector distance in meters
-    ai.set_center(beam_center[0], beam_center[1])  # Beam center (x, y) in pixels
+    ai.dist = detector_distance  # Detector distance in meters
+    ai.poni1 = beam_center[1] * pixel_size[1] 
+    ai.poni2 = beam_center[0] * pixel_size[0] 
+    
 
-    # Optional: Visualize the geometry
-    ai.plot_geometry()
+
 
     # Load TIFF images
     tiffs = sorted([f for f in os.listdir(tiff_folder) if f.lower().endswith(('.tiff', '.tif'))])
@@ -48,7 +53,7 @@ def integrate_em(tiff_folder, instr_file, plot=False):
     print(f"Experiment name: {experiment_name}")
 
     # Prepare output file
-    output_file = os.path.join(tiff_folder, f"{experiment_name}.h5")
+    output_file = os.path.join("/home/beams/PONSOT/Data/", f"{experiment_name}.h5")
 
     # Load images into a stack
     first_img = tiff.imread(os.path.join(tiff_folder, tiffs[0]))
@@ -93,7 +98,8 @@ def integrate_em(tiff_folder, instr_file, plot=False):
 
         # Process frames in parallel
         with ProcessPoolExecutor() as executor:
-            for i, (q, two_theta, intensity) in enumerate(executor.map(process_frame, images)):
+            results = executor.map(lambda img: process_frame(img,ai), images)
+            for i, (q, two_theta, intensity) in enumerate(executor.map(results)):
                 if i == 0:
                     # Save q and 2θ values (only need to save once, as they are the same for all frames)
                     h5file["q"][:] = q
@@ -102,8 +108,12 @@ def integrate_em(tiff_folder, instr_file, plot=False):
                 h5file["intensity"][i, :] = intensity
                 h5file["frame_numbers"][i] = i
     if plot: 
+    	q_val = h5file["q"][:] 
+    	int_val = h5file["intensity"][:] 
+    	frames = intensity_data.shape[0]
+    	norm = int_val / inval.max(axis = 1 , keepdims=true) 
         plt.figure(figsize=(10, 6))
-        plt.imshow(intensity, aspect='auto', extent=[q.min(), q.max(), 0, nframes],
+        plt.imshow(norm, aspect='auto', extent=[q_val.min(), q_val.max(), 0, frames],
                    origin='lower', cmap='viridis')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)')
@@ -113,6 +123,7 @@ def integrate_em(tiff_folder, instr_file, plot=False):
 
     print(f"Integrated results saved to {output_file}")
 
+        
 if __name__ == "__main__":
     # Command-line argument parsing
     parser = argparse.ArgumentParser(description="Polar integration of diffraction experiments.")
