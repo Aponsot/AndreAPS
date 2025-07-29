@@ -63,7 +63,7 @@ def integrate_em(tiff_folder, instr_file, plot=False):
     for i, fname in enumerate(tiffs[1:], start=1):
         img = tiff.imread(os.path.join(tiff_folder, fname))
         image_stack[i] = img
-        print(f"Loaded {fname} with shape {img.shape}")
+        
     images = image_stack
     nframes = images.shape[0]
     print(f"Number of frames: {nframes}")
@@ -83,10 +83,16 @@ def integrate_em(tiff_folder, instr_file, plot=False):
 
         q = result.radial  # q values (nm^-1)
         intensity = result.intensity  # Intensity values
-        two_theta = ai.q2twotheta(q) * (180 / np.pi)  # Convert q to 2θ in degrees
-
-        return q, two_theta, intensity
-
+        #two_theta = ai.q2twotheta(q) * (180 / np.pi)  # Convert q to 2θ in degrees
+        
+        return q, intensity
+    sam = images[0] 
+    q, intensity = process_frame(sam) 
+    print(f"sample int res") 
+    print(f"q range: {q.min()} to {q.max()}")
+    print(f"int range: {intensity.min()} tp {intensity.max()}") 
+    
+    
     # Process frames in parallel and save results to HDF5
     with h5py.File(output_file, "w") as h5file:
         # Create datasets for q, 2θ, intensity, and frame numbers
@@ -98,8 +104,8 @@ def integrate_em(tiff_folder, instr_file, plot=False):
 
         # Process frames in parallel
         with ProcessPoolExecutor() as executor:
-            results = executor.map(lambda img: process_frame(img,ai), images)
-            for i, (q, two_theta, intensity) in enumerate(executor.map(results)):
+            results = executor.map(lambda img: process_frame(img), images)
+            for i, (q, intensity) in enumerate(executor.map(results)):
                 if i == 0:
                     # Save q and 2θ values (only need to save once, as they are the same for all frames)
                     h5file["q"][:] = q
@@ -107,21 +113,24 @@ def integrate_em(tiff_folder, instr_file, plot=False):
                 # Save intensity and frame number for the current frame
                 h5file["intensity"][i, :] = intensity
                 h5file["frame_numbers"][i] = i
-    if plot: 
-	q_val = h5file["q"][:] 
-	int_val = h5file["intensity"][:] 
-	frames = intensity_data.shape[0]
-	norm = int_val / inval.max(axis = 1 , keepdims=true) 
-	plt.figure(figsize=(10, 6))
-	plt.imshow(norm, aspect='auto', extent=[q_val.min(), q_val.max(), 0, frames],
-		   origin='lower', cmap='viridis')
-	plt.colorbar(label='Intensity')
-	plt.xlabel('q (1/Å)')
-	plt.ylabel('Frame Index')
-	plt.title(f"Time-Resolved Data: {experiment_name}")
-	plt.show()
-
     print(f"Integrated results saved to {output_file}")
+    
+    if plot:
+    	with h5py.File(output_file, "r") as h5file: 
+            q_val = h5file["q"][:] 
+            int_val = h5file["intensity"][:] 
+            frames = int_val.shape[0]
+           
+            plt.figure(figsize=(10, 6))
+            plt.imshow(int_val, aspect='auto', extent=[q_val.min(), q_val.max(), 0, frames],
+                    origin='lower', cmap='viridis')
+            plt.colorbar(label='Intensity')
+            plt.xlabel('q (1/Å)')
+            plt.ylabel('Frame Index')
+            plt.title(f"Time-Resolved Data: {experiment_name}")
+            plt.show()
+
+ 
 
         
 if __name__ == "__main__":
