@@ -13,7 +13,7 @@ def load_hdf5_data(h5_file,frame):
         data = int_val[frame]
 
     # Estimate background using a Gaussian filter
-    sigma = 10  # Adjust sigma as needed for your data
+    sigma = 10000  # Adjust sigma as needed for your data
     background = gaussian_filter1d(data, sigma=sigma)
 
     # Subtract background
@@ -33,7 +33,7 @@ def load_hdf5_data(h5_file,frame):
         plt.show()
 
     # Find peaks on background-subtracted data
-    prominence = 0.1
+    prominence = 5
     peaks = signal.find_peaks(data_bg_sub, prominence=prominence)[0]
     print(f"Found {len(peaks)} peaks in frame {frame} after background subtraction.")
     print(f"Peak indices: {peaks}")
