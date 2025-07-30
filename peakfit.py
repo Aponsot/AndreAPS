@@ -1,19 +1,31 @@
 import numpy as np
 import h5py
-import matplotlib.pyplot as ax
+import matplotlib.pyplot as plt
 import hexrd
 import hexrd.fitting.fitpeak as fitpeak
+import scipy.signal as signal
 
 def load_hdf5_data(h5_file,frame):
     """Load data from an HDF5 file."""
     with h5py.File(h5_file, "r") as f:
-        int_val = f["intensity_stack"][:]
+        int_val = f["int"][:]
         print(f'Number of frames in intensity stack: {int_val.shape[0]}')
         data = int_val[frame]
-    ax.plot(data)
-    ax.xlabel('q (1/A)')
-    ax.ylabel('Intensity')
-    ax.title('1D Intensity vs q')
+   
+    prominence = 0.05
+    peaks = signal.find_peaks(data, prominence=prominence)[0]
+    print(f"Found {len(peaks)} peaks in frame {frame}.")
+    print(f"Peak indices: {peaks}")
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(data, label=f"Frame {frame}")
+    plt.scatter(peaks, data[peaks], color='red', label='Peaks')
+    plt.title(f"Peak Detection in Frame {frame}")
+    plt.xlabel('q (1/Å)')
+    plt.ylabel('Intensity')
+    plt.legend()
+    plt.show()
+
 
 if __name__ == "__main__":
     import argparse
@@ -25,4 +37,5 @@ if __name__ == "__main__":
     h5_file = args.h5_file
     frame = args.Frame
     
+load_hdf5_data(h5_file, frame)
    
