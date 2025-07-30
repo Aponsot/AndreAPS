@@ -9,15 +9,13 @@ import concurrent.futures
 import h5py
 import matplotlib.pyplot as plt
 
-
-def integrate_em(Tiff_fold, instr_file, plot=False):
+def integrate_em(Tiff_fold, instr, plot=False):
     """
     Perform polar integration of TIFF images and save results in HDF5 format.
 
     Parameters:
     - Tiff_fold: Path to the folder containing TIFF images.
-    - output_file: Path to the output HDF5 file.
-    - instr: HEXRD instrument configuration.
+    - instr_file: Path to the instrument YAML file.
     - plot: Boolean flag to enable plotting of time-resolved data.
     """
     # Extract energy from the instrument configuration
@@ -39,7 +37,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     experiment_name = os.path.commonprefix(tifs).rstrip('_-')
     print(f"Experiment name: {experiment_name}") 
     
-    output_file = os.path.join("/home/beams/PONSOT/Data" , f"{experiment_name}.h5") 
+    output_file = os.path.join("/home/beams/PONSOT/Data", f"{experiment_name}.h5") 
 
     first_img = tiff.imread(os.path.join(Tiff_fold, tifs[0]))
     image_shape = first_img.shape
@@ -71,13 +69,21 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     )
 
     def process_frame(image_1):
-        image_1 = np.ma.masked_where((image_1 == (2**32 - 1)) |  (image_1 <= 0), image_1) 
+        # Mask invalid pixels
+        image_1 = np.ma.masked_where((image_1 == (2**32 - 1)) | (image_1 <= 0), image_1)
+        
+        # Initialize local detector images
         local_imsd = dict.fromkeys(det_keys)
         for det_key in det_keys:
             local_imsd[det_key] = image_1
+        
+        # Perform polar remapping
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
-        Int = np.array(np.ma.average(pimg, axis=0))  # 1D array
-        return Int
+        
+        # Radial integration: average over eta (azimuthal direction)
+        radial_intensity = np.nanmean(pimg, axis=0)  # 1D array of intensity vs. tth
+        
+        return radial_intensity
 
     all_int = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -101,13 +107,11 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         h5_file.create_dataset(f"{experiment_name}/q_values", data=q_values)
     print(f"Polar integration completed. Results saved to {output_file}")
 
-    
     int1 = intensity_stack  
     int_max = np.max(intensity_stack) 
     normalized = 100 * int1 / int_max	
     # Plot time-resolved data if the plot flag is set
     if plot:
-    	
         plt.figure(figsize=(10, 6))
         plt.imshow(normalized, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
                    origin='lower', cmap='plasma')
@@ -116,7 +120,6 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         plt.ylabel('Frame Index')
         plt.title(f"Time-Resolved Data: {experiment_name}")
         plt.show()
-
 
 if __name__ == "__main__":
     # Command-line argument parsing
