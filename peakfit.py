@@ -20,25 +20,20 @@ def load_hdf5_data(h5_file,frame):
     data_bg_sub = data - background
 
     # Plotting function
-    def plot_function_peak_positions(data, peaks, title):
+    def plot_function_peak_positions(data, peaks, title, background=None):
         plt.figure(figsize=(10, 6))
         plt.plot(data, label='Intensity Data')
-        
+        if background is not None:
+            plt.plot(background, label='Estimated Background', color='orange', linestyle='--')
         for peak in peaks:
             plt.axvline(x=peak, color='r', linestyle='--', alpha=0.7)
-        plt.plot(peaks, data[peaks],"x", label="Detected Peaks")
+        plt.plot(peaks, data[peaks], "x", label="Detected Peaks")
         plt.title(title)
         plt.xlabel('q (1/Å)')
         plt.ylabel('Intensity')
         plt.legend()
         plt.show()
-        for background in background:
-            plt.axhline(y=background, color='g', linestyle='--', alpha=0.5, label='Background')
-        plt.plot(data_bg_sub, label='Background-Subtracted Data', color='orange')
-        plt.xlabel('q (1/Å)')
-        plt.ylabel('Intensity')
-        plt.legend()
-        plt.show()
+        
 
 
     # Find peaks on background-subtracted data
