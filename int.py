@@ -9,7 +9,7 @@ import concurrent.futures
 import h5py
 import matplotlib.pyplot as plt
 
-def integrate_em(Tiff_fold, instr, plot=False):
+def integrate_em(Tiff_fold, instr_file, plot=False):
     """
     Perform polar integration of TIFF images and save results in HDF5 format.
 
@@ -25,8 +25,7 @@ def integrate_em(Tiff_fold, instr, plot=False):
     wavelength = h * c / energy  # Wavelength in cm
     wavelength *= 1e8  # Convert to angstroms
 
-    print(f"Beam energy: {energy} keV")
-    print(f"Calculated wavelength: {wavelength:.6f} Å")
+
 
     # Load TIFF images
     tifs = sorted([f for f in os.listdir(Tiff_fold) if f.lower().endswith(('.tiff', '.tif'))])
@@ -35,9 +34,9 @@ def integrate_em(Tiff_fold, instr, plot=False):
 
     # Extract experiment name from TIFF files (common prefix)
     experiment_name = os.path.commonprefix(tifs).rstrip('_-')
-    print(f"Experiment name: {experiment_name}") 
+   
     
-    output_file = os.path.join("/home/beams/PONSOT/Data", f"{experiment_name}.h5") 
+    output_file = os.path.join("/home/beams/PONSOT/Data/h5", f"{experiment_name}.h5") 
 
     first_img = tiff.imread(os.path.join(Tiff_fold, tifs[0]))
     image_shape = first_img.shape
@@ -46,7 +45,6 @@ def integrate_em(Tiff_fold, instr, plot=False):
     for i, fname in enumerate(tifs[1:], start=1):
         img = tiff.imread(os.path.join(Tiff_fold, fname))
         image_stack[i] = img
-        print(f"Loaded {fname} with shape {img.shape}")
     images = image_stack
     nframes = images.shape[0]
     print(f"Number of frames: {nframes}")
@@ -79,8 +77,9 @@ def integrate_em(Tiff_fold, instr, plot=False):
         
         # Perform polar remapping
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
+        Int = np.array(np.ma.average(pimg, axis = 0))
         
-        return pimg
+        return Int 
 
     all_int = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -100,19 +99,24 @@ def integrate_em(Tiff_fold, instr, plot=False):
     # Save data to HDF5 format
     with h5py.File(output_file, 'w') as h5_file:
         h5_file.create_dataset(f"int", data=intensity_stack)
-        h5_file.create_dataset(f"tth", data=tth)
-        h5_file.create_dataset(f"q_", data=q_values)
-        h5_file.create_dataset(f"nframes", data=nframes)
+      
+        h5_file.attrs["q_values"] =q_values
+        
+        h5_file.attrs["nframes"] = nframes
+   
     print(f"Polar integration completed. Results saved to {output_file}")
 
+    
+    
     int1 = intensity_stack  
     int_max = np.max(intensity_stack) 
-    normalized = 100 * int1 / int_max	
+    normalized = 15 * int1 / int_max	
+     
     # Plot time-resolved data if the plot flag is set
     if plot:
         plt.figure(figsize=(10, 6))
         plt.imshow(normalized, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
-                   origin='lower', cmap='plasma')
+                   origin='lower', cmap='jet')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)')
         plt.ylabel('Frame Index')
