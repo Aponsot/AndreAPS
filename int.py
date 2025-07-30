@@ -80,10 +80,7 @@ def integrate_em(Tiff_fold, instr, plot=False):
         # Perform polar remapping
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
         
-        # Radial integration: average over eta (azimuthal direction)
-        radial_intensity = np.nanmean(pimg, axis=0)  # 1D array of intensity vs. tth
-        
-        return radial_intensity
+        return pimg
 
     all_int = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -102,9 +99,10 @@ def integrate_em(Tiff_fold, instr, plot=False):
 
     # Save data to HDF5 format
     with h5py.File(output_file, 'w') as h5_file:
-        h5_file.create_dataset(f"{experiment_name}/intensities", data=intensity_stack)
-        h5_file.create_dataset(f"{experiment_name}/tth", data=tth)
-        h5_file.create_dataset(f"{experiment_name}/q_values", data=q_values)
+        h5_file.create_dataset(f"int", data=intensity_stack)
+        h5_file.create_dataset(f"tth", data=tth)
+        h5_file.create_dataset(f"q_", data=q_values)
+        h5_file.create_dataset(f"nframes", data=nframes)
     print(f"Polar integration completed. Results saved to {output_file}")
 
     int1 = intensity_stack  
