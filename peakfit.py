@@ -23,19 +23,18 @@ def load_hdf5_data(h5_file,frame):
     def plot_function_peak_positions(data, peaks, title):
         plt.figure(figsize=(10, 6))
         plt.plot(data, label='Intensity Data')
+        
         for peak in peaks:
             plt.axvline(x=peak, color='r', linestyle='--', alpha=0.7)
-        plt.plot(peaks, data[peaks], "x", label="Detected Peaks")
+        plt.plot(peaks, data[peaks],"x", label="Detected Peaks")
         plt.title(title)
         plt.xlabel('q (1/Å)')
         plt.ylabel('Intensity')
         plt.legend()
         plt.show()
-        plt.figure(figsize=(10, 6))
-        plt.plot(data, label='Original Data')
-        plt.plot(background, label='Estimated Background', linestyle='--')
-        plt.plot(data_bg_sub, label='Background-Subtracted Data')
-        plt.title('Background Subtraction')
+        for background in background:
+            plt.axhline(y=background, color='g', linestyle='--', alpha=0.5, label='Background')
+        plt.plot(data_bg_sub, label='Background-Subtracted Data', color='orange')
         plt.xlabel('q (1/Å)')
         plt.ylabel('Intensity')
         plt.legend()
