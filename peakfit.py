@@ -18,8 +18,9 @@ def load_hdf5_data(h5_file,frame):
     print(f"Peak indices: {peaks}")
     
     plt.figure(figsize=(10, 6))
-    plt.plot(data, label=f"Frame {frame}")
-    plt.scatter(peaks, data[peaks], color='red', label='Peaks')
+    plt.plot(data, label='Intensity Data')
+    plt.overlay_peaks = fitpeak.OverlayPeaks(peaks, data, prominence=prominence)
+    plt.plot(peaks, data[peaks], "x", label="Detected Peaks")
     plt.title(f"Peak Detection in Frame {frame}")
     plt.xlabel('q (1/Å)')
     plt.ylabel('Intensity')
