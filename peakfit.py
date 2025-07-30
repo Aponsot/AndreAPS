@@ -31,6 +31,16 @@ def load_hdf5_data(h5_file,frame):
         plt.ylabel('Intensity')
         plt.legend()
         plt.show()
+        plt.figure(figsize=(10, 6))
+        plt.plot(data, label='Original Data')
+        plt.plot(background, label='Estimated Background', linestyle='--')
+        plt.plot(data_bg_sub, label='Background-Subtracted Data')
+        plt.title('Background Subtraction')
+        plt.xlabel('q (1/Å)')
+        plt.ylabel('Intensity')
+        plt.legend()
+        plt.show()
+
 
     # Find peaks on background-subtracted data
     prominence = 5
