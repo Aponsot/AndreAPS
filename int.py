@@ -10,7 +10,6 @@ import h5py
 import matplotlib.pyplot as plt
 
 
-
 def integrate_em(Tiff_fold, instr_file, plot=False):
     """
     Perform polar integration of TIFF images and save results in HDF5 format.
@@ -95,8 +94,8 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         return spot_mask
 
     from scipy.ndimage import median_filter
-
-    def mask_background(image, fluctuation_values, tolerance=0.1):
+  # Example fluctuation values for background masking
+    def mask_background(image, fluctuation_values = [0.0,1.0,2.0], tolerance=0.1):
         """
         Mask the background based on known fluctuation values.
 
@@ -118,7 +117,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         return masked_image
 
 
-    def process_frame(image_1, fluctuation_values, tolerance=0.1):
+    def process_frame(image_1, fluctuation_values = [0.0,1.0,2.0], tolerance=0.1):
         """
         Process a single frame for polar integration with improved background masking.
 
@@ -158,7 +157,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         return Int
 
     all_int = []
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor() as executor:  # Use the global fluctuation values
         futures = [executor.submit(process_frame, images[i]) for i in range(nframes)]
         for idx, future in enumerate(concurrent.futures.as_completed(futures)):
             all_int.append(future.result())
