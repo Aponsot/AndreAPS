@@ -91,8 +91,8 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
             if cluster_label != -1:  # Ignore noise points
                 cluster_coords = coords[clustering.labels_ == cluster_label]
                 spot_mask[cluster_coords[:, 0], cluster_coords[:, 1]] = True
+        return spot_mask
 
-    return spot_mask
     def process_frame(image_1):
         """
         Process a single frame for polar integration with spot detection.
