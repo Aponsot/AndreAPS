@@ -50,7 +50,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
 
     # Setup for polar remap
     tth_min = 1.0
-    tth_max = 11
+    tth_max = 14.0
     eta_min = -180.0
     eta_max = 180.0
     ndiv = 1
@@ -144,11 +144,14 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
 
         # Apply spot mask
         image_1_masked = np.ma.masked_where(~spot_mask, image_1)
-        threshold = 0.6  # Example threshold (adjust as needed)
-        inflate_factor = 10  # Factor to inflate high intensities
+        threshold = 0.7  # Example threshold (adjust as needed)
+        inflate_factor = 20  # Factor to inflate high intensities
+        sat_control = 15
 
         # Apply inflation only to values above the threshold
         image_1_masked = np.where(image_1_masked > threshold, image_1_masked * inflate_factor, image_1_masked)
+        image_1_masked = np.where(image_1_masked <= threshold, image_1_masked * 0, image_1_masked) 
+
         # Initialize local detector images
         local_imsd = dict.fromkeys(det_keys)
         for det_key in det_keys:
@@ -190,8 +193,8 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
                    origin='lower', cmap='jet')
         plt.colorbar(label='Intensity')
-        plt.xlabel('q (1/Å)')
-        plt.ylabel('Frame Index')
+        plt.xlabel('q (1/Å)', fontsize = 16)
+        plt.ylabel('Frame Index', fontsize = 16)
         plt.title(f"Time-Resolved Data: {experiment_name}")
         plt.show()
 
