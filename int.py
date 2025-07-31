@@ -75,7 +75,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         for det_key in det_keys:
             local_imsd[det_key] = image_1
         
-        
+        pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
         mean_intensity = np.mean(pimg)
         threshold = mean_intensity * 0.5  # Example: 50% of mean intensity
 
