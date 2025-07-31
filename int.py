@@ -144,17 +144,15 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
 
         # Apply spot mask
         image_1_masked = np.ma.masked_where(~spot_mask, image_1)
-
-        # Initialize local detector images
-        local_imsd = dict.fromkeys(det_keys)
-        for det_key in det_keys:
-            local_imsd[det_key] = image_1_masked
-        # Inflate intensity values above a certain threshold to enhance contrast
         threshold = 0.6  # Example threshold (adjust as needed)
         inflate_factor = 10  # Factor to inflate high intensities
 
         # Apply inflation only to values above the threshold
         image_1_masked = np.where(image_1_masked > threshold, image_1_masked * inflate_factor, image_1_masked)
+        # Initialize local detector images
+        local_imsd = dict.fromkeys(det_keys)
+        for det_key in det_keys:
+            local_imsd[det_key] = image_1_masked
         # Perform polar remapping
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
         Int = np.array(np.ma.average(pimg, axis=0))  # Integrate only meaningful bins
