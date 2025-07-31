@@ -25,8 +25,6 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     wavelength = h * c / energy  # Wavelength in cm
     wavelength *= 1e8  # Convert to angstroms
 
-
-
     # Load TIFF images
     tifs = sorted([f for f in os.listdir(Tiff_fold) if f.lower().endswith(('.tiff', '.tif'))])
     if not tifs:
@@ -34,8 +32,6 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
 
     # Extract experiment name from TIFF files (common prefix)
     experiment_name = os.path.commonprefix(tifs).rstrip('_-')
-   
-    
     output_file = os.path.join("/home/beams/PONSOT/Data/h5", f"{experiment_name}.h5") 
 
     first_img = tiff.imread(os.path.join(Tiff_fold, tifs[0]))
@@ -65,6 +61,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         pixel_size=(tth_stats[1] / ndiv, eta_stats[1] / ndiv),
         cache_coordinate_map=True
     )
+
     from sklearn.cluster import DBSCAN
 
     def detect_spots(image, eps=5, min_samples=3):
@@ -121,7 +118,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
         Int = np.array(np.ma.average(pimg, axis=0))  # Integrate only meaningful bins
 
-    return Int
+        return Int  # Ensure the result is returned
 
     all_int = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -141,15 +138,11 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     # Save data to HDF5 format
     with h5py.File(output_file, 'w') as h5_file:
         h5_file.create_dataset(f"int", data=intensity_stack)
-      
-        h5_file.attrs["q_values"] =q_values
-        
+        h5_file.attrs["q_values"] = q_values
         h5_file.attrs["nframes"] = nframes
    
     print(f"Polar integration completed. Results saved to {output_file}")
 
-    
-    
     int1 = intensity_stack  
     int_max = np.max(intensity_stack) 
     normalized = 15 * int1 / int_max	
@@ -164,21 +157,3 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         plt.ylabel('Frame Index')
         plt.title(f"Time-Resolved Data: {experiment_name}")
         plt.show()
-
-if __name__ == "__main__":
-    # Command-line argument parsing
-    parser = argparse.ArgumentParser(description="Polar integration of diffraction experiments.")
-    parser.add_argument("Tiff_fold", type=str, help="Path to the folder containing TIFF images.")
-    parser.add_argument("--instr_file", type=str, required=True, help="Path to the instrument YAML file.")
-    parser.add_argument("--plot", action="store_true", help="Enable plotting of time-resolved data.")
-
-    args = parser.parse_args()
-
-  
-    # Load instrument configuration
-    with open(args.instr_file, 'r') as f:
-        instr_cfg = yaml.safe_load(f)
-    instr = instrument.HEDMInstrument(instr_cfg)
-
-    # Run integration
-    integrate_em(args.Tiff_fold, args.instr_file, plot=args.plot)
