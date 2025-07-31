@@ -50,7 +50,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
 
     # Setup for polar remap
     tth_min = 1.0
-    tth_max = 15.0
+    tth_max = 11
     eta_min = -180.0
     eta_max = 180.0
     ndiv = 1
@@ -95,7 +95,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
 
     from scipy.ndimage import median_filter
   # Example fluctuation values for background masking
-    def mask_background(image, fluctuation_values = [0.0,1.0,2.0], tolerance=0.1):
+    def mask_background(image, fluctuation_values = [0.0,.5], tolerance=0.2):
         """
         Mask the background based on known fluctuation values.
 
@@ -117,7 +117,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         return masked_image
 
 
-    def process_frame(image_1, fluctuation_values = [0.0,1.0,2.0], tolerance=0.1):
+    def process_frame(image_1, fluctuation_values = [0.0,0.5], tolerance=0.2):
         """
         Process a single frame for polar integration with improved background masking.
 
@@ -179,14 +179,12 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
    
     print(f"Polar integration completed. Results saved to {output_file}")
 
-    int1 = intensity_stack  
-    int_max = np.max(intensity_stack) 
-    normalized = 15 * int1 / int_max	
+   
      
     # Plot time-resolved data if the plot flag is set
     if plot:
         plt.figure(figsize=(10, 6))
-        plt.imshow(normalized, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
+        plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
                    origin='lower', cmap='jet')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)')
