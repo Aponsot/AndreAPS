@@ -75,9 +75,13 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         for det_key in det_keys:
             local_imsd[det_key] = image_1
         
-        # Perform polar remapping
-        pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
-        Int = np.array(np.ma.average(pimg, axis = 0))
+        
+        mean_intensity = np.mean(pimg)
+        threshold = mean_intensity * 0.5  # Example: 50% of mean intensity
+
+    # Apply threshold-based binning
+        pimg_masked = np.ma.masked_where(pimg < threshold, pimg)  # Mask bins below the threshold
+        Int = np.array(np.ma.average(pimg_masked, axis=0))  # Integrate only meaningful bins
         
         return Int 
 
