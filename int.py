@@ -65,25 +65,63 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         pixel_size=(tth_stats[1] / ndiv, eta_stats[1] / ndiv),
         cache_coordinate_map=True
     )
+    from sklearn.cluster import DBSCAN
 
+    def detect_spots(image, eps=5, min_samples=3):
+        """
+        Detect spots in the image using DBSCAN clustering.
+    
+        Parameters:
+        - image: Input image (2D array).
+        - eps: Maximum distance between points to be considered a cluster.
+        - min_samples: Minimum number of points to form a cluster.
+    
+        Returns:
+        - spot_mask: Binary mask indicating detected spots.
+        """
+        # Extract coordinates of non-zero pixels
+        coords = np.column_stack(np.where(image > 0))
+    
+        # Apply DBSCAN clustering
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
+    
+        # Create a binary mask for detected spots
+        spot_mask = np.zeros_like(image, dtype=bool)
+        for cluster_label in np.unique(clustering.labels_):
+            if cluster_label != -1:  # Ignore noise points
+                cluster_coords = coords[clustering.labels_ == cluster_label]
+                spot_mask[cluster_coords[:, 0], cluster_coords[:, 1]] = True
+
+    return spot_mask
     def process_frame(image_1):
+        """
+        Process a single frame for polar integration with spot detection.
+    
+        Parameters:
+        - image_1: Input image (2D array).
+    
+        Returns:
+        - Int: Integrated intensity values for the frame.
+        """
         # Mask invalid pixels
         image_1 = np.ma.masked_where((image_1 == (2**32 - 1)) | (image_1 <= 0), image_1)
-        
+    
+        # Detect spots
+        spot_mask = detect_spots(image_1)
+    
+        # Apply spot mask
+        image_1_masked = np.ma.masked_where(~spot_mask, image_1)
+    
         # Initialize local detector images
         local_imsd = dict.fromkeys(det_keys)
         for det_key in det_keys:
-            local_imsd[det_key] = image_1
-        
+            local_imsd[det_key] = image_1_masked
+    
+        # Perform polar remapping
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
-        mean_intensity = np.mean(pimg)
-        threshold = mean_intensity * 0.5  # Example: 50% of mean intensity
+        Int = np.array(np.ma.average(pimg, axis=0))  # Integrate only meaningful bins
 
-    # Apply threshold-based binning
-        pimg_masked = np.ma.masked_where(pimg < threshold, pimg)  # Mask bins below the threshold
-        Int = np.array(np.ma.average(pimg_masked, axis=0))  # Integrate only meaningful bins
-        
-        return Int 
+    return Int
 
     all_int = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
