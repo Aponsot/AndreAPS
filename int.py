@@ -94,35 +94,68 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
                 spot_mask[cluster_coords[:, 0], cluster_coords[:, 1]] = True
         return spot_mask
 
-    def process_frame(image_1):
+    from scipy.ndimage import median_filter
+
+    def mask_background(image, fluctuation_values, tolerance=0.1):
         """
-        Process a single frame for polar integration with spot detection.
-    
+        Mask the background based on known fluctuation values.
+
+        Parameters:
+        - image: Input image (2D array).
+        - fluctuation_values: List of background values to mask.
+        - tolerance: Allowed deviation from the fluctuation values.
+
+        Returns:
+        - masked_image: Image with the background masked.
+        """
+        # Create a mask for the background
+        background_mask = np.zeros_like(image, dtype=bool)
+        for value in fluctuation_values:
+            background_mask |= (np.abs(image - value) <= tolerance)
+
+        # Mask the background
+        masked_image = np.ma.masked_where(background_mask, image)
+        return masked_image
+
+
+    def process_frame(image_1, fluctuation_values, tolerance=0.1):
+        """
+        Process a single frame for polar integration with improved background masking.
+
         Parameters:
         - image_1: Input image (2D array).
-    
+        - fluctuation_values: List of background values to mask.
+        - tolerance: Allowed deviation from the fluctuation values.
+
         Returns:
         - Int: Integrated intensity values for the frame.
         """
         # Mask invalid pixels
         image_1 = np.ma.masked_where((image_1 == (2**32 - 1)) | (image_1 <= 0), image_1)
-    
+
+        # Mask the background
+        image_1 = mask_background(image_1, fluctuation_values, tolerance=tolerance)
+
+        # Apply median filtering to estimate and subtract the background
+        background = median_filter(image_1, size=5)
+        image_1 = image_1 - background
+
         # Detect spots
         spot_mask = detect_spots(image_1)
-    
+
         # Apply spot mask
         image_1_masked = np.ma.masked_where(~spot_mask, image_1)
-    
+
         # Initialize local detector images
         local_imsd = dict.fromkeys(det_keys)
         for det_key in det_keys:
             local_imsd[det_key] = image_1_masked
-    
+
         # Perform polar remapping
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
         Int = np.array(np.ma.average(pimg, axis=0))  # Integrate only meaningful bins
 
-        return Int  # Ensure the result is returned
+        return Int
 
     all_int = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
