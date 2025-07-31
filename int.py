@@ -9,6 +9,8 @@ import concurrent.futures
 import h5py
 import matplotlib.pyplot as plt
 
+
+
 def integrate_em(Tiff_fold, instr_file, plot=False):
     """
     Perform polar integration of TIFF images and save results in HDF5 format.
@@ -24,7 +26,9 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     c = 2.99792458e10  # Speed of light in cm/s
     wavelength = h * c / energy  # Wavelength in cm
     wavelength *= 1e8  # Convert to angstroms
-
+    with open(instr_file, 'r') as f:
+        instr_cfg = yaml.safe_load(f)
+    instr = instrument.HEDMInstrument(instr_cfg)
     # Load TIFF images
     tifs = sorted([f for f in os.listdir(Tiff_fold) if f.lower().endswith(('.tiff', '.tif'))])
     if not tifs:
@@ -157,3 +161,15 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         plt.ylabel('Frame Index')
         plt.title(f"Time-Resolved Data: {experiment_name}")
         plt.show()
+
+if __name__ == "__main__":
+    # Command-line argument parsing
+    parser = argparse.ArgumentParser(description="Polar integration of diffraction experiments.")
+    parser.add_argument("Tiff_fold", type=str, help="Path to the folder containing TIFF images.")
+    parser.add_argument("--instr_file", type=str, required=True, help="Path to the instrument YAML file.")
+    parser.add_argument("--plot", action="store_true", help="Enable plotting of time-resolved data.")
+
+    args = parser.parse_args()
+    
+    # Run the integration workflow
+    integrate_em(args.Tiff_fold, args.instr_file, plot=args.plot)
