@@ -54,6 +54,8 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     eta_min = -180.0
     eta_max = 180.0
     ndiv = 1
+    cake_width = 10.0  # degrees, set your cake slice width here
+    n_cakes = int((eta_max - eta_min) / cake_width)
     tth_stats, eta_stats = np.degrees(instrument.hedm_instrument.pixel_resolution(instr))
     det_keys = instr.detectors.keys()
     imsd = dict.fromkeys(det_keys)
@@ -68,121 +70,89 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
     from sklearn.cluster import DBSCAN
 
     def detect_spots(image, eps=5, min_samples=3):
-        """
-        Detect spots in the image using DBSCAN clustering.
-    
-        Parameters:
-        - image: Input image (2D array).
-        - eps: Maximum distance between points to be considered a cluster.
-        - min_samples: Minimum number of points to form a cluster.
-    
-        Returns:
-        - spot_mask: Binary mask indicating detected spots.
-        """
-        # Extract coordinates of non-zero pixels
         coords = np.column_stack(np.where(image > 0))
-    
-        # Apply DBSCAN clustering
         clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
-    
-        # Create a binary mask for detected spots
         spot_mask = np.zeros_like(image, dtype=bool)
         for cluster_label in np.unique(clustering.labels_):
-            if cluster_label != -1:  # Ignore noise points
+            if cluster_label != -1:
                 cluster_coords = coords[clustering.labels_ == cluster_label]
                 spot_mask[cluster_coords[:, 0], cluster_coords[:, 1]] = True
         return spot_mask
 
     from scipy.ndimage import median_filter
-  # Example fluctuation values for background masking
-    def mask_background(image, fluctuation_values = [0.0,.5], tolerance=0.2):
-        """
-        Mask the background based on known fluctuation values.
-
-        Parameters:
-        - image: Input image (2D array).
-        - fluctuation_values: List of background values to mask.
-        - tolerance: Allowed deviation from the fluctuation values.
-
-        Returns:
-        - masked_image: Image with the background masked.
-        """
-        # Create a mask for the background
+    def mask_background(image, fluctuation_values=[0.0, .5], tolerance=0.2):
         background_mask = np.zeros_like(image, dtype=bool)
         for value in fluctuation_values:
             background_mask |= (np.abs(image - value) <= tolerance)
-
-        # Mask the background
         masked_image = np.ma.masked_where(background_mask, image)
         return masked_image
 
-
-    def process_frame(image_1, fluctuation_values = [0.0,0.5], tolerance=0.2):
-        """
-        Process a single frame for polar integration with improved background masking.
-
-        Parameters:
-        - image_1: Input image (2D array).
-        - fluctuation_values: List of background values to mask.
-        - tolerance: Allowed deviation from the fluctuation values.
-
-        Returns:
-        - Int: Integrated intensity values for the frame.
-        """
-        # Mask invalid pixels
+    def process_frame(image_1, fluctuation_values=[0.0, 0.5], tolerance=0.2, cake_slices=None):
         image_1 = np.ma.masked_where((image_1 == (2**32 - 1)) | (image_1 <= 0), image_1)
-
-        # Mask the background
         image_1 = mask_background(image_1, fluctuation_values, tolerance=tolerance)
-
-        # Apply median filtering to estimate and subtract the background
         background = median_filter(image_1, size=5)
         image_1 = image_1 - background
-
-        # Detect spots
         spot_mask = detect_spots(image_1)
-
-        # Apply spot mask
         image_1_masked = np.ma.masked_where(~spot_mask, image_1)
-        threshold = 0.7  # Example threshold (adjust as needed)
-        inflate_factor = 20  # Factor to inflate high intensities
-        sat_control = 15
-
-        # Apply inflation only to values above the threshold
+        threshold = 0.7
+        inflate_factor = 20
         image_1_masked = np.where(image_1_masked > threshold, image_1_masked * inflate_factor, image_1_masked)
-        image_1_masked = np.where(image_1_masked <= threshold, image_1_masked * 0, image_1_masked) 
-
-        # Initialize local detector images
+        image_1_masked = np.where(image_1_masked <= threshold, image_1_masked * 0, image_1_masked)
         local_imsd = dict.fromkeys(det_keys)
         for det_key in det_keys:
             local_imsd[det_key] = image_1_masked
-        # Perform polar remapping
         pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
-        Int = np.array(np.ma.average(pimg, axis=0))  # Integrate only meaningful bins
+        # Integrate over all eta (azimuth) as before
+        Int = np.array(np.ma.average(pimg, axis=0))
+        # If cake_slices is provided, bin by cake slices
+        cake_intensities = None
+        if cake_slices is not None:
+            cake_intensities = []
+            eta_axis = np.linspace(pv.eta_min, pv.eta_max, pimg.shape[0]) * 180 / np.pi
+            for eta_start, eta_end in cake_slices:
+                mask = (eta_axis >= eta_start) & (eta_axis < eta_end)
+                # Average only over the eta slice
+                cake_int = np.array(np.ma.average(pimg[mask, :], axis=0))
+                cake_intensities.append(cake_int)
+        return Int, cake_intensities
 
-        return Int
+    # Prepare cake slices
+    cake_slices = []
+    for i in range(n_cakes):
+        eta_start = eta_min + i * cake_width
+        eta_end = eta_start + cake_width
+        cake_slices.append((eta_start, eta_end))
 
     all_int = []
-    with concurrent.futures.ThreadPoolExecutor() as executor:  # Use the global fluctuation values
-        futures = [executor.submit(process_frame, images[i]) for i in range(nframes)]
+    all_cake_int = []
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(process_frame, images[i], cake_slices=cake_slices) for i in range(nframes)]
         for idx, future in enumerate(concurrent.futures.as_completed(futures)):
-            all_int.append(future.result())
+            Int, cake_intensities = future.result()
+            all_int.append(Int)
+            if cake_intensities is not None:
+                all_cake_int.append(cake_intensities)
             if (idx + 1) % 100 == 0 or (idx + 1) == nframes:
                 print(f"Processed {idx + 1} of {nframes} frames (parallel)")
 
-    # Convert to 2D array: (Z = image/frame index, X = tth points)
     intensity_stack = np.array(all_int)
+    # If cake integration was performed, stack cakes: shape (nframes, n_cakes, tth)
+    if all_cake_int:
+        cake_intensity_stack = np.array(all_cake_int)  # shape: (nframes, n_cakes, tth)
+    else:
+        cake_intensity_stack = None
 
-    # Compute tth and q values
     tth = np.linspace(pv.tth_min, pv.tth_max, pv.shape[1]) * 180 / np.pi
     q_values = (4 * np.pi * np.sin(np.radians(tth / 2))) / wavelength
 
     # Save data to HDF5 format
     with h5py.File(output_file, 'w') as h5_file:
-        h5_file.create_dataset(f"int", data=intensity_stack)
-        h5_file.attrs["q_values"] = q_values
+        h5_file.create_dataset("int", data=intensity_stack)  # shape: (nframes, tth)
+        h5_file.create_dataset("q", data=q_values)           # shape: (tth,)
         h5_file.attrs["nframes"] = nframes
-   
+        if cake_intensity_stack is not None:
+            h5_file.create_dataset("cake_int", data=cake_intensity_stack)  # shape: (nframes, n_cakes, tth)
+            h5_file.create_dataset("cake_eta_ranges", data=np.array(cake_slices))  # shape: (n_cakes, 2)
     print(f"Polar integration completed. Results saved to {output_file}")
 
    
