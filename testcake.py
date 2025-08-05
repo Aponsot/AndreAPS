@@ -2,11 +2,7 @@ import h5py
 import argparse 
 import matplotlib.pyplot as plt
 import numpy as np
-with h5py.File("input_file", 'w') as f: 
-    print(f"Intensity stack shape: {f['int'].shape}")
-    print(f"q values: {f['q'][:]}")
-    print(f"cake intensity stack shape: {f['cake_int'].shape if 'cake_int' in f else 'Not available'}")
-    print(f"cake eta ranges: {f['cake_eta_ranges'][:] if 'cake_eta_ranges' in f else 'Not available'}") 
+
 
 def test_cake(input_file, frame_number, cake_slice):
     with h5py.File(input_file, 'r') as f:
@@ -40,8 +36,8 @@ def test_cake(input_file, frame_number, cake_slice):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import h5 file and display its contents")
     parser.add_argument("input_file", type=str, help="Input file containing 2D diffraction data.") 
-    parser.add_argument("frame number", type=int ,  help="Frame number to process (0-indexed).")
-    parser.add_argument("cake slice", type=int, help="cake slice to investigate.")
+    parser.add_argument("frame_number", type=int ,  help="Frame number to process (0-indexed).")
+    parser.add_argument("cake_slice", type=int, help="cake slice to investigate.")
     args = parser.parse_args()
 
     input_file = args.input_file
@@ -52,4 +48,4 @@ if __name__ == "__main__":
     # Load the 2D diffraction data (this part is assumed to be implemented)
     # intensity_stack, q_values, nframes, cake_intensity_stack, cake_slices = load_data(input_file)
     
-    
+test_cake(input_file, frame_number, cake_slice) 
