@@ -26,7 +26,7 @@ def peak_fit(h5, frame_number,peak_pos):
         if cake_data is not None:
             poly_model = PolynomialModel(degree=1)
             gauss_model = GaussianModel()
-            combined_model = gauss_model + poly_model
+            model = gauss_model + poly_model
             params = model.make_params(
                 center=peak_pos,  # Adjust this to a more accurate guess
                 sigma=1,  # Start with a smaller sigma for narrow peaks
@@ -34,7 +34,7 @@ def peak_fit(h5, frame_number,peak_pos):
                 c0=np.mean(cake_data),  # Background intercept as the mean intensity
                 c1=0  # Assume a flat background initially
             )
-            result_cake = combined_model.fit(cake_data, params, x=q)
+            result_cake = model.fit(cake_data, params, x=q)
             axes[i, 0].plot(q, cake_data, 'b.', label='Cake Slice Data')
             axes[i, 0].plot(q, result_cake.best_fit, 'r-', label='Fit')
             axes[i, 0].set_title(f'Cake Slice {cs}')
@@ -54,7 +54,7 @@ def peak_fit(h5, frame_number,peak_pos):
             c0=np.mean(int_val),  # Background intercept as the mean intensity
             c1=0  # Assume a flat background initially
         )
-        result_full = combined_model.fit(intensity_data, params, x=q)
+        result_full = model.fit(intensity_data, params, x=q)
         axes[i, 1].plot(q, intensity_data, 'g.', label='Full Azimuthal Data')
         axes[i, 1].plot(q, result_full.best_fit, 'r-', label='Fit')
         axes[i, 1].set_title('Full Azimuthal')
