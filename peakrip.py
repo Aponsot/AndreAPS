@@ -1,3 +1,4 @@
+
 import numpy as np
 import h5py
 import argparse
@@ -31,10 +32,12 @@ def peakrip(h5, peak_pos, window=0.1):
             background_full = gaussian_filter1d(int_val_mask, sigma=sigma)
             data_bg_sub_full = int_val_mask - background_full
             peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= prominence) 
-            peak_positions.append(peaks_full)  
-        
+            peak_positions.append(cs,peaks_full)  
+
+            frame_number = peak_positions[-1][0]
+            peak_indices = peak_positions[-1][1]
             plt.figure(figsize=(8, 5))
-            plt.scatter(peak_positions)
+            plt.scatter(frame_number, peak_indices, label=f"Frame {frame_number}, Peak Positions", color='blue')
             plt.xlabel("peak positions", q_limited)
             plt.ylabel("Frame Number")
             plt.title(f"Peak Positions for Frame {frames} in window q = {peak_pos} +/- {window}")
