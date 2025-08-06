@@ -9,31 +9,32 @@ from scipy.ndimage import gaussian_filter1d
 
 def peakrip(h5, peak_pos, window=0.1):
         with h5py.File(h5, 'r') as f:
-            int_val = f['int'][:]  
+            int_val = f['int'][:]  # shape (frames,q) 
             q = f['q'][:]  
+            frames = int_val.shape[0]
         peak_positions = []
-    
-        for i in enumerate(range(frames)):
+        print(f'int_val shape {int_val.shape}') 
+        for i ,cs in enumerate(range(frames)):
             prominence = 5
             sigma = 50
            
-            int_val_frame = int_val_limited[i,:]
+            int_val_frame = int_val[cs,:]
+            print(f'int_val_frame shapp {int_val_frame.shape}') 
             q_min = peak_pos - window
             q_max = peak_pos + window
             mask = (q >= q_min) & (q <= q_max)
-            q_limited = q[mask]
-            int_val_limited = int_val_frame[mask]       
-            frames = int_val.shape[0]
+            q_limited = q[mask] 
+            int_val_mask = int_val_frame[mask]   
+      
         # Fit a Gaussian model to the peak
-            int_full_limited = int_val[frames, mask]
-            background_full = gaussian_filter1d(int_full_limited, sigma=sigma)
-            data_bg_sub_full = int_full_limited - background_full
+          
+            background_full = gaussian_filter1d(int_val_mask, sigma=sigma)
+            data_bg_sub_full = int_val_mask - background_full
             peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= prominence) 
             peak_positions.append(peaks_full)  
         
-
             plt.figure(figsize=(8, 5))
-            plt.scatter(peak_positions, frames, label="Intensity vs q")
+            plt.scatter(peak_positions)
             plt.xlabel("peak positions", q_limited)
             plt.ylabel("Frame Number")
             plt.title(f"Peak Positions for Frame {frames} in window q = {peak_pos} +/- {window}")
