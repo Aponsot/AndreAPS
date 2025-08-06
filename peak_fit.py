@@ -30,6 +30,7 @@ def peak_fit(h5, frame_number, peak_pos=None, window=0.1):
         peaks, _ = find_peaks(cake_data_limited, height=np.max(cake_data_limited) * 0.5, distance=10)
         if len(peaks) > 0:
             detected_peak_pos = q_limited[peaks[0]]  # Use the first detected peak as the initial guess
+            print(f"Detected peak at {detected_peak_pos} for cake slice {cs}")
         else:
             print(f"No peaks found in the specified region for cake slice {cs}. Skipping.")
             continue
