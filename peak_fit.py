@@ -42,7 +42,7 @@ def peak_fit(h5, frame_number,peak_pos):
             # Mask data within the window
             mask = (q >= q_min) & (q <= q_max)
             q_plot = q[mask]
-            cake_plot = cake_intensity_stack[mask]
+            cake_plot = cake_data[mask]
             fit_plot = result_cake.best_fit[mask]
             axes[i, 0].plot(q_plot, cake_plot, 'b.', label='Cake Slice Data')
             axes[i, 0].plot(q_plot, fit_plot, 'r-', label='Fit')
