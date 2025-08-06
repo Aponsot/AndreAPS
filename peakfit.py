@@ -1,3 +1,4 @@
+
 import numpy as np
 import h5py
 import argparse
@@ -23,23 +24,32 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     mask = (q >= q_min) & (q <= q_max)
     q_limited = q[mask]
     # Prepare compound plot
-    fig, axes = plt.subplots(len(cake_slices), 2, figsize=(10, 3 * len(cake_slices)))
+    fig, axes = plt.subplots(
+    2, 3,  # 2 rows, 3 columns
+    figsize=(15, 10),  # Adjust the figure size as needed
+    gridspec_kw={"width_ratios": [1, 1, 2]},  # Left columns are equal, right column is wider
+)
+
+    fig.suptitle(f'Peak Fit for Frame {frame_number}', fontsize=16)
+    
     #Full Az 
     int_full_limited = int_val[frame_number, mask]
     background_full = gaussian_filter1d(int_full_limited, sigma=sigma)
     data_bg_sub_full = int_full_limited - background_full
     peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= full_prominence) 
-    axes[1, 1].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--')
-    axes[1, 1].plot(q_limited, background_full, label='Background', linestyle = "-") 
-    axes[1, 1].plot(q_limited[peaks_full], data_bg_sub_full[peaks_full], 'x', label='Peaks')
-    axes[1, 1].set_title(f'Full Azumutal Integration')
-    axes[1, 1].set_xlabel('q')
-    axes[1, 1].set_ylabel('Intensity')
+    axes[0, 2].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--', color='green')
+    axes[0, 2].plot(q_limited, background_full, label='Background', linestyle = "-",color='blue') 
+    axes[0, 2].plot(q_limited[peaks_full], data_bg_sub_full[peaks_full], 'x', label='Peaks')
+    axes[0, 2].set_title(f'Full Azumutal Integration')
+    axes[0, 2].set_xlabel('q')
+    axes[0, 2].set_ylabel('Intensity')
     
     
     
     # Fit and plot for each cake slice
     for i, cs in enumerate(cake_slices):
+        row = i // 2 
+        col = i % 2
         cake_data = cake_intensity_stack[frame_number, cs, :]
         cake_data_limited = cake_data[mask]
         
@@ -48,17 +58,17 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
         data_bg_sub = cake_data_limited - background
 
         peaks_cake, properties = signal.find_peaks(data_bg_sub, prominence=prominence) 
-        axes[i, 0].plot(q_limited, cake_data_limited, label='Cake Slice Data', linestyle='--')
-        axes[i, 0].plot(q_limited, background, label='Background', linestyle='-')
-        axes[i, 0].plot(q_limited[peaks_cake], data_bg_sub[peaks_cake], 'x', label='Peaks')
-        axes[i, 0].set_title(f'Cake Slice integration {cs}')    
-        axes[i, 0].set_xlabel('q')
-        axes[i, 0].set_ylabel('Intensity')
+        axes[row, col].plot(q_limited, cake_data_limited, label='Cake Slice Data', linestyle='--', color='green')
+        axes[row, col].plot(q_limited, background, label='Background', linestyle='-', color='red')
+        axes[row, col].plot(q_limited[peaks_cake], data_bg_sub[peaks_cake], 'x', label='Peaks')
+        axes[row, col].set_title(f'Cake Slice integration {cs}')    
+        axes[row, col].set_xlabel('q')
+        axes[row, col].set_ylabel('Intensity')
 
         print(f"Cake slice {cs}: Found peaks at {q_limited[peaks_cake]}")
 
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout to fit the title
     plt.show()
 
      
