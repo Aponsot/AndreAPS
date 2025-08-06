@@ -109,3 +109,18 @@ def peak_fit(h5, frame_number, peak_pos=None, window=0.1):
 
     plt.tight_layout()
     plt.show()
+
+    if __name__ == "__main__":
+        parser = argparse.ArgumentParser(description="Fit peak function")
+        parser.add_argument("h5", type=str, help="Input h5 file containing processed data.") 
+        parser.add_argument("frame_number", type=int, help="Frame number to process (0-indexed).")
+        parser.add_argument("--peak_pos", type=float, default=None, help="Position of the peak to fit (in q units). If not provided, peaks will be automatically detected.")
+        parser.add_argument("--window", type=float, default=0.1, help="Window size around the peak position for peak finding.")
+        args = parser.parse_args()
+ 
+        h5 = args.h5
+        frame_number = args.frame_number
+        peak_pos = args.peak_pos
+        window = args.window
+
+    peak_fit(h5, frame_number, peak_pos, window)
