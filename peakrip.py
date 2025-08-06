@@ -11,18 +11,19 @@ def peakrip(h5, peak_pos, window=0.1):
         with h5py.File(h5, 'r') as f:
             int_val = f['int'][:]  
             q = f['q'][:]  
-            q_min = peak_pos - window
-            q_max = peak_pos + window
-            mask = (q >= q_min) & (q <= q_max)
-            q_limited = q[mask]
-            int_val_limited = int_val[mask]       
-            frames = int_val.shape[0]
         peak_positions = []
     
         for i in enumerate(range(frames)):
             prominence = 5
             sigma = 50
-            int_val_frame = int_val_limited[i]
+           
+            int_val_frame = int_val_limited[i,:]
+            q_min = peak_pos - window
+            q_max = peak_pos + window
+            mask = (q >= q_min) & (q <= q_max)
+            q_limited = q[mask]
+            int_val_limited = int_val_frame[mask]       
+            frames = int_val.shape[0]
         # Fit a Gaussian model to the peak
             int_full_limited = int_val[frames, mask]
             background_full = gaussian_filter1d(int_full_limited, sigma=sigma)
