@@ -41,7 +41,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     # Find peaks on background-subtracted data
         peaks_cake, properties = signal.find_peaks(data_bg_sub, prominence=prominence) 
 
-        print(f"Cake slice {cs}: Found peaks at {q_limited[peaks_cake]} with properties {properties}") 
+        print(f"Cake slice {cs}: Found peaks at {q_limited[peaks_cake]}") 
 
 if __name__ == "__main__":
         parser = argparse.ArgumentParser(description="Fit peak function")
