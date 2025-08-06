@@ -1,61 +1,59 @@
 import numpy as np
 import h5py
+import argparse
 import matplotlib.pyplot as plt
 import scipy.signal as signal
+from scipy.optimize import curve_fit
 from scipy.ndimage import gaussian_filter1d
-from scipy.integrate import simpson
 
-def load_hdf5_data(h5_file, frame, sigma=10, prominence=2):
-    """Load data from an HDF5 file and apply Gaussian background subtraction."""
-    with h5py.File(h5_file, "r") as f:
-        int_val = f["int"][:]
-        print(f'Number of frames in intensity stack: {int_val.shape[0]}')
+def peak_fit(h5, frame_number, peak_pos, window=0.1):
+    with h5py.File(h5, 'r') as f:
+        int_val = f['int'][:]  # shape: (nframes, q)
+        q = f['q'][:]          # shape: (q,)
+        cake_intensity_stack = f['cake_int'][:]  # shape: (nframes, n_cakes, q)
        
-        data = int_val[frame]
+    cake_slices = [0, 10, 19, 28]
+    sigma = 1.0  # Smoothing parameter for background
+    prominence = 0.1  # Minimum prominence for peak finding
+    # Prepare compound plot
+    fig, axes = plt.subplots(len(cake_slices), 2, figsize=(10, 3 * len(cake_slices)))
 
-    # Estimate background using a Gaussian filter
-    background = gaussian_filter1d(data, sigma=sigma)
+    # Fit and plot for each cake slice
+    for i, cs in enumerate(cake_slices):
+        cake_data = cake_intensity_stack[frame_number, cs, :]
+        intensity_data = int_val[frame_number, :]
+
+        # Limit the region for peak finding based on the peak_pos and window
+        if peak_pos is not None:
+            q_min = peak_pos - window
+            q_max = peak_pos + window
+            mask = (q >= q_min) & (q <= q_max)
+            q_limited = q[mask]
+            cake_data_limited = cake_data[mask]
+        else:
+            q_limited = q
+            cake_data_limited = cake_data
+        background = gaussian_filter1d(cake_data_limited, sigma=sigma)
 
     # Subtract background
-    data_bg_sub = data - background
+        data_bg_sub = cake_data_limited - background
 
     # Find peaks on background-subtracted data
-    peaks, properties = signal.find_peaks(data_bg_sub, prominence=prominence)
-    
-    print(f"Found {len(peaks)} peaks in frame {frame} after background subtraction.")
-    print(f"Peak indices: {peaks}")
+        peaks_cake, properties = signal.find_peaks(data_bg_sub, prominence=prominence) 
 
-    # Plotting function
-    def plot_function_peak_positions(data, peaks, title, background=None):
-        plt.figure(figsize=(10, 6))
-        plt.plot(data, label='Intensity Data')
-        if background is not None:
-            plt.plot(background, label='Estimated Background', color='orange', linestyle='--')
-        for peak in peaks:
-            plt.axvline(x=peak, color='r', linestyle='--', alpha=0.7)
-        plt.plot(peaks, data[peaks], "x", label="Detected Peaks")
-        plt.title(title)
-        plt.xlabel('q (1/Å)')
-        plt.ylabel('Intensity')
-        plt.legend()
-        plt.show()
-
-    title = f'Scipy peak picking after Gaussian background subtraction (prominence={prominence:.2f})'
-    plot_function_peak_positions(data_bg_sub, peaks, title, background=background)
-
+        print(f"Cake slice {cs}: Found peaks at {q_limited[peaks_cake]} with properties {properties}") 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Load and process HDF5 data.")
-    parser.add_argument("h5_file", type=str, help="Path to the HDF5 file")
-    parser.add_argument("Frame", type=int, help="Frame number to process")
-    parser.add_argument("--sigma", type=float, default=1000, help="Sigma for Gaussian filter")
-    parser.add_argument("--prominence", type=float, default=2, help="Prominence for peak detection")
-    args = parser.parse_args()
+        parser = argparse.ArgumentParser(description="Fit peak function")
+        parser.add_argument("h5", type=str, help="Input h5 file containing processed data.") 
+        parser.add_argument("frame_number", type=int, help="Frame number to process (0-indexed).")
+        parser.add_argument("peak_pos", type=float, help="Position of the peak to fit (in q units). If not provided, peaks will be automatically detected.")
+        parser.add_argument("--window", type=float, default=0.1, help="Window size around the peak position for peak finding.")
+        args = parser.parse_args()
+ 
+        h5 = args.h5
+        frame_number = args.frame_number
+        peak_pos = args.peak_pos
+        window = args.window
 
-    h5_file = args.h5_file
-    frame = args.Frame
-    sigma = args.sigma
-    prominence = args.prominence
-
-    load_hdf5_data(h5_file, frame, sigma=sigma, prominence=prominence)
+peak_fit(h5, frame_number, peak_pos, window)
