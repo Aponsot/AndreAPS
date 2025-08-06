@@ -35,8 +35,17 @@ def peak_fit(h5, frame_number,peak_pos):
                 c1=0  # Assume a flat background initially
             )
             result_cake = model.fit(cake_data, params, x=q)
-            axes[i, 0].plot(q, cake_data, 'b.', label='Cake Slice Data')
-            axes[i, 0].plot(q, result_cake.best_fit, 'r-', label='Fit')
+            window = .2
+            q_min = peak_pos - window
+            q_max = peak_pos + window
+
+            # Mask data within the window
+            mask = (q >= q_min) & (q <= q_max)
+            q_plot = q[mask]
+            cake_plot = int_val[mask]
+            fit_plot = result_cake.best_fit[mask]
+            axes[i, 0].plot(q_plot, cake_plot, 'b.', label='Cake Slice Data')
+            axes[i, 0].plot(q_plot, fit_plot, 'r-', label='Fit')
             axes[i, 0].set_title(f'Cake Slice {cs}')
             axes[i, 0].legend()
         else:
@@ -55,10 +64,10 @@ def peak_fit(h5, frame_number,peak_pos):
             c1=0  # Assume a flat background initially
         )
         result_full = model.fit(intensity_data, params, x=q)
-        axes[i, 1].plot(q, intensity_data, 'g.', label='Full Azimuthal Data')
-        axes[i, 1].plot(q, result_full.best_fit, 'r-', label='Fit')
-        axes[i, 1].set_title('Full Azimuthal')
-        axes[i, 1].legend()
+        axes[1, 1].plot(q, intensity_data, 'g.', label='Full Azimuthal Data')
+        axes[1, 1].plot(q, result_full.best_fit, 'r-', label='Fit')
+        axes[1, 1].set_title('Full Azimuthal')
+        axes[1, 1].legend()
 
     plt.tight_layout()
     plt.show()
