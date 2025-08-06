@@ -20,17 +20,11 @@ def peak_fit(h5, frame_number, peak_pos=None, window=0.1):
     for i, cs in enumerate(cake_slices):
         cake_data = cake_intensity_stack[frame_number, cs, :]
         intensity_data = int_val[frame_number, :]
-
-        # Limit the region for peak finding based on the peak_pos and window
-        if peak_pos is not None:
-            q_min = peak_pos - window
-            q_max = peak_pos + window
-            mask = (q >= q_min) & (q <= q_max)
-            q_limited = q[mask]
-            cake_data_limited = cake_data[mask]
-        else:
-            q_limited = q
-            cake_data_limited = cake_data
+        q_min = peak_pos - window
+        q_max = peak_pos + window
+        mask = (q >= q_min) & (q <= q_max)
+        q_limited = q[mask]
+        cake_data_limited = cake_data[mask]
 
         # Automatically find peaks in the limited region
         peaks, _ = find_peaks(cake_data_limited, height=np.max(cake_data_limited) * 0.5, distance=10)
@@ -55,8 +49,8 @@ def peak_fit(h5, frame_number, peak_pos=None, window=0.1):
             result_cake = model.fit(cake_data, params, x=q)
 
             # Plot the cake slice data and fit
-            axes[i, 0].plot(q, cake_data, 'b.', label='Cake Slice Data')
-            axes[i, 0].plot(q, result_cake.best_fit, 'r-', label='Fit')
+            axes[i, 0].plot(q_limited, cake_data_limited, 'b.', label='Cake Slice Data')
+            axes[i, 0].plot(q_limited, result_cake.best_fit, 'r-', label='Fit')
             axes[i, 0].set_title(f'Cake Slice {cs}')
             axes[i, 0].legend()
         else:
