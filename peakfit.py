@@ -40,13 +40,14 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     data_bg_sub_full = int_full_limited - background_full
     peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= full_prominence) 
     print(f"peaks found: {q_limited[peaks_full]}")
-    for cs , in enumerate(q_limited[peaks_full]): 
+    for cs , in enumerate(len(peaks_full)): 
+        peak = peaks_full[cs]
         gaussian_model = GaussianModel()
         background = PolynomialModel(degree=1) 
         model = gaussian_model - background # Linear background
-        params = gaussian_model.guess(data_bg_sub_full[peaks_full], x=q_limited[peaks_full]) 
-        params['center'].set(value=q_limited[peaks_full][0])
-        result = model.fit(data_bg_sub_full[peaks_full], params, x=q_limited[peaks_full])
+        params = gaussian_model.guess(data_bg_sub_full[peak], x=q_limited[peak]) 
+        params['center'].set(value=q_limited[peak][0])
+        result = model.fit(data_bg_sub_full[peak], params, x=q_limited[peak])
         axes[0, 2].plot(q_limited, result.best_fit, label='Fitted Peak', color='orange') 
     
     axes[0, 2].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--', color='green')
