@@ -40,7 +40,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     data_bg_sub_full = int_full_limited - background_full
     peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= full_prominence) 
     print(f"peaks found: {q_limited[peaks_full]}")
-    for cs , in enumerate(len(peaks_full)): 
+    for cs , in enumerate(np.shape(q_limited[peaks_full])): 
         peak = peaks_full[cs]
         gaussian_model = GaussianModel()
         background = PolynomialModel(degree=1) 
