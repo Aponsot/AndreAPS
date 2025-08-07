@@ -50,7 +50,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
         background = PolynomialModel(degree=1) 
         model = gaussian_model - background # Linear background
         params = model.make_params(
-            center=peak, sigma=2, amplitude=100,  # Gaussian parameters
+            center=peak, sigma=2,  # Gaussian parameters
             c0=10, c1=0.5  # Polynomial parameters (c0: intercept, c1: slope)
         )
         result = model.fit(int_full_limited, params, x=q_limited[peak])
@@ -61,7 +61,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
         }
         peak_fits.append(peak_fit)  # Append the dictionary to the list
         axes[0, 2].plot(q_limited, result.best_fit, label='Fitted Peak', color='orange') 
-    print(f'Peak fits: {peak_fits}')
+    print(f'Peak index: {i} {result.params['center'].value}')
     axes[0, 2].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--', color='green')
     axes[0, 2].plot(q_limited, background_full, label='Background', linestyle = "-",color='blue') 
     axes[0, 2].plot(q_limited[peaks_full], data_bg_sub_full[peaks_full], 'x', label='Peaks')
