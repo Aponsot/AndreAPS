@@ -40,7 +40,9 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     background_full = gaussian_filter1d(int_full_limited, sigma=sigma)
     data_bg_sub_full = int_full_limited - background_full
     peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= full_prominence) 
-    print(f"peaks amplitude: {properties_full['peak_heights']}")
+    prominence_peak = properties_full['prominences']
+    widths = properties_full['widths'] 
+    print(f"Prominence of peaks: {prominence_peak}, Widths of peaks: {widths}")
     print(f"peaks found: {q_limited[peaks_full][1]}")
     print(f"peak shape: {len(q_limited[peaks_full])}")
     num_peaks = int(len(q_limited[peaks_full]))
