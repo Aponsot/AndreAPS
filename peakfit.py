@@ -39,7 +39,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     int_full_limited = int_val[frame_number, mask]
     background_full = gaussian_filter1d(int_full_limited, sigma=sigma)
     data_bg_sub_full = int_full_limited - background_full
-    peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= full_prominence) 
+    peaks_full, properties_full = signal.find_peaks(data_bg_sub_full, prominence= full_prominence, width=1 ) 
     prominence_peak = properties_full['prominences']
     widths = properties_full['widths'] 
     print(f"Prominence of peaks: {prominence_peak}, Widths of peaks: {widths}")
@@ -64,7 +64,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
         sigma=2,           # Initial width guess
         amplitude=int_full_limited[peak_index]  # Initial amplitude guess
     ))
-
+    params[f"g{i}_center"].set(value=peak_value, min=peak_value - 0.05, max=peak_value + 0.05)
 # Fit the composite model to the data
     result = composite_model.fit(int_full_limited, params, x=q_limited)
 
