@@ -1,5 +1,6 @@
 
 
+
 import numpy as np
 import h5py
 import argparse
@@ -42,6 +43,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     print(f"peaks found: {q_limited[peaks_full][1]}")
     print(f"peak shape: {len(q_limited[peaks_full])}")
     num_peaks = int(len(q_limited[peaks_full]))
+    peak_fits = [] 
     for i in range(num_peaks): 
         peak = q_limited[peaks_full][i]
         gaussian_model = GaussianModel()
@@ -52,8 +54,14 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
             c0=10, c1=0.5  # Polynomial parameters (c0: intercept, c1: slope)
         )
         result = model.fit(int_full_limited, params, x=q_limited[peak])
+        peak_fit = {
+        "peak_index": i,
+        "fit_result": result.best_fit,  # The fitted curve
+        "fit_params": result.params     # The optimized parameters
+        }
+        peak_fits.append(peak_fit)  # Append the dictionary to the list
         axes[0, 2].plot(q_limited, result.best_fit, label='Fitted Peak', color='orange') 
-    
+    print(f'Peak fits: {peak_fits}')
     axes[0, 2].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--', color='green')
     axes[0, 2].plot(q_limited, background_full, label='Background', linestyle = "-",color='blue') 
     axes[0, 2].plot(q_limited[peaks_full], data_bg_sub_full[peaks_full], 'x', label='Peaks')
