@@ -51,7 +51,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
             center=peak, sigma=2, amplitude=100,  # Gaussian parameters
             c0=10, c1=0.5  # Polynomial parameters (c0: intercept, c1: slope)
         )
-        result = model.fit(data_bg_sub_full[peak], params, x=q_limited[peak])
+        result = model.fit(int_full_limited, params, x=q_limited[peak])
         axes[0, 2].plot(q_limited, result.best_fit, label='Fitted Peak', color='orange') 
     
     axes[0, 2].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--', color='green')
