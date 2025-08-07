@@ -47,24 +47,52 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     print(f"peak shape: {len(q_limited[peaks_full])}")
     num_peaks = int(len(q_limited[peaks_full]))
     peak_fits = [] 
-    for i in range(num_peaks): 
-        peak = q_limited[peaks_full][i]
-        gaussian_model = GaussianModel()
-        background = PolynomialModel(degree=1) 
-        model = gaussian_model - background # Linear background
-        params = model.make_params(
-            center=peak, sigma=2,  # Gaussian parameters
-            c0=10, c1=0.5  # Polynomial parameters (c0: intercept, c1: slope)
-        )
-        result = model.fit(int_full_limited, params, x=q_limited)
-        print(f"Peak {i}: Center = {result.params['center'].value}")
+    composite_model = PolynomialModel(degree=1, prefix="bg_")  # Background model
+    params = composite_model.make_params(c0=10, c1=0.5)  # Initial guesses for background
+
+# Dynamically add Gaussian models for each peak
+    for i, peak_index in enumerate(peaks_full):
+        peak_value = q_limited[peak_index]  # Peak location
+        gaussian_model = GaussianModel(prefix=f"g{i}_")  # Unique prefix for each Gaussian
+
+    # Add the Gaussian model to the composite model
+        composite_model += gaussian_model
+
+    # Initialize parameters for this Gaussian
+        params.update(gaussian_model.make_params(
+        center=peak_value,  # Peak location
+        sigma=2,           # Initial width guess
+        amplitude=int_full_limited[peak_index]  # Initial amplitude guess
+    ))
+
+# Fit the composite model to the data
+    result = composite_model.fit(int_full_limited, params, x=q_limited)
+
+# Store the fit results for each peak
+    peak_fits = []  # List to store fit results for each peak
+    for i in range(len(peaks_full)):
         peak_fit = {
-        "peak_index": i,
-        "fit_result": result.best_fit,  # The fitted curve
-        "fit_params": result.params     # The optimized parameters
+            "peak_index": i,
+            "fit_result": result.best_fit,  # The fitted curve
+            "fit_params": {key: result.params[key] for key in result.params if key.startswith(f"g{i}_")}  # Parameters for this peak
         }
-        peak_fits.append(peak_fit)  # Append the dictionary to the list
-        axes[0, 2].plot(q_limited, result.best_fit, label='Fitted Peak', color='orange') 
+        peak_fits.append(peak_fit)
+
+    # Plot the fitted curve for this peak
+    axes[0, 2].plot(q_limited, result.best_fit, label=f'Fitted Peak {i}', color='orange')
+
+# Optionally, plot the background separately
+    background_fit = result.eval_components()["bg_"]
+    axes[0, 2].plot(q_limited, background_fit, label="Background", color="green")
+
+# Add a legend to the plot
+    axes[0, 2].legend()
+
+# Print the fit parameters for debugging
+    for i, fit in enumerate(peak_fits):
+        print(f"Peak {i} Fit Parameters:")
+    for param_name, param in fit["fit_params"].items():
+        print(f"  {param_name}: {param.value:.4f} ± {param.stderr:.4f}") 
    
     axes[0, 2].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--', color='green')
     axes[0, 2].plot(q_limited, background_full, label='Background', linestyle = "-",color='blue') 
