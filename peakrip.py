@@ -20,7 +20,7 @@ def peakrip(h5, peak_pos, window=0.1):
         q = f['q'][:]          # shape (q,)
         frames = int_val.shape[0]
     
-    print(f'int_val shape: {int_val.shape}') 
+
     
     # Initialize lists to store frame numbers and peak positions
     frame_numbers = []
@@ -32,7 +32,7 @@ def peakrip(h5, peak_pos, window=0.1):
         
         # Extract the intensity data for the current frame
         int_val_frame = int_val[cs, :]
-        print(f'int_val_frame shape: {int_val_frame.shape}') 
+        
         
         # Apply the window to limit the q range
         q_min = peak_pos - window
