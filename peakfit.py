@@ -54,19 +54,18 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
     for i, peak_index in enumerate(peaks_full):
         peak_value = q_limited[peak_index]  # Peak location
         gaussian_model = GaussianModel(prefix=f"g{i}_")  # Unique prefix for each Gaussian
-
+        width_guess = widths[i] /2.35 
     # Add the Gaussian model to the composite model
         composite_model += gaussian_model
 
     # Initialize parameters for this Gaussian
         params.update(gaussian_model.make_params(
         center=peak_value,  # Peak location
-        sigma=2,           # Initial width guess
+        sigma=width_guess,           # Initial width guess
         amplitude=int_full_limited[peak_index]  # Initial amplitude guess
     ))
-    params[f"g{i}_center"].set(value=peak_value, min=peak_value - 0.05, max=peak_value + 0.05)
 # Fit the composite model to the data
-    result = composite_model.fit(int_full_limited, params, x=q_limited)
+    result = composite_model.fit(int_full_limited, params, x=q_limited, method="leastsq")
 
 # Store the fit results for each peak
     peak_fits = []  # List to store fit results for each peak
