@@ -88,11 +88,7 @@ def peak_fit(h5, frame_number, peak_pos, window=0.1):
 # Add a legend to the plot
     axes[0, 2].legend()
 
-# Print the fit parameters for debugging
-    for i, fit in enumerate(peak_fits):
-        print(f"Peak {i} Fit Parameters:")
-    for param_name, param in fit["fit_params"].items():
-        print(f"  {param_name}: {param.value:.4f} ± {param.stderr:.4f}") 
+
    
     axes[0, 2].plot(q_limited, int_full_limited, label='Full Data', linestyle = '--', color='green')
     axes[0, 2].plot(q_limited, background_full, label='Background', linestyle = "-",color='blue') 
