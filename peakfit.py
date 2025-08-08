@@ -178,9 +178,12 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
 
     # --- Detection (background-sub only) ---
     dq = float(np.diff(q_win).mean())
-    sigma_smooth_detect = max(2, min(12, int(0.03 * len(q_win))))
-    bg_detect = gaussian_filter1d(y_win, sigma=sigma_smooth_detect)
+    sigma_smooth_detect = max(3, min(12, int(0.03 * len(q_win))))
+    bg_gauss = gaussian_filter1d(y_win, sigma=sigma_smooth_detect)
+    bg_floor = detect_background(y_win, q_win, pct=20, win_frac=0.05, smooth_sigma=2)
+    bg_detect = np.minimum(bg_gauss, bg_floor)   # never rises above the floor
     y_det = y_win - bg_detect
+  
 
     # min spacing ~ 0.8*FWHM_guess (in points)
     w_pts_guess = 3.0
