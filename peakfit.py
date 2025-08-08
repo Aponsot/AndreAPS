@@ -3,7 +3,7 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 import scipy.signal as signal
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, percentile_filter
 from lmfit.models import PolynomialModel, GaussianModel
 
 
@@ -40,9 +40,9 @@ def fit_metrics(result, x, y, weights=None):
 
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
+
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
-
 
 def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
                            add_frac=0.45, min_sep_sigma=0.8):
@@ -61,8 +61,7 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
     for i, pidx in enumerate(peaks_idx):
         mu = float(q[pidx])
         sig = max(_sigma_from_fwhm(widths[i], dq), 1e-6)
-        # area ≈ height * sigma * sqrt(2π) using prominence as height proxy
-        amp = float(promin[i]) * sig * np.sqrt(2*np.pi)
+        amp = float(promin[i]) * sig * np.sqrt(2*np.pi)  # area ≈ prominence * sigma * sqrt(2π)
         yhat += amp * np.exp(-0.5*((q - mu)/sig)**2)
 
     residual = y_bgsub - yhat
@@ -101,7 +100,6 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
 
     order = np.argsort(q[peaks_idx])
     return peaks_idx[order], {"widths": widths[order], "prominences": promin[order]}
-
 
 def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     """
@@ -156,6 +154,21 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     comps = result.model.eval_components(params=result.params, x=q)
     return result, comps
 
+# --- detection-only background: robust, flat floor (helper) ---
+def detect_background(y_win, pct=20, win_frac=0.05, smooth_sigma=2):
+    """
+    Percentile-floor baseline for PEAK DETECTION ONLY.
+    pct: lower-envelope percentile (10–30 typical). Lower = flatter baseline.
+    win_frac: window size as fraction of series length (0.03–0.08 typical).
+    smooth_sigma: tiny Gaussian smooth to de-block the percentile output.
+    """
+    n = len(y_win)
+    win = max(7, int(win_frac * n) | 1)   # odd, >=7
+    bg = percentile_filter(y_win, percentile=pct, size=win)
+    if smooth_sigma and smooth_sigma > 0:
+        bg = gaussian_filter1d(bg, sigma=smooth_sigma)
+    return bg
+
 
 # ----------------------------- main ----------------------------- #
 def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
@@ -178,12 +191,13 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
 
     # --- Detection (background-sub only) ---
     dq = float(np.diff(q_win).mean())
+
+    # Gentle Gaussian baseline for noise + robust percentile floor; clamp with min()
     sigma_smooth_detect = max(3, min(12, int(0.03 * len(q_win))))
     bg_gauss = gaussian_filter1d(y_win, sigma=sigma_smooth_detect)
-    bg_floor = detect_background(y_win, q_win, pct=20, win_frac=0.05, smooth_sigma=2)
-    bg_detect = np.minimum(bg_gauss, bg_floor)   # never rises above the floor
+    bg_floor = detect_background(y_win, pct=20, win_frac=0.05, smooth_sigma=2)
+    bg_detect = np.minimum(bg_gauss, bg_floor)   # floor wins under peaks
     y_det = y_win - bg_detect
-  
 
     # min spacing ~ 0.8*FWHM_guess (in points)
     w_pts_guess = 3.0
@@ -206,7 +220,8 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     w = 1.0 / np.sqrt(np.clip(y_win, 1.0, None))  # same weights used in fit
     m = fit_metrics(result, q_win, y_win, weights=w)
     print(f"[METRICS] R2={m['r2']:.6f}  adjR2={m['adj_r2']:.6f}  redχ²={m['red_chisq']:.3g}  "
-      f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}") 
+          f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}")
+
     # Dense plotting
     q_dense = np.linspace(q_win.min(), q_win.max(), len(q_win)*5)
     best_fit_dense = result.model.eval(params=result.params, x=q_dense)
@@ -226,7 +241,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     ax.set_xlabel("q"); ax.set_ylabel("Intensity")
     ax.legend(loc="upper right", fontsize=8)
 
-    # --- Cake previews (unchanged, simple) ---
+    # --- Cake previews (simple) ---
     if cake is not None:
         slices = [0, 10, 19, 28]
         for i, cs in enumerate(slices):
