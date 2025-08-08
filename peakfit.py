@@ -12,7 +12,34 @@ def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
     """FWHM -> sigma in x-units via FWHM = 2.355*sigma."""
     return (fwhm_pts * dq) / 2.355
 
+def fit_metrics(result, x, y, weights=None):
+    yhat = result.model.eval(params=result.params, x=x)
+    resid = y - yhat
+    n = len(y)
+    k = sum(p.vary for p in result.params.values())  # #free params
 
+    if weights is not None:
+        w = np.asarray(weights, float)
+        sse = float(np.sum((w*resid)**2))
+        # weighted mean using w^2 (~least-squares convention)
+        ybar = float(np.sum((w**2)*y) / np.sum(w**2))
+        sst = float(np.sum((w*(y - ybar))**2))
+    else:
+        sse = float(np.sum(resid**2))
+        ybar = float(np.mean(y))
+        sst = float(np.sum((y - ybar)**2))
+
+    r2 = 1.0 - sse/max(sst, 1e-18)
+    adj_r2 = 1.0 - (1.0 - r2) * (n - 1)/max(n - k - 1, 1)
+
+    red_chisq = sse / max(n - k, 1)
+    aic = result.aic
+    bic = result.bic
+    rmse = np.sqrt(sse / n)
+    max_abs = float(np.max(np.abs(resid)))
+
+    return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
+                rmse=rmse, max_abs=max_abs, n=n, k=k)
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
 
@@ -173,7 +200,10 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
 
     # --- Fit ---
     result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
-
+    w = 1.0 / np.sqrt(np.clip(y_win, 1.0, None))  # same weights used in fit
+    m = fit_metrics(result, q_win, y_win, weights=w)
+    print(f"[METRICS] R2={m['r2']:.6f}  adjR2={m['adj_r2']:.6f}  redχ²={m['red_chisq']:.3g}  "
+      f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}") 
     # Dense plotting
     q_dense = np.linspace(q_win.min(), q_win.max(), len(q_win)*5)
     best_fit_dense = result.model.eval(params=result.params, x=q_dense)
