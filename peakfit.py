@@ -38,11 +38,7 @@ def fit_multi_peaks(
     params["bg_c0"].set(value=float(np.median(y_limited)), min=0)
     if bg_degree >= 1:
         params["bg_c1"].set(value=0)
-    height0 = float(prominences[i])
-    amp0 = height0 * sigma0 * np.sqrt(2*np.pi)
-
-    # instead of min=0, give a floor tied to the guess
-    params[f"g{i}_amplitude"].set(min=0.35*abs(amp0), max=5*abs(amp0))
+    
     # Peak props
     fwhm_pts = props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float))
     prominences = props.get("prominences", np.ones_like(peaks_idx, dtype=float))
@@ -61,19 +57,21 @@ def fit_multi_peaks(
         sigma0 = float(_sigma_from_fwhm(float(fwhm_pts[i]), dq))
         sigma0 = max(sigma0, sigma_floor)
 
-        # amplitude ~ area ≈ height * sigma * sqrt(2*pi) (height ~ prominence on bg-sub)
-        height0 = float(prominences[i])
-        amp0 = height0 * sigma0 * np.sqrt(2 * np.pi)
-
         g = PeakModel(prefix=f"g{i}_")
         composite += g
 
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
         # Bounds to stop swapping:
         params[f"g{i}_center"].set(min=center0 - center_window, max=center0 + center_window)
-        params[f"g{i}_sigma"].set(min=sigma0 * 0.25, max=sigma0 * 4)
+
         # Keep amplitude from exploding or flipping wildly
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
+        height0 = float(prominences[i])
+        amp0 = height0 * sigma0 * np.sqrt(2*np.pi)
+
+# instead of min=0, give a floor tied to the guess
+        params[f"g{i}_amplitude"].set(min=0.35*abs(amp0), max=5*abs(amp0))
+        
     # Global fit
         w = 1.0 / np.sqrt(np.clip(y_limited, 1.0, None))   # Poisson-ish
 
