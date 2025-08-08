@@ -40,7 +40,47 @@ def fit_metrics(result, x, y, weights=None):
 
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
+def add_fit_summary_table(fig, result, metrics, title="Fit summary"):
+    """
+    Draw a table at the bottom of `fig` with metrics and fitted peak params.
+    - result: lmfit result object from fit_multi_peaks
+    - metrics: dict from fit_metrics(...)
+    """
+    # Collect fitted peak IDs (g0_, g1_, ...)
+    peak_ids = sorted({
+        int(k.split('_')[0][1:])
+        for k in result.params if k.startswith("g") and k.endswith("_center")
+    })
 
+    # Build rows: metrics, blank, then per-peak params
+    metric_rows = [
+        ["R²",       f"{metrics['r2']:.6f}",   "", ""],
+        ["Adj R²",   f"{metrics['adj_r2']:.6f}", "", ""],
+        ["RMSE",     f"{metrics['rmse']:.4g}", "", ""],
+        ["red χ²",   f"{metrics['red_chisq']:.4g}", "", ""],
+        ["AIC",      f"{metrics['aic']:.2f}",  "", ""],
+        ["BIC",      f"{metrics['bic']:.2f}",  "", ""],
+        ["max|res|", f"{metrics['max_abs']:.3g}", "", ""],
+    ]
+
+    peak_rows = []
+    for i in peak_ids:
+        c = result.params[f"g{i}_center"].value
+        s = result.params[f"g{i}_sigma"].value
+        a = result.params[f"g{i}_amplitude"].value
+        peak_rows.append([f"g{i}", f"{c:.6f}", f"{s:.5g}", f"{a:.5g}"])
+
+    data = [["Metric/Peak", "center (q)", "sigma", "area"]] + metric_rows + [["", "", "", ""]] + peak_rows
+
+    # Leave space at bottom for the table, then add an axes just for the table
+    fig.tight_layout(rect=[0, 0.22, 1, 0.96])   # push plots up; reserve ~22% height
+    ax_tbl = fig.add_axes([0.06, 0.03, 0.88, 0.16])  # [left, bottom, width, height] in figure coords
+    ax_tbl.axis("off")
+
+    table = ax_tbl.table(cellText=data, cellLoc="center", loc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.2)
 
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
@@ -327,7 +367,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
         s = result.params[f"g{i}_sigma"].value
         a = result.params[f"g{i}_amplitude"].value
         print(f"  g{i}: center={c:.6f}, sigma={s:.6g}, area={a:.6g}")
-
+    add_fit_summary_table(fig, result, m)
     plt.tight_layout(rect=[0, 0, 1, 0.96]); plt.show()
 
 
