@@ -19,7 +19,7 @@ def fit_multi_peaks(
     y_limited,
     peaks_idx,
     props,
-    bg_degree=1,
+    bg_degree=2,
     center_window=0.005,
     sigma_floor=1e-5,
     model_kind="pvoigt",  # 'pvoigt' or 'gauss'
