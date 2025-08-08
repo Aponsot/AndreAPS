@@ -1,3 +1,4 @@
+
 import argparse
 import numpy as np
 import h5py
@@ -40,47 +41,7 @@ def fit_metrics(result, x, y, weights=None):
 
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
-def add_fit_summary_table(fig, result, metrics, title="Fit summary"):
-    """
-    Draw a table at the bottom of `fig` with metrics and fitted peak params.
-    - result: lmfit result object from fit_multi_peaks
-    - metrics: dict from fit_metrics(...)
-    """
-    # Collect fitted peak IDs (g0_, g1_, ...)
-    peak_ids = sorted({
-        int(k.split('_')[0][1:])
-        for k in result.params if k.startswith("g") and k.endswith("_center")
-    })
 
-    # Build rows: metrics, blank, then per-peak params
-    metric_rows = [
-        ["R²",       f"{metrics['r2']:.6f}",   "", ""],
-        ["Adj R²",   f"{metrics['adj_r2']:.6f}", "", ""],
-        ["RMSE",     f"{metrics['rmse']:.4g}", "", ""],
-        ["red χ²",   f"{metrics['red_chisq']:.4g}", "", ""],
-        ["AIC",      f"{metrics['aic']:.2f}",  "", ""],
-        ["BIC",      f"{metrics['bic']:.2f}",  "", ""],
-        ["max|res|", f"{metrics['max_abs']:.3g}", "", ""],
-    ]
-
-    peak_rows = []
-    for i in peak_ids:
-        c = result.params[f"g{i}_center"].value
-        s = result.params[f"g{i}_sigma"].value
-        a = result.params[f"g{i}_amplitude"].value
-        peak_rows.append([f"g{i}", f"{c:.6f}", f"{s:.5g}", f"{a:.5g}"])
-
-    data = [["Metric/Peak", "center (q)", "sigma", "area"]] + metric_rows + [["", "", "", ""]] + peak_rows
-
-    # Leave space at bottom for the table, then add an axes just for the table
-    fig.tight_layout(rect=[0, 0.22, 1, 0.96])   # push plots up; reserve ~22% height
-    ax_tbl = fig.add_axes([0.06, 0.03, 0.88, 0.16])  # [left, bottom, width, height] in figure coords
-    ax_tbl.axis("off")
-
-    table = ax_tbl.table(cellText=data, cellLoc="center", loc="center")
-    table.auto_set_font_size(False)
-    table.set_fontsize(8)
-    table.scale(1.0, 1.2)
 
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
@@ -230,7 +191,7 @@ def detect_background_adaptive(y_win, floor_pct=15, floor_win_frac=0.05,
     sg = max(3, min(12, int(gauss_frac * n)))
     bg_gauss = gaussian_filter1d(y_win, sigma=sg)
 
-    # binary search for alpha in [0,1] so frac(y <= alpha*gauss + (1-alpha)*floor) ≈ target_frac
+    # binary search for alpha in [0,1]
     lo, hi = 0.0, 1.0
     for _ in range(max_iter):
         alpha = 0.5 * (lo + hi)
@@ -266,7 +227,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     if q_win.size < 5:
         raise ValueError("Fit window too small or outside q-range.")
 
-    # Figure
+    # Figure (2 rows x 3 columns; right column is wider by width_ratios)
     fig, axes = plt.subplots(2, 3, figsize=(15, 10), gridspec_kw={"width_ratios": [1, 1, 2]})
     fig.suptitle(f"Peak Fit for Frame {frame_number}", fontsize=16)
 
@@ -276,11 +237,11 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     # Adaptive baseline (floor + gaussian blend picked per frame)
     bg_detect, bg_info = detect_background_adaptive(
         y_win,
-        floor_pct=15,       # try 10–20
-        floor_win_frac=0.05,# try 0.04–0.07
+        floor_pct=15,         # try 10–20
+        floor_win_frac=0.05,  # try 0.04–0.07
         floor_smooth=2,
-        gauss_frac=0.03,    # gaussian sigma ≈ 3% of window length
-        target_frac=0.60    # ~60% of points under baseline
+        gauss_frac=0.03,      # gaussian sigma ≈ 3% of window length
+        target_frac=0.60      # ~60% of points under baseline
     )
     y_det = y_win - bg_detect
     print(f"[bg] alpha={bg_info['alpha']:.2f} frac_below={bg_info['frac_below']:.2f} "
@@ -325,6 +286,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     best_fit_dense = result.model.eval(params=result.params, x=q_dense)
     comps_dense = result.model.eval_components(params=result.params, x=q_dense)
 
+    # --- Right top: Full Azimuthal Integration ---
     ax = axes[0, 2]
     ax.plot(q_win, y_win, "--", label="Data")
     ax.plot(q_win, bg_detect, "-", label="BG (detect)")
@@ -339,14 +301,13 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     ax.set_xlabel("q"); ax.set_ylabel("Intensity")
     ax.legend(loc="upper right", fontsize=8)
 
-    # --- Cake previews (simple) ---
+    # --- Left 2x2: Cake previews (simple) ---
     if cake is not None:
         slices = [0, 10, 19, 28]
+        sigma_smooth_detect = max(3, min(12, int(0.03 * len(q_win))))  # for preview only
         for i, cs in enumerate(slices):
             r, c = divmod(i, 2)
             y_c = cake[frame_number, cs, :][mask]
-            # reuse same detect sigma for preview baseline
-            sigma_smooth_detect = max(3, min(12, int(0.03 * len(q_win))))
             bg_c = gaussian_filter1d(y_c, sigma=sigma_smooth_detect)
             ysub = y_c - bg_c
             pk_c, _ = signal.find_peaks(ysub, prominence=prom_full, width=(wmin, wmax))
@@ -360,15 +321,39 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
         for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)]:
             axes[r, c].axis("off"); axes[r, c].text(0.5, 0.5, "No cake_int", ha="center", va="center")
 
-    # Print compact params
-    print("\n[FIT] Peaks:")
+    # --- Bottom-right: Table with metrics + peak centers ---
+    table_ax = axes[1, 2]
+    table_ax.axis("off")
+
+    table_data = [
+        ["R²", f"{m['r2']:.6f}"],
+        ["Adj R²", f"{m['adj_r2']:.6f}"],
+        ["Reduced χ²", f"{m['red_chisq']:.3g}"],
+        ["AIC", f"{m['aic']:.2f}"],
+        ["BIC", f"{m['bic']:.2f}"],
+        ["RMSE", f"{m['rmse']:.3g}"],
+        ["Max |res|", f"{m['max_abs']:.3g}"],
+        ["# Peaks", f"{len(peaks)}"],
+        ["", ""],  # spacer
+    ]
+    # Add peak centers (and optionally sigma/area—uncomment if wanted)
     for i in range(len(peaks)):
         c = result.params[f"g{i}_center"].value
-        s = result.params[f"g{i}_sigma"].value
-        a = result.params[f"g{i}_amplitude"].value
-        print(f"  g{i}: center={c:.6f}, sigma={s:.6g}, area={a:.6g}")
-    add_fit_summary_table(fig, result, m)
-    plt.tight_layout(rect=[0, 0, 1, 0.96]); plt.show()
+        # s = result.params[f"g{i}_sigma"].value
+        # a = result.params[f"g{i}_amplitude"].value
+        table_data.append([f"Peak {i} center", f"{c:.6f}"])
+        # table_data.append([f"Peak {i} σ / area", f"{s:.5g} / {a:.5g}"])
+
+    table = table_ax.table(cellText=table_data,
+                           colLabels=["Metric / Peak", "Value"],
+                           cellLoc="center",
+                           loc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.2, 1.25)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
 
 
 # ----------------------------- CLI ----------------------------- #
