@@ -59,11 +59,11 @@ def fit_multi_peaks(
 
         g = PeakModel(prefix=f"g{i}_")
         composite += g
+        height0 = float(prominences[i])
         amp0 = height0 * sigma0 * np.sqrt(2*np.pi)
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
         params[f"g{i}_center"].set(min=center0 - center_window, max=center0 + center_window)
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
-        height0 = float(prominences[i])
         params[f"g{i}_amplitude"].set(min=0.35*abs(amp0), max=5*abs(amp0))
         
     # Global fit
