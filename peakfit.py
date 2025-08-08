@@ -148,7 +148,7 @@ def fit_multi_peaks(
     _refit_overlapping_pairs(result, q_limited, y_limited, overlap_factor=2.5)
 
     # Final components after pair refinements
-    comps = result.model.eval_components(result.params, x=q_limited)
+    comps = result.model.eval_components(params=result.params, x=q_limited)
     return result, comps
 
 
