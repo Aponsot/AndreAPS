@@ -22,6 +22,7 @@ def fit_multi_peaks(
     bg_degree=2,
     center_window=0.005,
     sigma_floor=1e-5,
+
 ):
     """
     Build & fit a background + sum(peaks) using good starting guesses from find_peaks.
@@ -43,7 +44,7 @@ def fit_multi_peaks(
     prominences = props.get("prominences", np.ones_like(peaks_idx, dtype=float))
 
     # Peak model type
-    PeakModel = GaussianModel
+    PeakModel =  GaussianModel
     # inside fit_multi_peaks(...) before loop
     params.add('qshift', value=0.0, min=-5e-3, max=5e-3)  # tune range
 
@@ -86,8 +87,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     # Tunables
     sigma_smooth = 50                  # smoothing for detection baseline
     prom_cake = 2                      # min prominence for cake find_peaks
-    prom_full = 2                      # min prominence for full data find_peaks
-    model_kind = "gauss"              # 'pvoigt' or 'gauss'
+    prom_full = 2                      # min prominence for full data find_peaks             # 'pvoigt' or 'gauss'
     center_window = 0.0005             # tighten if peaks are VERY close
 
     # Window the region around the target peak_pos
@@ -126,7 +126,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
         props_full,
         bg_degree=1,
         center_window=center_window,
-        model_kind=model_kind,
+        model_kind=GaussianModel,
     )
 
     # Plot data + detection bg
@@ -150,11 +150,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
             c = result_full.params.get(f"g{i}_center").value
             s = result_full.params.get(f"g{i}_sigma").value
             a = result_full.params.get(f"g{i}_amplitude").value
-            if model_kind == "pvoigt":
-                eta = result_full.params.get(f"g{i}_fraction").value
-                print(f"  g{i}: center={c:.6f}, sigma={s:.6g}, amp={a:.6g}, fraction(Lorentz)={eta:.3f}")
-            else:
-                print(f"  g{i}: center={c:.6f}, sigma={s:.6g}, amp={a:.6g}")
+            print(f"  g{i}: center={c:.6f}, sigma={s:.6g}, amp={a:.6g}")
 
     ax.set_title("Full Azimuthal Integration")
     ax.set_xlabel("q")
