@@ -155,7 +155,7 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     return result, comps
 
 # --- detection-only background: robust, flat floor (helper) ---
-def detect_background(y_win, pct=20, win_frac=0.05, smooth_sigma=2):
+def detect_background(y_win, pct=10, win_frac=0.05, smooth_sigma=1):
     """
     Percentile-floor baseline for PEAK DETECTION ONLY.
     pct: lower-envelope percentile (10–30 typical). Lower = flatter baseline.
@@ -195,7 +195,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     # Gentle Gaussian baseline for noise + robust percentile floor; clamp with min()
     sigma_smooth_detect = max(3, min(12, int(0.03 * len(q_win))))
     bg_gauss = gaussian_filter1d(y_win, sigma=sigma_smooth_detect)
-    bg_floor = detect_background(y_win, pct=20, win_frac=0.05, smooth_sigma=2)
+    bg_floor = detect_background(y_win, pct=10, win_frac=0.03, smooth_sigma=50)
     bg_detect = np.minimum(bg_gauss, bg_floor)   # floor wins under peaks
     y_det = y_win - bg_detect
 
