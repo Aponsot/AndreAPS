@@ -59,17 +59,11 @@ def fit_multi_peaks(
 
         g = PeakModel(prefix=f"g{i}_")
         composite += g
-
+        amp0 = height0 * sigma0 * np.sqrt(2*np.pi)
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
-        # Bounds to stop swapping:
         params[f"g{i}_center"].set(min=center0 - center_window, max=center0 + center_window)
-
-        # Keep amplitude from exploding or flipping wildly
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
         height0 = float(prominences[i])
-        amp0 = height0 * sigma0 * np.sqrt(2*np.pi)
-
-# instead of min=0, give a floor tied to the guess
         params[f"g{i}_amplitude"].set(min=0.35*abs(amp0), max=5*abs(amp0))
         
     # Global fit
