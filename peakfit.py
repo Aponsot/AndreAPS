@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import scipy.signal as signal
 from scipy.ndimage import gaussian_filter1d
 
-from lmfit.models import PolynomialModel, GaussianModel, PseudoVoigtModel
+from lmfit.models import PolynomialModel, GaussianModel
 
 
 # ----------------------------- helpers ----------------------------- #
@@ -22,7 +22,6 @@ def fit_multi_peaks(
     bg_degree=2,
     center_window=0.005,
     sigma_floor=1e-5,
-    model_kind="pvoigt",  # 'pvoigt' or 'gauss'
 ):
     """
     Build & fit a background + sum(peaks) using good starting guesses from find_peaks.
@@ -44,7 +43,7 @@ def fit_multi_peaks(
     prominences = props.get("prominences", np.ones_like(peaks_idx, dtype=float))
 
     # Peak model type
-    PeakModel = PseudoVoigtModel if model_kind.lower() in ("pv", "pvoigt") else GaussianModel
+    PeakModel = GaussianModel
     # inside fit_multi_peaks(...) before loop
     params.add('qshift', value=0.0, min=-5e-3, max=5e-3)  # tune range
 
@@ -64,7 +63,7 @@ def fit_multi_peaks(
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
         params[f"g{i}_center"].set(min=center0 - center_window, max=center0 + center_window)
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
-        params[f"g{i}_amplitude"].set(min=0.35*abs(amp0), max=5*abs(amp0))
+        params[f"g{i}_amplitude"].set(min=0.25*abs(amp0), max=4*abs(amp0))
         
     # Global fit
         w = 1.0 / np.sqrt(np.clip(y_limited, 1.0, None))   # Poisson-ish
