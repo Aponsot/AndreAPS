@@ -130,6 +130,15 @@ def fit_multi_peaks(
         amp0 = max(height0 * sigma0 * np.sqrt(2*np.pi), 1e-9)
 
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
+        broad = GaussianModel(prefix='broad_')
+        composite += broad
+        span = (q_limited.max() - q_limited.min())
+        sigma_broad0 = 0.20*span
+        params.update(broad.make_params(center=np.mean(q_limited),
+                                sigma=sigma_broad0,
+                                amplitude=0.05*np.trapz(y_limited, q_limited)))
+        params['broad_sigma'].set(min=0.5*sigma_broad0, max=3*sigma_broad0)
+        params['broad_amplitude'].set(min=0, max=np.trapz(y_limited, q_limited))
 
         # Tie actual center to base + global shift + tiny per-peak wiggle
         params.add(f"g{i}_c0", value=center0, vary=False)
@@ -139,6 +148,14 @@ def fit_multi_peaks(
         # Keep widths/amplitudes sane
         params[f"g{i}_sigma"].set(min=0.3*sigma0, max=3.0*sigma0)
         params[f"g{i}_amplitude"].set(min=0.25*abs(amp0), max=10*abs(amp0))
+        # after params.add('qshift', ...)
+        params.add('qscale', value=1.0, min=0.999, max=1.001)  # tune bounds
+
+# inside the per-peak loop, after make_params(...)
+        params.add(f"g{i}_c0", value=center0, vary=False)
+        params.add(f"g{i}_dcenter", value=0.0, min=-0.001, max=0.001)
+# NEW: include qscale
+        params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
 
     # Global fit (Poisson-ish weights)
     w = _poisson_weights(y_limited)
