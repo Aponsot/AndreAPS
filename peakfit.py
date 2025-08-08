@@ -325,7 +325,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     table_ax = axes[1, 2]
     table_ax.axis("off")
 
-    table_data = [
+    table_data = [ 
         ["R²", f"{m['r2']:.6f}"],
         ["Adj R²", f"{m['adj_r2']:.6f}"],
         ["Reduced χ²", f"{m['red_chisq']:.3g}"],
@@ -347,7 +347,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     table = table_ax.table(cellText=table_data,
                            colLabels=["Metric / Peak", "Value"],
                            cellLoc="center",
-                           loc="center")
+                           loc="center", fontsize=12)
     table.auto_set_font_size(False)
     table.set_fontsize(8)
     table.scale(1.2, 1.25)
