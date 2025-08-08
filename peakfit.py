@@ -126,7 +126,6 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
         props_full,
         bg_degree=1,
         center_window=center_window,
-        model_kind=GaussianModel,
     )
 
     # Plot data + detection bg
