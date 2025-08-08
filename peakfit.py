@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 import argparse
 import numpy as np
 import h5py
@@ -107,15 +107,16 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
 
 def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     """
-    Minimal, robust fit: background poly + sum of Gaussians.
-    Centers tied to global qshift+qscale with tiny per-peak wiggle.
+    Robust fit: background poly + sum of Gaussians.
+    Centers tied to global qshift+qscale with small per-peak wiggle.
+    Also tries quadratic background and keeps it if AIC improves.
     """
     if len(peaks_idx) == 0:
         return None, {}
 
     dq = float(np.diff(q).mean())
 
-    # Background
+    # Background (linear by default)
     composite = PolynomialModel(degree=bg_degree, prefix="bg_")
     params = composite.make_params()
     params["bg_c0"].set(value=float(np.median(y)), min=0)
@@ -142,21 +143,64 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
         # tie: center = qscale*base + qshift + tiny per-peak wiggle
         params.add(f"g{i}_c0", value=center0, vary=False)
-        params.add(f"g{i}_dcenter", value=0.0, min=-0.001, max=0.001)
+
+        # widen the wiggle to ~3 samples or ~0.0018, whichever larger
+        dwig = max(3 * dq, 0.0018)
+        params.add(f"g{i}_dcenter", value=0.0, min=-dwig, max=dwig)
         params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
 
-        params[f"g{i}_sigma"].set(min=0.3 * sigma0, max=3.0 * sigma0)
+        # looser width bounds for melted frames
+        params[f"g{i}_sigma"].set(min=0.25 * sigma0, max=4.0 * sigma0)
         params[f"g{i}_amplitude"].set(min=0.2 * abs(amp0), max=10 * abs(amp0))
 
-    # Robust global fit
+    # Robust global fit (linear bg)
     w = _poisson_weights(y)
     result = composite.fit(
         y, params, x=q, weights=w,
         method="least_squares", fit_kws={"loss": "soft_l1", "f_scale": 1.0}
     )
-
     comps = result.model.eval_components(params=result.params, x=q)
-    return result, comps
+
+    # --- Try quadratic background; keep if AIC improves meaningfully ---
+    best_result, best_comps, best_aic = result, comps, result.aic
+    if bg_degree == 1:
+        comp2 = PolynomialModel(degree=2, prefix="bg2_")
+        m2 = comp2
+        p2 = comp2.make_params()
+        p2["bg2_c0"].set(value=float(np.median(y)), min=0)
+        p2["bg2_c1"].set(value=0)
+        p2["bg2_c2"].set(value=0)
+
+        # Re-add Gaussians seeded from the linear-bg solution
+        for i, _ in enumerate(peaks_idx):
+            g = GaussianModel(prefix=f"g{i}_")
+            m2 += g
+            p2.update(g.make_params(
+                center=best_result.params[f"g{i}_center"].value,
+                sigma=best_result.params[f"g{i}_sigma"].value,
+                amplitude=best_result.params[f"g{i}_amplitude"].value
+            ))
+            # keep center ties and bounds
+            p2.add(f"g{i}_c0", value=best_result.params[f"g{i}_c0"].value, vary=False)
+            p2.add(f"g{i}_dcenter",
+                   value=best_result.params[f"g{i}_dcenter"].value,
+                   min=best_result.params[f"g{i}_dcenter"].min,
+                   max=best_result.params[f"g{i}_dcenter"].max)
+            p2[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
+
+        # global transforms
+        p2.add("qshift", value=best_result.params["qshift"].value,
+               min=best_result.params["qshift"].min, max=best_result.params["qshift"].max)
+        p2.add("qscale", value=best_result.params["qscale"].value,
+               min=best_result.params["qscale"].min, max=best_result.params["qscale"].max)
+
+        r2 = m2.fit(y, p2, x=q, weights=w,
+                    method="least_squares", fit_kws={"loss": "soft_l1", "f_scale": 1.0})
+        if (best_aic - r2.aic) > 2.0:  # worth the extra term
+            best_result = r2
+            best_comps = m2.eval_components(params=r2.params, x=q)
+
+    return best_result, best_comps
 
 
 # --- detection background helpers --- #
@@ -175,9 +219,9 @@ def detect_background_floor(y_win, pct=15, win_frac=0.05, smooth_sigma=2):
     return bg
 
 
-def detect_background_adaptive(y_win, floor_pct=15, floor_win_frac=0.05,
+def detect_background_adaptive(y_win, floor_pct=14, floor_win_frac=0.05,
                                floor_smooth=2, gauss_frac=0.03,
-                               target_frac=0.60, max_iter=12):
+                               target_frac=0.55, max_iter=12):
     """
     Blend between floor and Gaussian so that ~target_frac of points lie
     BELOW the baseline (keeps a true floor while allowing mild slope post-melt).
@@ -237,11 +281,11 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     # Adaptive baseline (floor + gaussian blend picked per frame)
     bg_detect, bg_info = detect_background_adaptive(
         y_win,
-        floor_pct=15,         # try 10–20
-        floor_win_frac=0.05,  # try 0.04–0.07
+        floor_pct=14,         # lowered a bit
+        floor_win_frac=0.05,
         floor_smooth=2,
-        gauss_frac=0.03,      # gaussian sigma ≈ 3% of window length
-        target_frac=0.60      # ~60% of points under baseline
+        gauss_frac=0.03,
+        target_frac=0.55      # sits a touch lower
     )
     y_det = y_win - bg_detect
     print(f"[bg] alpha={bg_info['alpha']:.2f} frac_below={bg_info['frac_below']:.2f} "
@@ -249,13 +293,13 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
 
     # Adaptive thresholds for detection (handles melting)
     sig = _robust_sigma(y_det)
-    K = 4.0  # noise multiplier for prominence; try 3.5–5.0 if needed
+    K = 3.6  # slightly easier picks post-melt
     prom_full = max(1.0, K * sig)
 
     w_guess_pts = 3.0
     wmin = max(1, int(0.6 * w_guess_pts))
-    wmax = int(16 * w_guess_pts)  # allow broader peaks post-melt
-    min_dist_pts = int(max(1, round(0.7 * w_guess_pts)))
+    wmax = int(20 * w_guess_pts)  # allow broader peaks post-melt
+    min_dist_pts = int(max(1, round(0.6 * w_guess_pts)))
 
     peaks, props = signal.find_peaks(
         y_det,
@@ -280,6 +324,33 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     m = fit_metrics(result, q_win, y_win, weights=w)
     print(f"[METRICS] R2={m['r2']:.6f}  adjR2={m['adj_r2']:.6f}  redχ²={m['red_chisq']:.3g}  "
           f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}")
+
+    # --- If R² still low, try a tiny residual add & refit once ---
+    TARGET = 0.98
+    if m['r2'] < TARGET and len(peaks) > 0:
+        yhat = result.model.eval(params=result.params, x=q_win)
+        resid_bg = (y_win - bg_detect) - (yhat - bg_detect)
+        sigR = _robust_sigma(resid_bg)
+        cand, cprops = signal.find_peaks(
+            resid_bg, prominence=2.5 * sigR, width=1,
+            distance=int(max(1, round(0.6 * w_guess_pts)))
+        )
+        keep = []
+        for j, pidx in enumerate(cand):
+            if len(peaks) and np.min(np.abs(q_win[peaks] - q_win[pidx])) < (0.6 * w_guess_pts * dq):
+                continue
+            keep.append(j)
+        if keep:
+            peaks = np.concatenate([np.asarray(peaks, int), cand[keep].astype(int)])
+            widths = np.concatenate([np.asarray(props.get("widths", np.full_like(peaks, 3.0))),
+                                     cprops["widths"][keep]])
+            promin = np.concatenate([np.asarray(props.get("prominences", np.ones_like(peaks))),
+                                     cprops["prominences"][keep]])
+            order = np.argsort(q_win[peaks]); peaks = peaks[order]
+            props = {"widths": widths[order], "prominences": promin[order]}
+            result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
+            m = fit_metrics(result, q_win, y_win, weights=_poisson_weights(y_win))
+            print(f"[refit] R2→{m['r2']:.6f}")
 
     # Dense plotting
     q_dense = np.linspace(q_win.min(), q_win.max(), len(q_win) * 5)
@@ -325,7 +396,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     table_ax = axes[1, 2]
     table_ax.axis("off")
 
-    table_data = [ 
+    table_data = [
         ["R²", f"{m['r2']:.6f}"],
         ["Adj R²", f"{m['adj_r2']:.6f}"],
         ["Reduced χ²", f"{m['red_chisq']:.3g}"],
@@ -336,13 +407,9 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
         ["# Peaks", f"{len(peaks)}"],
         ["", ""],  # spacer
     ]
-    # Add peak centers (and optionally sigma/area—uncomment if wanted)
     for i in range(len(peaks)):
         c = result.params[f"g{i}_center"].value
-        # s = result.params[f"g{i}_sigma"].value
-        # a = result.params[f"g{i}_amplitude"].value
         table_data.append([f"Peak {i} center", f"{c:.6f}"])
-        # table_data.append([f"Peak {i} σ / area", f"{s:.5g} / {a:.5g}"])
 
     table = table_ax.table(cellText=table_data,
                            colLabels=["Metric / Peak", "Value"],
