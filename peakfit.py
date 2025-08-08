@@ -71,7 +71,8 @@ def fit_multi_peaks(
         # Keep amplitude from exploding or flipping wildly
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
     # Global fit
-    result = composite.fit(y_limited, params, x=q_limited)
+        w = 1.0 / np.sqrt(np.clip(y_limited, 1.0, None))
+    result = composite.fit(y_limited, params, x=q_limited, weights=w)
     comps = result.eval_components(x=q_limited)
     return result, comps
 
