@@ -29,7 +29,6 @@ def _build_crude_model(q, peaks_idx, props, dq, floor_amp=1e-9):
         yhat += _gaussian(q, mu, sigma, amp)
     return yhat
 
-
 def _augment_peaks_with_residual(
     q,
     y_bgsub,
@@ -40,10 +39,15 @@ def _augment_peaks_with_residual(
     add_frac=0.45,
     min_sep_sigma=0.8,
     max_iter=2,
+    # --- NEW knobs ---
+    mad_k=3.5,              # residual must exceed k * noise (MAD) to be considered
+    corr_min=0.6,           # min normalized correlation with a Gaussian template
+    aic_drop=2.0,           # require AIC to drop by at least this to accept a new peak
+    width_bounds_pts=(2, 25) # acceptable FWHM in sample points for residual peaks
 ):
     """
     Iteratively detect missed shoulders on the residual of a crude Gaussian sum.
-    y_bgsub is background-subtracted data (detection only).
+    Adds robust gating: noise-aware threshold, shape correlation, and AIC test.
     """
     peaks_idx = np.array(init_idx, dtype=int)
     widths = np.array(
@@ -55,14 +59,50 @@ def _augment_peaks_with_residual(
         dtype=float,
     )
 
-    for _ in range(max_iter):
-        mean_w_pts = float(np.clip(np.nanmean(widths) if widths.size else 3.0, 2.0, 20.0))
-        min_dist_pts = int(max(1, round(min_sep_sigma * mean_w_pts)))
+    def _noise_mad(x):
+        med = np.median(x)
+        mad = np.median(np.abs(x - med))
+        # robust sigma ~ 1.4826 * MAD
+        return 1.4826 * mad
 
+    def _local_mask_away_from_peaks(q, centers, sigmas, span=3.0):
+        if len(centers) == 0:
+            return np.ones_like(q, dtype=bool)
+        mask = np.ones_like(q, dtype=bool)
+        for c, s in zip(centers, sigmas):
+            mask &= ~((q > c - span*s) & (q < c + span*s))
+        return mask
+
+    def _gauss_template_corr(x, y, mu, sig):
+        # build unit-energy Gaussian template on x, correlate with y in a local window
+        t = np.exp(-0.5*((x - mu)/max(sig, 1e-6))**2)
+        t /= np.sqrt((t**2).sum() + 1e-12)
+        y0 = y - y.mean()
+        den = np.sqrt((y0**2).sum()) + 1e-12
+        return float((t * y0).sum() / den)
+
+    def _aic(n, rss, k):
+        # AIC = n*ln(rss/n) + 2k (constant terms ignored)
+        rss = max(rss, 1e-18)
+        return n * np.log(rss / max(n,1)) + 2 * k
+
+    for _ in range(max_iter):
+        # crude model from current seeds
         crude = _build_crude_model(q, peaks_idx, {"widths": widths, "prominences": prominences}, dq)
         residual = y_bgsub - crude
 
-        prom_add = max(0.3, add_frac) * prom_base  # lower threshold for residual
+        # estimate noise from residual far from current peaks
+        centers = q[peaks_idx] if peaks_idx.size else np.array([])
+        sigmas_now = (widths * dq) / 2.355 if widths.size else np.array([])
+        away = _local_mask_away_from_peaks(q, centers, sigmas_now, span=3.0)
+        sigma_noise = _noise_mad(residual[away]) if away.any() else _noise_mad(residual)
+        thr_abs = mad_k * sigma_noise
+
+        # baseline thresholds for residual detection
+        mean_w_pts = float(np.clip(np.nanmean(widths) if widths.size else 3.0, *width_bounds_pts))
+        min_dist_pts = int(max(1, round(min_sep_sigma * mean_w_pts)))
+        prom_add = max(0.3, add_frac) * prom_base
+
         cand_idx, cand_props = signal.find_peaks(
             residual, prominence=prom_add, width=1, distance=min_dist_pts, rel_height=0.5
         )
@@ -70,10 +110,50 @@ def _augment_peaks_with_residual(
         new_idx, new_w, new_p = [], [], []
         for j, pidx in enumerate(cand_idx):
             qj = q[pidx]
+            # spacing from existing peaks
             if peaks_idx.size and np.min(np.abs(q[peaks_idx] - qj)) < (min_dist_pts * dq):
-                continue  # too close to an existing seed
+                continue
+
+            # residual height must exceed robust noise threshold
+            if residual[pidx] < thr_abs:
+                continue
+
+            # width gate (from find_peaks width in pts)
+            w_pts = float(cand_props["widths"][j])
+            if not (width_bounds_pts[0] <= w_pts <= width_bounds_pts[1]):
+                continue
+
+            # local correlation with Gaussian template
+            sig_j = max((w_pts * dq) / 2.355, 1e-6)
+            # take a small local window
+            loc = (q > qj - 3*sig_j) & (q < qj + 3*sig_j)
+            if loc.sum() < 7:
+                continue
+            corr = _gauss_template_corr(q[loc], residual[loc], qj, sig_j)
+            if corr < corr_min:
+                continue
+
+            # --------- AIC gate: does adding this peak help enough? ---------
+            # Model0: crude in the local window
+            y0 = residual[loc]  # residual we are trying to explain (pos bump)
+            n = int(loc.sum())
+            rss0 = float(np.sum((y0 - 0.0)**2))  # residual vs zero (since residual already subtracted crude)
+
+            # one-Gaussian fit on local residual (area param only; center/width fixed)
+            # best amp in LS sense for fixed mu,sigma is linear:
+            gtpl = _gaussian(q[loc], qj, sig_j, 1.0)
+            amp_opt = float(np.dot(gtpl, y0) / (np.dot(gtpl, gtpl) + 1e-12))
+            y1 = amp_opt * gtpl
+            rss1 = float(np.sum((y0 - y1)**2))
+
+            aic0 = _aic(n, rss0, k=0)   # no extra params
+            aic1 = _aic(n, rss1, k=1)   # +1 for amplitude
+            if (aic0 - aic1) < aic_drop:
+                continue
+            # ---------------------------------------------------------------
+
             new_idx.append(pidx)
-            new_w.append(cand_props["widths"][j])
+            new_w.append(w_pts)
             new_p.append(cand_props["prominences"][j])
 
         if not new_idx:
