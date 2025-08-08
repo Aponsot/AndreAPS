@@ -178,7 +178,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
 
     # --- Detection (background-sub only) ---
     dq = float(np.diff(q_win).mean())
-    sigma_smooth_detect = max(3, int(0.06 * len(q_win)))  # gentle, adaptive
+    sigma_smooth_detect = max(2, min(12, int(0.03 * len(q_win))))
     bg_detect = gaussian_filter1d(y_win, sigma=sigma_smooth_detect)
     y_det = y_win - bg_detect
 
