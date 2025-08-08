@@ -64,7 +64,7 @@ def fit_multi_peaks(
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
         params[f"g{i}_center"].set(min=center0 - center_window, max=center0 + center_window)
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
-        params[f"g{i}_amplitude"].set(min=0.25*abs(amp0), max=4*abs(amp0))
+        params[f"g{i}_amplitude"].set(min=0.35*abs(amp0), max=10*abs(amp0))
         
     # Global fit
         w = 1.0 / np.sqrt(np.clip(y_limited, 1.0, None))   # Poisson-ish
