@@ -71,7 +71,12 @@ def fit_multi_peaks(
         # Keep amplitude from exploding or flipping wildly
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
     # Global fit
-        w = 1.0 / np.sqrt(np.clip(y_limited, 1.0, None))
+        w = 1.0 / np.sqrt(np.clip(y_limited, 1.0, None))   # Poisson-ish
+# boost weights near the pair
+        qmid = (params['midpair_mid'].value)
+        halfspan = 0.75*params['midpair_delta'].value
+        boost = ((q_limited > qmid-halfspan) & (q_limited < qmid+halfspan)).astype(float)
+        w = w * (1 + 0.5*boost)   # 1.5x in that region
     result = composite.fit(y_limited, params, x=q_limited, weights=w)
     comps = result.eval_components(x=q_limited)
     return result, comps
