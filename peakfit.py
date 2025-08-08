@@ -11,7 +11,77 @@ from lmfit.models import PolynomialModel, GaussianModel
 def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
     """Convert FWHM in sample points to sigma in x-units using FWHM = 2.355*sigma."""
     return (fwhm_pts * dq) / 2.355
+def _gaussian(x, mu, sig, amp):
+    return amp * np.exp(-0.5*((x - mu)/sig)**2)
 
+def _build_crude_model(q, peaks_idx, props, dq, floor_amp=1e-9):
+    widths = props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float))
+    prominences = props.get("prominences", np.ones_like(peaks_idx, dtype=float))
+    yhat = np.zeros_like(q, dtype=float)
+    for i, pidx in enumerate(peaks_idx):
+        mu = float(q[pidx])
+        sigma = max((widths[i]*dq)/2.355, 1e-6)
+        height = float(prominences[i])
+        amp = max(height * sigma * np.sqrt(2*np.pi), floor_amp)  # area for Gaussian
+        yhat += _gaussian(q, mu, sigma, amp)
+    return yhat
+
+def _augment_peaks_with_residual(q, y_bgsub, init_idx, init_props, dq,
+                                 prom_base=2.0, add_frac=0.4, min_sep_sigma=0.8,
+                                 max_iter=2):
+    """
+    y_bgsub is background-subtracted data used ONLY for detection.
+    We keep orig raw data for fitting elsewhere.
+    """
+    peaks_idx = np.array(init_idx, dtype=int)
+    widths = np.array(init_props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), dtype=float)
+    prominences = np.array(init_props.get("prominences", np.ones_like(peaks_idx, dtype=float)), dtype=float)
+
+    for _ in range(max_iter):
+        if peaks_idx.size == 0:
+            mean_w_pts = 3.0
+        else:
+            mean_w_pts = float(np.clip(np.nanmean(widths), 2.0, 20.0))
+        min_dist_pts = int(max(1, round(min_sep_sigma * mean_w_pts)))
+
+        # crude model from current seeds
+        crude = _build_crude_model(q, peaks_idx, {"widths": widths, "prominences": prominences}, dq)
+        residual = y_bgsub - crude
+
+        # detect on residual with lower threshold
+        prom_add = max(0.3, add_frac) * prom_base
+        cand_idx, cand_props = signal.find_peaks(residual, prominence=prom_add, width=1,
+                                                 distance=min_dist_pts, rel_height=0.5)
+
+        # keep only candidates sufficiently far from existing seeds
+        new_idx = []
+        new_w = []
+        new_p = []
+        for j, pidx in enumerate(cand_idx):
+            qj = q[pidx]
+            if peaks_idx.size and np.min(np.abs(q[peaks_idx] - qj)) < (min_dist_pts * dq):
+                continue
+            new_idx.append(pidx)
+            new_w.append(cand_props["widths"][j])
+            new_p.append(cand_props["prominences"][j])
+
+        if not new_idx:
+            break  # nothing else to add
+
+        # merge
+        peaks_idx = np.concatenate([peaks_idx, np.array(new_idx, dtype=int)])
+        widths = np.concatenate([widths, np.array(new_w, dtype=float)])
+        prominences = np.concatenate([prominences, np.array(new_p, dtype=float)])
+
+        # sort by q
+        order = np.argsort(q[peaks_idx])
+        peaks_idx = peaks_idx[order]
+        widths = widths[order]
+        prominences = prominences[order]
+
+    # return in scipy-like props dict
+    props_out = {"widths": widths, "prominences": prominences}
+    return peaks_idx, props_out
 
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
@@ -198,12 +268,24 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
 
     # ---- FULL AZIMUTHAL ----
     y_full = int_val[frame_number, mask]
+    # background for detection only
     background_full = gaussian_filter1d(y_full, sigma=sigma_smooth)
     data_bg_sub_full = y_full - background_full
 
+# initial detection
     peaks_full, props_full = signal.find_peaks(
         data_bg_sub_full, prominence=prom_full, width=1, rel_height=0.5
+        )
+
+# --- NEW: iterative residual detection to catch shoulders / hidden peaks ---
+    dq = float(np.diff(q_limited).mean())
+    peaks_full, props_full = _augment_peaks_with_residual(
+        q_limited, data_bg_sub_full, peaks_full, props_full, dq,
+        prom_base=prom_full, add_frac=0.45,   # candidate threshold ~45% of base prom
+        min_sep_sigma=0.8, max_iter=2         # tune if needed
     )
+
+    print(f"[FULL] Seeds after augmentation: {len(peaks_full)} @", q_limited[peaks_full])
     print(f"[FULL] Detected {len(peaks_full)} peaks at q:", q_limited[peaks_full])
 
     result_full, comps_full = fit_multi_peaks(
