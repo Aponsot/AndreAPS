@@ -113,7 +113,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     data_bg_sub_full = y_full - background_full
 
     peaks_full, props_full = signal.find_peaks(
-        data_bg_sub_full, prominence=prom_full, width=1
+        data_bg_sub_full, prominence=prom_full, width=1 , rel_height=0.5
     )
 
     print(f"[FULL] Detected {len(peaks_full)} peaks at q:", q_limited[peaks_full])
