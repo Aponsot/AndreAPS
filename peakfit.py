@@ -45,7 +45,11 @@ def fit_multi_peaks(
 
     # Peak model type
     PeakModel = PseudoVoigtModel if model_kind.lower() in ("pv", "pvoigt") else GaussianModel
+    # inside fit_multi_peaks(...) before loop
+    params.add('qshift', value=0.0, min=-5e-3, max=5e-3)  # tune range
 
+#
+# You can still bound qshift globally, so no need for per-peak center bounds now
     # Add a component per detected peak
     for i, pidx in enumerate(peaks_idx):
         center0 = float(q_limited[pidx])
@@ -66,11 +70,6 @@ def fit_multi_peaks(
         params[f"g{i}_sigma"].set(min=sigma0 * 0.25, max=sigma0 * 4)
         # Keep amplitude from exploding or flipping wildly
         params[f"g{i}_amplitude"].set(min=-abs(amp0) * 5, max=abs(amp0) * 5)
-
-        # PseudoVoigt adds eta; start neutral mid-way if present
-        if isinstance(g, PseudoVoigtModel):
-            params[f"g{i}_fraction"].set(value=0.5, min=0, max=1)
-
     # Global fit
     result = composite.fit(y_limited, params, x=q_limited)
     comps = result.eval_components(x=q_limited)
@@ -92,7 +91,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     prom_cake = 2                      # min prominence for cake find_peaks
     prom_full = 2                      # min prominence for full data find_peaks
     model_kind = "gauss"              # 'pvoigt' or 'gauss'
-    center_window = 0.005              # tighten if peaks are VERY close
+    center_window = 0.0005             # tighten if peaks are VERY close
 
     # Window the region around the target peak_pos
     q_min = peak_pos - window
