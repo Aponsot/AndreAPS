@@ -114,7 +114,7 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Using UFloat objects with std_dev==0")
             rep = fit_report(result, show_correl=False)
-            print(rep)
+            #print(rep)
     return result
 
 @dataclass
