@@ -119,9 +119,6 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     composite = PolynomialModel(degree=bg_degree, prefix="bg_")
     params = composite.make_params()
     params["bg_c0"].set(value=float(np.median(y)), min=0)
-    if bg_degree >= 1:
-        params["bg_c1"].set(value=0)
-
     # Global q-axis drift/scale
     params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
     params.add("qscale", value=1.0, min=0.999, max=1.001)
