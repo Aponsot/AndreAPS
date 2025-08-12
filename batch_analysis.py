@@ -5,11 +5,10 @@ import scipy.signal as signal
 from scipy.ndimage import gaussian_filter1d, percentile_filter
 from lmfit.models import PolynomialModel, GaussianModel
 import warnings
-import csv
 from dataclasses import dataclass
 from tqdm import tqdm  
 import argparse
-
+from lmfit.printfuncs import fit_report
 
 def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
     return (fwhm_pts * dq) / 2.355
@@ -112,6 +111,10 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
             y, params, x=q, weights=w,
             method="least_squares", fit_kws={"loss": "soft_l1", "f_scale": 1.0}
         )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Using UFloat objects with std_dev==0")
+            rep = fit_report(result, show_correl=False)
+            print(rep)
     return result
 
 @dataclass
@@ -164,7 +167,7 @@ def fit_one_for_sweep(q_full, int_row, peak_pos, window=0.1):
     params=result.params      # <-- add this
 ), ""
 
-def sweep_frames(h5_path, peak_pos, window=0.1, frames=None, csv_path=None, print_every=50):
+def sweep_frames(h5_path, peak_pos, window=0.1, frames=None):
     with h5py.File(h5_path, "r") as f:
         Int = f["int"][:]
         q = f["q"][:]
@@ -233,4 +236,5 @@ if __name__ == "__main__":
     parser.add_argument("peak_pos", type=float, help="Location of Peak of study")
     args = parser.parse_args()
     sweep_frames(args.h5, args.peak_pos, window=0.1, frames=None, csv_path="peakfit_with_peaks.csv")
+
 
