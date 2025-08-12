@@ -7,62 +7,54 @@ import scipy.signal as signal
 from scipy.ndimage import gaussian_filter1d
 from lmfit.models import PolynomialModel, GaussianModel
 
-
 # ===================== TUNABLE PEAK-FIT PARAMS =====================
-# Detection & noise
-W_GUESS_PTS       = 6.0   # nominal FWHM in *points*
-HP_SIGMA_MULT     = 2.0   # high-pass smoothing = HP_SIGMA_MULT * W_GUESS_PTS
-K_PROM            = 4.0   # noise multiplier for prominence threshold
-MIN_PROM_ABS_FRAC = 0.03  # min prominence as fraction of local dynamic range (after BG removal)
-PROM_ABS_FLOOR    = 1.0   # absolute minimum prominence (counts)
+# Sampling / width prior
+W_GUESS_PTS       = 6.0   # nominal FWHM in *points*; set ~ your median points/FWHM
 
-# Detection width/distance (in points, scaled by W_GUESS_PTS)
-WMIN_FRAC         = 0.6
-WMAX_MULT         = 10.0
-MIN_DIST_FRAC     = 0.8
-MAX_INIT_PEAKS    = 4     # cap initial seeds BEFORE fitting (prune/merge still applies)
+# Detection sensitivity
+K_PROM            = 4.0   # noise multiplier (higher = stricter)
+MIN_PROM_ABS_FRAC = 0.03  # floor as fraction of dynamic range after BG-sub
+PROM_ABS_FLOOR    = 1.0   # absolute minimum prominence in counts
 
-# Exactly how many peaks to fit?
-# - If None: fit exactly the number of seeds found (after pruning/merging/cap).
-# - If an integer (e.g., 2): force exactly that many peaks.
-EXACT_N_PEAKS     = None
+# Multi-scale candidate generation (captures overlaps)
+SCALES_FWHM       = [0.6, 1.0, 1.6, 2.3]  # widths relative to W_GUESS_PTS for matched smoothing
+WMIN_FRAC         = 0.4   # min width (points) = WMIN_FRAC * W_GUESS_PTS
+WMAX_MULT         = 10.0  # max width (points) = WMAX_MULT * W_GUESS_PTS
+MIN_DIST_FRAC_INIT= 0.5   # NMS radius in points = MIN_DIST_FRAC_INIT * W_GUESS_PTS
+VALLEY_FRAC       = 0.15  # require ≥15% valley depth between neighbors
 
-# Gaussian bounds (relative to seed)
-SIGMA_MIN_FRAC    = 0.20  # lower bound on sigma = SIGMA_MIN_FRAC * sigma_seed
-SIGMA_MAX_MULT    = 4.0   # upper bound on sigma = SIGMA_MAX_MULT * sigma_seed
-AMP_MIN_FRAC      = 0.05  # min amplitude (AREA) = AMP_MIN_FRAC * area_seed
-AMP_MAX_MULT      = 20.0  # max amplitude (AREA) = AMP_MAX_MULT * area_seed
-MERGE_FRAC        = .75
+MAX_CANDIDATES    = 12    # hard cap on initial candidates
 
-# Centers: per-peak, not globally tied
-CENTER_WIGGLE_PTS = 8.0   # each center can move ± CENTER_WIGGLE_PTS * dq from its seed
+# Gaussian bounds relative to seeds
+SIGMA_MIN_FRAC    = 0.20
+SIGMA_MAX_MULT    = 4.0
+AMP_MIN_FRAC      = 0.05  # lmfit Gaussian amplitude = AREA
+AMP_MAX_MULT      = 20.0
 
-# Linear background (fit) slope guard
+# Center wiggle per peak (independent centers; no global shift/scale)
+CENTER_WIGGLE_PTS = 8.0   # ± points each center may move from its seed
+
+# Linear background slope guard
 SLOPE_LIMIT_SCALE = 2.0   # |bg_c1| <= SLOPE_LIMIT_SCALE * (yspan/qspan)
 
-# Optional: one-shot residual augment (adds at most one extra peak)
-USE_RESIDUAL_AUGMENT = False
-REFIT_TARGET_R2      = 0.985
+# Backward pruning by BIC
+PRUNE_BIC_DROP    = 2.0   # require ΔBIC ≤ -2.0 to keep a removal (lower is better)
+PRUNE_MAX_STEPS   = 10    # safety cap
 # ==================================================================
-
 
 # ----------------------------- helpers ----------------------------- #
 def _sigma_from_fwhm_pts(fwhm_pts: float, dq: float) -> float:
-    """FWHM (in samples) -> sigma in q-units."""
     return (fwhm_pts * dq) / 2.355
-
 def _fwhm_from_sigma(sigma: float) -> float:
     return 2.355 * sigma
-
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
-
 def _robust_sigma(x):
     med = np.median(x)
     return 1.4826 * np.median(np.abs(x - med))
 
 def robust_linear_bg(q, y, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
-    """Iterative sigma-clipped straight line (used for detection baseline only)."""
+    """Iterative sigma-clipped straight line (detection baseline only)."""
     q = np.asarray(q, float); y = np.asarray(y, float); n = y.size
     if n < 3:
         a = float(np.median(y)); b = 0.0
@@ -89,82 +81,118 @@ def robust_linear_bg(q, y, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
         mask = newmask; kept = mask.sum()
     return (a + b*q), dict(a=a, b=b, kept=kept, iters=it+1)
 
-def estimate_noise(y_det, hp_sigma_pts):
-    """Noise from high-pass residual: y_det - smooth(y_det)."""
-    hp_sigma_pts = max(3, int(round(hp_sigma_pts)))
+def estimate_noise(y_det, w_guess_pts):
+    """Noise from high-pass residual: y_det - gaussian_smooth(y_det) with σ≈W_GUESS_PTS/2."""
+    hp_sigma_pts = max(3.0, 0.5 * w_guess_pts)  # in points
     if y_det.size < 7:
-        return _robust_sigma(y_det), y_det
+        return _robust_sigma(y_det)
     smooth = gaussian_filter1d(y_det, sigma=hp_sigma_pts)
     resid = y_det - smooth
-    return _robust_sigma(resid), resid
+    return _robust_sigma(resid)
 
-def prune_merge_sort(q, peaks, props, peak_pos, w_guess_pts):
-    """Sort by proximity to peak_pos then by prominence; merge too-close; enforce MAX_INIT_PEAKS."""
-    if peaks.size == 0:
-        return np.array([], dtype=int), {"widths": np.array([]), "prominences": np.array([])}
+def nms_candidates(q, score_idx, score_vals, radius_pts):
+    """Non-maximum suppression on indices using a points-radius."""
+    order = np.argsort(-score_vals)  # high score first
+    picked = []
+    for o in order:
+        idx = int(score_idx[o])
+        if all(abs(idx - p) > radius_pts for p in picked):
+            picked.append(idx)
+    return np.array(picked, int)
 
-    order = np.argsort(np.abs(q[peaks] - peak_pos) + 1e-9 * (-props["prominences"]))
-    peaks = peaks[order]
-    widths = props["widths"][order].astype(float)
-    promin = props["prominences"][order].astype(float)
-
-    # merge peaks closer than MERGE_FRAC * W_GUESS_PTS (keep higher prominence)
-    keep = [0]
-    for i in range(1, len(peaks)):
-        prev = keep[-1]
-        if (peaks[i] - peaks[prev]) < int(max(1, MERGE_FRAC * w_guess_pts)):
-            if promin[i] > promin[prev]:
-                keep[-1] = i
-        else:
-            keep.append(i)
-
-    peaks = peaks[keep]; widths = widths[keep]; promin = promin[keep]
-    # cap initial seeds
-    if len(peaks) > MAX_INIT_PEAKS:
-        peaks  = peaks[:MAX_INIT_PEAKS]
-        widths = widths[:MAX_INIT_PEAKS]
-        promin = promin[:MAX_INIT_PEAKS]
-
-    return peaks, {"widths": widths, "prominences": promin}
-
-def seeds_from_detection(q, y_det, dq, peak_pos):
-    """Return seeds: list of (center_q, sigma_seed, area_seed) and detection info."""
+def multiscale_candidates(q, y_det, dq, peak_pos):
+    """Build a generous candidate set from multi-scale matched filtering, valley gating, and NMS."""
+    n = y_det.size
     dyn = max(float(y_det.max() - y_det.min()), 1.0)
-    hp_sigma_pts = HP_SIGMA_MULT * W_GUESS_PTS
-    sig_hp, _ = estimate_noise(y_det, hp_sigma_pts=hp_sigma_pts)
-    prom_thr = max(MIN_PROM_ABS_FRAC * dyn, K_PROM * sig_hp, PROM_ABS_FLOOR)
+    sig_noise = estimate_noise(y_det, W_GUESS_PTS)
+    prom_thr = max(MIN_PROM_ABS_FRAC * dyn, K_PROM * sig_noise, PROM_ABS_FLOOR)
 
     wmin = max(1, int(WMIN_FRAC * W_GUESS_PTS))
     wmax = int(WMAX_MULT * W_GUESS_PTS)
-    mindist = int(max(1, round(MIN_DIST_FRAC * W_GUESS_PTS)))
 
-    peaks, props = signal.find_peaks(
-        y_det, prominence=prom_thr, width=(wmin, wmax), distance=mindist, rel_height=0.5
-    )
-    peaks, props = prune_merge_sort(q, peaks, props, peak_pos, W_GUESS_PTS)
+    cand_idx = []
+    cand_prom = []
+    cand_width = []
+    # collect from each scale
+    for sc in SCALES_FWHM:
+        sigma_pts = max(1.0, (W_GUESS_PTS * sc) / 2.355)
+        y_s = gaussian_filter1d(y_det, sigma=sigma_pts)
+        # adaptive, same thresholds across scales
+        pks, props = signal.find_peaks(
+            y_s, prominence=prom_thr, width=(wmin, wmax), rel_height=0.5
+        )
+        for i, p in enumerate(pks):
+            cand_idx.append(int(p))
+            cand_prom.append(float(props["prominences"][i]) if "prominences" in props else float(y_s[p]))
+            cand_width.append(float(props["widths"][i]) if "widths" in props else W_GUESS_PTS)
 
+    if not cand_idx:
+        # fallback: single candidate at closest point to peak_pos
+        i0 = int(np.argmin(np.abs(q - peak_pos)))
+        return [i0], [W_GUESS_PTS], prom_thr
+
+    cand_idx = np.array(cand_idx, int)
+    cand_prom = np.array(cand_prom, float)
+    cand_width = np.array(cand_width, float)
+
+    # NMS by points radius
+    radius_pts = max(1, int(round(MIN_DIST_FRAC_INIT * W_GUESS_PTS)))
+    keep_idx = nms_candidates(q, cand_idx, cand_prom, radius_pts)
+    cand_idx = cand_idx[np.isin(cand_idx, keep_idx)]
+    # sort by proximity to given peak_pos (then by prominence)
+    order = np.argsort(np.abs(q[cand_idx] - peak_pos) + 1e-6 * (-cand_prom[np.isin(keep_idx, cand_idx, assume_unique=False)]))
+    cand_idx = cand_idx[order]
+    cand_prom = cand_prom[order]
+    cand_width = cand_width[order]
+
+    # valley gating between neighbors (to keep true splits)
+    def valley_ok(i, j):
+        a, b = (i, j) if i < j else (j, i)
+        if b - a < 2:
+            return False
+        valley = float(np.min(y_det[a:b+1]))
+        h_i, h_j = float(y_det[i]), float(y_det[j])
+        depth = min(h_i, h_j) - valley
+        return depth >= (VALLEY_FRAC * max(1.0, min(h_i, h_j)))
+
+    # always keep the strongest near peak_pos, then allow neighbors that pass valley test
+    kept = []
+    for idx in cand_idx:
+        if len(kept) == 0:
+            kept.append(idx)
+            continue
+        # allow if it forms a real valley with the closest kept peak
+        nearest = kept[np.argmin(np.abs(np.array(kept) - idx))]
+        if valley_ok(idx, nearest):
+            kept.append(idx)
+
+    # cap candidates
+    if len(kept) > MAX_CANDIDATES:
+        kept = kept[:MAX_CANDIDATES]
+
+    # provide a matching width per kept idx (fallback to W_GUESS_PTS)
+    widths = []
+    for k in kept:
+        # find a width we measured for this index
+        matches = np.where(cand_idx == k)[0]
+        widths.append(float(cand_width[matches[0]]) if matches.size else W_GUESS_PTS)
+
+    return kept, widths, prom_thr
+
+def seeds_from_candidates(q, y_det, dq, idx_list, width_pts_list):
+    """Convert candidate indices to (center_q, sigma_seed, area_seed)."""
     seeds = []
-    for i, idx in enumerate(peaks):
-        fwhm_pts = float(props["widths"][i]) if "widths" in props and len(props["widths"])>i else W_GUESS_PTS
-        sigma_seed = _sigma_from_fwhm_pts(max(fwhm_pts, 1.0), dq)
-        height_est = max(float(y_det[idx]), 1.0)
-        area_seed = height_est * sigma_seed * np.sqrt(2*np.pi)  # GaussianModel amplitude = area
-        seeds.append((float(q[idx]), sigma_seed, area_seed))
+    for idx, wpts in zip(idx_list, width_pts_list):
+        sigma_seed = _sigma_from_fwhm_pts(max(1.0, wpts), dq)
+        height = max(float(y_det[idx]), 1.0)
+        area = height * sigma_seed * np.sqrt(2*np.pi)  # Gaussian AREA
+        seeds.append((float(q[idx]), sigma_seed, area))
+    return seeds
 
-    # Fallback if none
-    if not seeds:
-        sigma0 = _sigma_from_fwhm_pts(W_GUESS_PTS, dq)
-        i0 = int(np.nanargmin(np.abs(q - peak_pos)))
-        height0 = max(float(y_det[i0]), 1.0)
-        area0 = height0 * sigma0 * np.sqrt(2*np.pi)
-        seeds = [(float(q[i0]), sigma0, area0)]
-
-    return seeds, dict(prom_thr=prom_thr, wmin=wmin, wmax=wmax, mindist=mindist)
-
-def build_and_fit(q, y, seeds, npeaks):
-    """Linear background + exactly npeaks Gaussians. Returns (result, components)."""
+def build_and_fit(q, y, seeds):
+    """Linear background + all seeds Gaussians. Returns (result, components)."""
     dq = float(np.diff(q).mean())
-    # linear background with guarded slope
+    # linear background (degree 1) with slope bound
     bg = PolynomialModel(degree=1, prefix="bg_")
     model = bg
     params = bg.make_params()
@@ -175,31 +203,18 @@ def build_and_fit(q, y, seeds, npeaks):
     smax = SLOPE_LIMIT_SCALE * yspan / qspan
     params["bg_c1"].set(min=-smax, max=+smax)
 
-    # ensure we have exactly npeaks seeds: split strongest if too few, trim if too many
-    seeds = list(seeds)
-    if len(seeds) > npeaks:
-        # keep first npeaks (already sorted by proximity/prominence)
-        seeds = seeds[:npeaks]
-    while len(seeds) < npeaks:
-        j = int(np.argmax([a for _,_,a in seeds]))
-        c, s, a = seeds.pop(j)
-        offset = 0.40 * _fwhm_from_sigma(s)
-        seeds += [(c - offset/2, s, a/2), (c + offset/2, s, a/2)]
-
+    # add Gaussians
     for i, (c0, s0, a0) in enumerate(seeds):
         g = GaussianModel(prefix=f"g{i}_")
         model += g
         params.update(g.make_params(center=c0, sigma=max(1e-6, s0), amplitude=max(1e-9, a0)))
-        # per-peak center wiggle
         wig = CENTER_WIGGLE_PTS * dq
         params[f"g{i}_center"].set(min=c0 - wig, max=c0 + wig)
-        # sigma & area bounds relative to seed
         params[f"g{i}_sigma"].set(min=max(1e-6, SIGMA_MIN_FRAC * s0),
                                   max=max(2e-6, SIGMA_MAX_MULT * s0))
         params[f"g{i}_amplitude"].set(min=max(1e-9, AMP_MIN_FRAC * abs(a0)),
                                       max=max(1e-8, AMP_MAX_MULT * abs(a0)))
 
-    # fit
     w = _poisson_weights(y)
     result = model.fit(y, params, x=q, weights=w,
                        method="least_squares",
@@ -231,16 +246,47 @@ def fit_metrics(result, x, y, weights=None):
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
 
+def prune_by_bic(q, y, seeds):
+    """Start with all seeds; iteratively remove one Gaussian if BIC improves by ≥ PRUNE_BIC_DROP."""
+    if not seeds:
+        return build_and_fit(q, y, [(float(q[len(q)//2]), _sigma_from_fwhm_pts(W_GUESS_PTS, float(np.diff(q).mean())), 1.0)])
 
+    # initial fit
+    result, comps = build_and_fit(q, y, seeds)
+    w = _poisson_weights(y)
+    m = fit_metrics(result, q, y, weights=w)
+    current = dict(seeds=seeds, result=result, comps=comps, metrics=m)
+
+    for step in range(PRUNE_MAX_STEPS):
+        n_now = len(current["seeds"])
+        if n_now <= 1:
+            break
+        # evaluate removing each peak once; choose the best BIC
+        best_drop = None
+        best_state = None
+        for i in range(n_now):
+            seeds_try = current["seeds"][:i] + current["seeds"][i+1:]
+            res_try, comp_try = build_and_fit(q, y, seeds_try)
+            m_try = fit_metrics(res_try, q, y, weights=w)
+            # ΔBIC = new - old (we want negative to improve)
+            dBIC = m_try["bic"] - current["metrics"]["bic"]
+            if (best_drop is None) or (m_try["bic"] < best_state["metrics"]["bic"]):
+                best_drop = (i, dBIC)
+                best_state = dict(seeds=seeds_try, result=res_try, comps=comp_try, metrics=m_try)
+        # accept removal only if BIC improved by at least PRUNE_BIC_DROP
+        if best_drop is None or best_drop[1] > -PRUNE_BIC_DROP:
+            break
+        current = best_state  # keep pruned model
+
+    return current["result"], current["comps"], current["metrics"]
 # ----------------------------- main ----------------------------- #
 def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
-    # load
     with h5py.File(h5_path, "r") as f:
         Int = f["int"][:]  # (nframes, q)
         q = f["q"][:]      # (q,)
 
     # window
-    q_min, q_max = peak_pos - window, peak_pos + window
+    q_min, q_max = float(peak_pos - window), float(peak_pos + window)
     mask = (q >= q_min) & (q <= q_max)
     q_win = q[mask]
     y_win = Int[int(frame_number), mask].astype(float)
@@ -249,83 +295,48 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
 
     dq = float(np.diff(q_win).mean())
 
-    # detection baseline (linear) and bg-sub for seeding
-    bg_det, _ = robust_linear_bg(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_iter=10)
+    # detection baseline (strict linear), build BG-sub for seeding
+    bg_det, bg_info = robust_linear_bg(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_iter=10)
     y_det = y_win - bg_det
 
-    # seeds from detection
-    seeds, detinfo = seeds_from_detection(q_win, y_det, dq, peak_pos)
-    seeds_used = len(seeds)
+    # multi-scale candidates → seeds
+    idx_list, width_pts_list, prom_thr = multiscale_candidates(q_win, y_det, dq, peak_pos)
+    seeds = seeds_from_candidates(q_win, y_det, dq, idx_list, width_pts_list)
 
-    # decide npeaks to fit (no model selection)
-    if EXACT_N_PEAKS is None:
-        npeaks = seeds_used
-    else:
-        npeaks = int(EXACT_N_PEAKS)
-
-    # fit exactly npeaks
-    result, comps = build_and_fit(q_win, y_win, seeds, npeaks)
-
-    # optional: one-shot residual augment (adds at most one) — disabled by default
-    if USE_RESIDUAL_AUGMENT and EXACT_N_PEAKS is None:
-        w = _poisson_weights(y_win)
-        m_now = fit_metrics(result, q_win, y_win, weights=w)
-        if m_now["r2"] < REFIT_TARGET_R2:
-            yhat = result.model.eval(params=result.params, x=q_win)
-            resid = y_win - yhat
-            sigR = _robust_sigma(resid)
-            cand, props = signal.find_peaks(resid, prominence=2.5*sigR, width=1)
-            if cand.size:
-                centers_now = np.array([result.params[f"g{i}_center"].value for i in range(npeaks)], float)
-                for p in cand:
-                    if np.min(np.abs(q_win[p] - centers_now)) > (0.6 * W_GUESS_PTS * dq):
-                        s0 = _sigma_from_fwhm_pts(W_GUESS_PTS, dq)
-                        a0 = max(resid[p], 1.0) * s0 * np.sqrt(2*np.pi)
-                        seeds2 = [(result.params[f"g{i}_center"].value,
-                                   max(1e-6, result.params[f"g{i}_sigma"].value),
-                                   max(1e-9, result.params[f"g{i}_amplitude"].value)) for i in range(npeaks)]
-                        seeds2.append((float(q_win[p]), s0, a0))
-                        result, comps = build_and_fit(q_win, y_win, seeds2, npeaks+1)
-                        npeaks += 1
-                        break  # add only one
-
-    # metrics
-    w = _poisson_weights(y_win)
-    metrics = fit_metrics(result, q_win, y_win, weights=w)
+    # prune by BIC (fluid number of peaks)
+    result, comps, metrics = prune_by_bic(q_win, y_win, seeds)
 
     # ----------- plotting -----------
-    fig, ax = plt.subplots(2, 1, figsize=(11, 8), gridspec_kw={"height_ratios": [3, 2]})
+    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(11, 8), gridspec_kw={"height_ratios": [3, 2]})
 
-    # top: data + fit + components
-    ax0 = ax[0]
     ax0.plot(q_win, y_win, "k.", ms=3, label="Data")
 
     # fitted BG (linear)
     if "bg_" in comps:
         ax0.plot(q_win, comps["bg_"], "-", lw=1.2, label="BG (fit, linear)")
 
-    # total fit (dense)
+    # total fit
     q_dense = np.linspace(q_win.min(), q_win.max(), len(q_win)*5)
     y_dense = result.model.eval(params=result.params, x=q_dense)
-    ax0.plot(q_dense, y_dense, "-", lw=1.6, label=f"Total fit ({npeaks} Gaussian{'s' if npeaks>1 else ''})")
+    ax0.plot(q_dense, y_dense, "-", lw=1.6, label="Total fit")
 
-    # individual Gaussians
+    # components
     comp_dense = result.model.eval_components(params=result.params, x=q_dense)
-    for k in sorted([k for k in comp_dense if k.startswith("g")]):
+    gnames = sorted([k for k in comp_dense if k.startswith("g")])
+    for k in gnames:
         ax0.plot(q_dense, comp_dense[k], ":", lw=1.0, label=k)
 
-    # mark centers
-    centers = [result.params[f"g{i}_center"].value for i in range(npeaks)]
-    ax0.plot(centers, [np.interp(c, q_dense, y_dense) for c in centers], "x", ms=8, label="Peak centers")
+    # mark fitted centers
+    centers = [result.params[f"g{i}_center"].value for i in range(len(gnames))]
+    ax0.plot(centers, [np.interp(c, q_dense, y_dense) for c in centers], "x", ms=8, label="Centers")
 
     ax0.set_xlabel("q"); ax0.set_ylabel("Intensity")
-    ax0.set_title(f"Frame {frame_number} | seeds used: {seeds_used} | npeaks fit: {npeaks}")
+    ax0.set_title(f"Frame {frame_number} | seeds init: {len(seeds)} | fitted peaks: {len(gnames)}")
     ax0.legend(loc="best", fontsize=8)
 
-    # bottom: metrics + per-peak params
-    ax1 = ax[1]; ax1.axis("off")
+    # metrics table
+    ax1.axis("off")
     rows = [
-        ["Metric", "Value"],
         ["R²", f"{metrics['r2']:.6f}"],
         ["Adj R²", f"{metrics['adj_r2']:.6f}"],
         ["Reduced χ²", f"{metrics['red_chisq']:.3g}"],
@@ -333,13 +344,10 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
         ["BIC", f"{metrics['bic']:.2f}"],
         ["RMSE", f"{metrics['rmse']:.3g}"],
         ["Max |res|", f"{metrics['max_abs']:.3g}"],
-        ["# Peaks", f"{npeaks}"],
-        ["Detection prom≥", f"{detinfo['prom_thr']:.3g}"],
-        ["Width range (pts)", f"[{detinfo['wmin']},{detinfo['wmax']}]"],
-        ["Min dist (pts)", f"{detinfo['mindist']}"],
+        ["Det. prom≥", f"{prom_thr:.3g}"],
         ["", ""],
     ]
-    for i in range(npeaks):
+    for i in range(len(gnames)):
         c = result.params[f"g{i}_center"].value
         s = result.params[f"g{i}_sigma"].value
         a = result.params[f"g{i}_amplitude"].value  # AREA
@@ -358,16 +366,14 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     plt.tight_layout()
     plt.show()
 
-
 # ----------------------------- CLI ----------------------------- #
 def _parse_args():
-    p = argparse.ArgumentParser(description="Linear-BG Gaussian peak fitting (no model selection).")
+    p = argparse.ArgumentParser(description="Fluid Gaussian peak fitting with linear background and BIC pruning.")
     p.add_argument("h5", type=str)
     p.add_argument("frame_number", type=int)
     p.add_argument("peak_pos", type=float)
     p.add_argument("--window", type=float, default=0.1, help="Half-window in q around peak_pos")
     return p.parse_args()
-
 
 if __name__ == "__main__":
     args = _parse_args()
