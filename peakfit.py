@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import numpy as np
 import h5py
@@ -106,19 +107,20 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
 
 def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     """
-    Robust fit: background poly + sum of Gaussians.
+    Robust fit: background = strictly linear (degree 1) + sum of Gaussians.
     Centers tied to global qshift+qscale with small per-peak wiggle.
-    Also tries quadratic background and keeps it if AIC improves.
     """
     if len(peaks_idx) == 0:
         return None, {}
 
     dq = float(np.diff(q).mean())
 
-    # Background (linear by default)
-    composite = PolynomialModel(degree=bg_degree, prefix="bg_")
+    # ---- STRICTLY LINEAR BACKGROUND ----
+    composite = PolynomialModel(degree=1, prefix="bg_")
     params = composite.make_params()
     params["bg_c0"].set(value=float(np.median(y)), min=0)
+    params["bg_c1"].set(value=0.0)  # seed slope; no higher-degree terms
+
     # Global q-axis drift/scale
     params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
     params.add("qscale", value=1.0, min=0.999, max=1.001)
@@ -157,46 +159,8 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     )
     comps = result.model.eval_components(params=result.params, x=q)
 
-    # --- Try quadratic background; keep if AIC improves meaningfully ---
-    best_result, best_comps, best_aic = result, comps, result.aic
-    if bg_degree == 1:
-        comp2 = PolynomialModel(degree=2, prefix="bg2_")
-        m2 = comp2
-        p2 = comp2.make_params()
-        p2["bg2_c0"].set(value=float(np.median(y)), min=0)
-        p2["bg2_c1"].set(value=0)
-        p2["bg2_c2"].set(value=0)
-
-        # Re-add Gaussians seeded from the linear-bg solution
-        for i, _ in enumerate(peaks_idx):
-            g = GaussianModel(prefix=f"g{i}_")
-            m2 += g
-            p2.update(g.make_params(
-                center=best_result.params[f"g{i}_center"].value,
-                sigma=best_result.params[f"g{i}_sigma"].value,
-                amplitude=best_result.params[f"g{i}_amplitude"].value
-            ))
-            # keep center ties and bounds
-            p2.add(f"g{i}_c0", value=best_result.params[f"g{i}_c0"].value, vary=False)
-            p2.add(f"g{i}_dcenter",
-                   value=best_result.params[f"g{i}_dcenter"].value,
-                   min=best_result.params[f"g{i}_dcenter"].min,
-                   max=best_result.params[f"g{i}_dcenter"].max)
-            p2[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
-
-        # global transforms
-        p2.add("qshift", value=best_result.params["qshift"].value,
-               min=best_result.params["qshift"].min, max=best_result.params["qshift"].max)
-        p2.add("qscale", value=best_result.params["qscale"].value,
-               min=best_result.params["qscale"].min, max=best_result.params["qscale"].max)
-
-        r2 = m2.fit(y, p2, x=q, weights=w,
-                    method="least_squares", fit_kws={"loss": "soft_l1", "f_scale": 1.0})
-        if (best_aic - r2.aic) > 2.0:  # worth the extra term
-            best_result = r2
-            best_comps = m2.eval_components(params=r2.params, x=q)
-
-    return best_result, best_comps
+    # NO quadratic fallback — background is fixed to degree=1.
+    return result, comps
 
 
 # --- detection background helpers --- #
@@ -221,6 +185,7 @@ def detect_background_adaptive(y_win, floor_pct=14, floor_win_frac=0.05,
     """
     Blend between floor and Gaussian so that ~target_frac of points lie
     BELOW the baseline (keeps a true floor while allowing mild slope post-melt).
+    Used only for detection; the fit background is strictly linear.
     """
     n = len(y_win)
     # floor
@@ -314,7 +279,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
             peaks, props = peaks_try, props_try
             print(f"[detect] after residual augment: {len(peaks)} @ {q_win[peaks]}")
 
-    # --- Fit ---
+    # --- Fit (strict linear BG) ---
     result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
     w = 1.0 / np.sqrt(np.clip(y_win, 1.0, None))  # same weights used in fit
     m = fit_metrics(result, q_win, y_win, weights=w)
@@ -421,7 +386,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
 
 # ----------------------------- CLI ----------------------------- #
 def _parse_args():
-    p = argparse.ArgumentParser(description="Lean multi-peak Gaussian fitting with adaptive detection baseline.")
+    p = argparse.ArgumentParser(description="Multi-peak Gaussian fitting with STRICT linear background.")
     p.add_argument("h5", type=str)
     p.add_argument("frame_number", type=int)
     p.add_argument("peak_pos", type=float)
