@@ -138,13 +138,22 @@ def multiscale_candidates(q, y_det, dq, peak_pos):
     # NMS by points radius
     radius_pts = max(1, int(round(MIN_DIST_FRAC_INIT * W_GUESS_PTS)))
     keep_idx = nms_candidates(q, cand_idx, cand_prom, radius_pts)
-    cand_idx = cand_idx[np.isin(cand_idx, keep_idx)]
-    # sort by proximity to given peak_pos (then by prominence)
-    order = np.argsort(np.abs(q[cand_idx] - peak_pos) + 1e-6 * (-cand_prom[np.isin(keep_idx, cand_idx, assume_unique=False)]))
-    cand_idx = cand_idx[order]
-    cand_prom = cand_prom[order]
-    cand_width = cand_width[order]
 
+    # fallback: keep the single strongest candidate if NMS returned none
+    if len(keep_idx) == 0:
+        keep_idx = np.array([int(cand_idx[np.argmax(cand_prom)])])
+
+    # >>> FIX: apply the SAME mask to all arrays
+    mask_keep = np.isin(cand_idx, keep_idx)
+    cand_idx   = cand_idx[mask_keep]
+    cand_prom  = cand_prom[mask_keep]
+    cand_width = cand_width[mask_keep]
+
+    # sort by proximity to peak_pos, tie-break by higher prominence
+    order = np.argsort(np.abs(q[cand_idx] - peak_pos) + 1e-9 * (-cand_prom))
+    cand_idx   = cand_idx[order]
+    cand_prom  = cand_prom[order]
+    cand_width = cand_width[order]
     # valley gating between neighbors (to keep true splits)
     def valley_ok(i, j):
         a, b = (i, j) if i < j else (j, i)
