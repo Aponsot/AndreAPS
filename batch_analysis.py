@@ -8,6 +8,7 @@ import warnings
 import csv
 from dataclasses import dataclass
 from tqdm import tqdm  
+import argparse
 
 
 def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
@@ -225,10 +226,11 @@ def sweep_frames(h5_path, peak_pos, window=0.1, frames=None, csv_path=None, prin
     else:
         print("all frames fit successfully")
     return summaries
-
 # Example usage
 if __name__ == "__main__":
-    h5 = r"C:\Users\Andre\OneDrive - Oregon State University\APS Intern\EXP016_IncGrCInc_18_1ms_250Hz_line_P400w_S0p5_StF2p5_FTopm50_Att200_11.h5"
-    peak_pos = 6.8
-    window = 0.1
-    sweep_frames(h5, peak_pos, window=0.1, frames=None, csv_path="peakfit_with_peaks.csv")
+    parser = argparse.ArgumentParser(description="Polar integration of diffraction experiments.")
+    parser.add_argument("h5", type=str, help="Path to the folder containing TIFF images.")
+    parser.add_argument("peak_pos", type=str, required=True, help="Path to the instrument YAML file.")
+    args = parser.parse_args()
+    sweep_frames(args.h5, args.peak_pos, window=0.1, frames=None, csv_path="peakfit_with_peaks.csv")
+
