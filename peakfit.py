@@ -4,12 +4,41 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 import scipy.signal as signal
+from scipy.ndimage import gaussian_filter1d  # for noise estimate
 from lmfit.models import PolynomialModel, GaussianModel
+
+
+# ===================== TUNABLE PEAK-FIT PARAMS =====================
+# Set these to refine detection & fit behavior.
+W_GUESS_PTS       = 3.0   # nominal FWHM in *points*
+HP_SIGMA_MULT     = 2.0   # high-pass smoothing = HP_SIGMA_MULT * W_GUESS_PTS
+K_PROM            = 4.0   # noise multiplier for prominence threshold
+MIN_PROM_ABS_FRAC = 0.03  # 3% of local dynamic range as absolute floor
+PROM_ABS_FLOOR    = 1.0   # absolute minimum prominence (counts)
+
+WMIN_FRAC         = 0.6   # min width (points) = WMIN_FRAC * W_GUESS_PTS
+WMAX_MULT         = 8.0   # max width (points) = WMAX_MULT * W_GUESS_PTS
+MIN_DIST_FRAC     = 0.8   # min distance between peaks (points) = MIN_DIST_FRAC * W_GUESS_PTS
+
+MERGE_FRAC        = 0.75  # merge peaks closer than MERGE_FRAC * W_GUESS_PTS (keep higher prom)
+MAX_PEAKS         = 4     # hard cap on number of peaks to fit
+
+SLOPE_LIMIT_SCALE = 2.0   # |bg_c1| <= SLOPE_LIMIT_SCALE * (yspan/qspan)
+
+SIGMA_MIN_FRAC    = 0.20  # lower bound on sigma = SIGMA_MIN_FRAC * sigma0
+SIGMA_MAX_MULT    = 3.0   # upper bound on sigma = SIGMA_MAX_MULT * sigma0
+AMP_MIN_FRAC      = 0.10  # min amplitude = AMP_MIN_FRAC * initial amplitude
+AMP_MAX_MULT      = 10.0  # max amplitude = AMP_MAX_MULT * initial amplitude
+
+REFIT_TARGET_R2   = 0.98  # if R^2 below this, try one residual-based augment+refit
+# ==================================================================
+
 
 # ----------------------------- helpers ----------------------------- #
 def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
     """FWHM -> sigma in x-units via FWHM = 2.355*sigma."""
     return (fwhm_pts * dq) / 2.355
+
 
 def fit_metrics(result, x, y, weights=None):
     yhat = result.model.eval(params=result.params, x=x)
@@ -34,11 +63,71 @@ def fit_metrics(result, x, y, weights=None):
     bic = result.bic
     rmse = np.sqrt(sse / n)
     max_abs = float(np.max(np.abs(resid)))
+
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
 
+
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
+
+
+def _estimate_noise(y_det, hp_sigma_pts=6):
+    """Estimate noise via high-pass residual: y_det - gaussian_smooth(y_det)."""
+    if len(y_det) < 7:
+        return _robust_sigma(y_det), y_det
+    smooth = gaussian_filter1d(y_det, sigma=hp_sigma_pts)
+    resid = y_det - smooth
+    return _robust_sigma(resid), resid
+
+
+def _prune_and_merge_peaks(q, y_det, peaks, props, dq,
+                           w_guess_pts=W_GUESS_PTS, merge_frac=MERGE_FRAC,
+                           max_peaks=MAX_PEAKS):
+    """Merge too-close peaks, then cap by prominence."""
+    if len(peaks) <= 1:
+        return peaks, props
+
+    order = np.argsort(peaks)
+    peaks = peaks[order]
+    widths = np.asarray(props.get("widths", np.full_like(peaks, w_guess_pts)), float)[order]
+    promin = np.asarray(props.get("prominences", np.ones_like(peaks)), float)[order]
+
+    keep = [0]
+    for i in range(1, len(peaks)):
+        prev = keep[-1]
+        if (peaks[i] - peaks[prev]) < int(max(1, merge_frac * w_guess_pts)):
+            # keep the more prominent
+            if promin[i] > promin[prev]:
+                keep[-1] = i
+        else:
+            keep.append(i)
+    peaks = peaks[keep]
+    widths = widths[keep]
+    promin = promin[keep]
+
+    if len(peaks) > max_peaks:
+        idx = np.argsort(promin)[-max_peaks:]
+        idx.sort()
+        peaks = peaks[idx]
+        widths = widths[idx]
+        promin = promin[idx]
+
+    return peaks, {"widths": widths, "prominences": promin}
+
+
+def _fit_linear_only(q, y):
+    """Fit only the linear background (used when no peaks are detected)."""
+    bg = PolynomialModel(degree=1, prefix="bg_")
+    p = bg.make_params()
+    p["bg_c0"].set(value=float(np.median(y)), min=0)
+    p["bg_c1"].set(value=0.0)
+    w = _poisson_weights(y)
+    res = bg.fit(y, p, x=q, weights=w, method="least_squares",
+                 fit_kws={"loss": "soft_l1", "f_scale": 1.0})
+    comps = res.model.eval_components(params=res.params, x=q)
+    return res, comps
+
 
 def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
                            add_frac=0.45, min_sep_sigma=0.8):
@@ -46,7 +135,7 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
     if len(peaks_idx) == 0:
         return peaks_idx, props
 
-    widths = np.array(props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), float)
+    widths = np.array(props.get("widths", np.full_like(peaks_idx, W_GUESS_PTS, dtype=float)), float)
     promin = np.array(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
 
     # crude model of current peaks
@@ -59,7 +148,7 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
 
     residual = y_bgsub - yhat
 
-    mean_w_pts = float(np.clip(np.nanmean(widths) if widths.size else 3.0, 2.0, 20.0))
+    mean_w_pts = float(np.clip(np.nanmean(widths) if widths.size else W_GUESS_PTS, 2.0, 20.0))
     min_dist_pts = int(max(1, round(min_sep_sigma * mean_w_pts)))
 
     prom_base = float(np.median(promin)) if promin.size else 2.0
@@ -91,7 +180,8 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
     order = np.argsort(q[peaks_idx])
     return peaks_idx[order], {"widths": widths[order], "prominences": promin[order]}
 
-# ---------------- STRICTLY LINEAR BACKGROUND (fit) ---------------- #
+
+# ---------------- STRICT LINEAR BACKGROUND FOR FIT ---------------- #
 def fit_multi_peaks(q, y, peaks_idx, props):
     """Linear background (degree=1) + sum of Gaussians. No higher-degree terms."""
     if len(peaks_idx) == 0:
@@ -99,17 +189,18 @@ def fit_multi_peaks(q, y, peaks_idx, props):
 
     dq = float(np.diff(q).mean())
 
-    # Linear background
+    # Linear background with bounded slope
     composite = PolynomialModel(degree=1, prefix="bg_")
     params = composite.make_params()
     params["bg_c0"].set(value=float(np.median(y)), min=0)
-    params["bg_c1"].set(value=0.0)  # slope seed
+    params["bg_c1"].set(value=0.0)
 
-    # Global q-axis drift/scale for peak centers
-    params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
-    params.add("qscale", value=1.0, min=0.999, max=1.001)
+    qspan = max(q.max() - q.min(), 1e-9)
+    yspan = max(np.percentile(y, 95) - np.percentile(y, 5), 1.0)
+    smax = SLOPE_LIMIT_SCALE * yspan / qspan
+    params["bg_c1"].set(min=-smax, max=+smax)
 
-    fwhm_pts = np.asarray(props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), float)
+    fwhm_pts = np.asarray(props.get("widths", np.full_like(peaks_idx, W_GUESS_PTS, dtype=float)), float)
     prominences = np.asarray(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
 
     for i, pidx in enumerate(peaks_idx):
@@ -129,16 +220,22 @@ def fit_multi_peaks(q, y, peaks_idx, props):
         params.add(f"g{i}_dcenter", value=0.0, min=-dwig, max=dwig)
         params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
 
-        params[f"g{i}_sigma"].set(min=0.25 * sigma0, max=4.0 * sigma0)
-        params[f"g{i}_amplitude"].set(min=0.2 * abs(amp0), max=10 * abs(amp0))
+        # width & amplitude bounds (tighter than before)
+        params[f"g{i}_sigma"].set(min=SIGMA_MIN_FRAC * sigma0, max=SIGMA_MAX_MULT * sigma0)
+        params[f"g{i}_amplitude"].set(min=AMP_MIN_FRAC * abs(amp0), max=AMP_MAX_MULT * abs(amp0))
 
-    # Fit with Poisson-esque weights, robust loss
+    # Global q-axis drift/scale for peak centers
+    params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
+    params.add("qscale", value=1.0, min=0.999, max=1.001)
+
+    # Fit with Poisson-like weights, robust loss
     w = _poisson_weights(y)
     result = composite.fit(y, params, x=q, weights=w,
                            method="least_squares",
                            fit_kws={"loss": "soft_l1", "f_scale": 1.0})
     comps = result.model.eval_components(params=result.params, x=q)
     return result, comps
+
 
 # -------------- ROBUST LINEAR BASELINE FOR DETECTION -------------- #
 def detect_background_linear(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
@@ -163,19 +260,16 @@ def detect_background_linear(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_i
         a, b = float(beta[0]), float(beta[1])
         bg = a + b*q
         resid = y - bg
-        # robust sigma from points currently considered background
         rsel = resid[mask]
         med = np.median(rsel)
         sig = 1.4826 * np.median(np.abs(rsel - med)) if rsel.size > 0 else 0.0
         if sig == 0.0:
             break
-        # keep points that are not far above the line (downward clipping)
         below = y <= (bg + clip_sigma * sig)
-        # of those, keep the lowest residual fraction
         idx = np.where(below)[0]
         if idx.size < 5:
             break
-        order = np.argsort(resid[idx])  # most negative (below line) first
+        order = np.argsort(resid[idx])
         k = max(5, int(frac_keep * idx.size))
         newmask = np.zeros(n, dtype=bool)
         newmask[idx[order[:k]]] = True
@@ -188,9 +282,11 @@ def detect_background_linear(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_i
     bg = a + b*q
     return bg, {"a": a, "b": b, "iters": it + 1, "kept": int(kept)}
 
+
 def _robust_sigma(x):
     med = np.median(x)
     return 1.4826 * np.median(np.abs(x - med))
+
 
 # ----------------------------- main ----------------------------- #
 def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_detect_bg=True):
@@ -217,15 +313,15 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
     y_det = y_win - bg_detect
     print(f"[bg-detect-linear] a={bg_info['a']:.3g}  b={bg_info['b']:.3g}  iters={bg_info['iters']}  kept={bg_info['kept']}")
 
-    # Adaptive thresholds for detection
-    sig = _robust_sigma(y_det)
-    K = 3.6
-    prom_full = max(1.0, K * sig)
+    # --- Conservative detection on high-pass residual ---
+    hp_sigma_pts = int(round(HP_SIGMA_MULT * W_GUESS_PTS))
+    sig_hp, hp_resid = _estimate_noise(y_det, hp_sigma_pts=max(3, hp_sigma_pts))
+    dyn = max(y_det.max() - y_det.min(), 1.0)
+    prom_full = max(MIN_PROM_ABS_FRAC * dyn, K_PROM * sig_hp, PROM_ABS_FLOOR)
 
-    w_guess_pts = 3.0
-    wmin = max(1, int(0.6 * w_guess_pts))
-    wmax = int(20 * w_guess_pts)
-    min_dist_pts = int(max(1, round(0.6 * w_guess_pts)))
+    wmin = max(1, int(WMIN_FRAC * W_GUESS_PTS))
+    wmax = int(WMAX_MULT * W_GUESS_PTS)
+    min_dist_pts = int(max(1, round(MIN_DIST_FRAC * W_GUESS_PTS)))
 
     peaks, props = signal.find_peaks(
         y_det,
@@ -234,49 +330,60 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
         distance=min_dist_pts,
         rel_height=0.5,
     )
-    print(f"[detect] sig={sig:.3g} prom>={prom_full:.3g} width∈[{wmin},{wmax}] N={len(peaks)}")
 
-    if augment and len(peaks) > 0:
-        peaks_try, props_try = _augment_once_residual(
-            q_win, y_det, peaks, props, dq, add_frac=0.40, min_sep_sigma=0.8
-        )
-        if len(peaks_try) > len(peaks):
-            peaks, props = peaks_try, props_try
-            print(f"[detect] after residual augment: {len(peaks)} @ {q_win[peaks]}")
+    peaks, props = _prune_and_merge_peaks(
+        q_win, y_det, peaks, props, dq,
+        w_guess_pts=W_GUESS_PTS, merge_frac=MERGE_FRAC, max_peaks=MAX_PEAKS
+    )
+    print(f"[detect] hp_sig={sig_hp:.3g} prom>={prom_full:.3g} width∈[{wmin},{wmax}] N={len(peaks)}")
 
-    # --- Fit (strict linear BG) ---
-    result, comps = fit_multi_peaks(q_win, y_win, peaks, props)
+    # If none, fit linear only and plot
+    if len(peaks) == 0:
+        result, comps = _fit_linear_only(q_win, y_win)
+    else:
+        # Optionally augment once from residuals (conservative seeds now)
+        if augment:
+            peaks_try, props_try = _augment_once_residual(
+                q_win, y_det, peaks, props, dq, add_frac=0.40, min_sep_sigma=0.8
+            )
+            if len(peaks_try) > len(peaks):
+                peaks, props = peaks_try, props_try
+                print(f"[detect] after residual augment: {len(peaks)} @ {q_win[peaks]}")
+
+        # --- Fit (strict linear BG) ---
+        result, comps = fit_multi_peaks(q_win, y_win, peaks, props)
+
+        # Optional one-pass refit if R² is low
+        w = _poisson_weights(y_win)
+        m = fit_metrics(result, q_win, y_win, weights=w)
+        if m['r2'] < REFIT_TARGET_R2 and len(peaks) > 0:
+            yhat = result.model.eval(params=result.params, x=q_win)
+            resid_bg = (y_win - bg_detect) - (yhat - bg_detect)
+            sigR = _robust_sigma(resid_bg)
+            cand, cprops = signal.find_peaks(
+                resid_bg, prominence=2.5 * sigR, width=1,
+                distance=int(max(1, round(0.6 * W_GUESS_PTS)))
+            )
+            keep = []
+            for j, pidx in enumerate(cand):
+                if len(peaks) and np.min(np.abs(q_win[peaks] - q_win[pidx])) < (0.6 * W_GUESS_PTS * dq):
+                    continue
+                keep.append(j)
+            if keep:
+                peaks = np.concatenate([np.asarray(peaks, int), cand[keep].astype(int)])
+                widths = np.concatenate([np.asarray(props.get("widths", np.full_like(peaks, W_GUESS_PTS))),
+                                         cprops["widths"][keep]])
+                promin = np.concatenate([np.asarray(props.get("prominences", np.ones_like(peaks))),
+                                         cprops["prominences"][keep]])
+                order = np.argsort(q_win[peaks]); peaks = peaks[order]
+                props = {"widths": widths[order], "prominences": promin[order]}
+                result, comps = fit_multi_peaks(q_win, y_win, peaks, props)
+
+    # Metrics (final)
     w = _poisson_weights(y_win)
     m = fit_metrics(result, q_win, y_win, weights=w)
     print(f"[METRICS] R2={m['r2']:.6f}  adjR2={m['adj_r2']:.6f}  redχ²={m['red_chisq']:.3g}  "
           f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}")
-
-    # --- Optional one-pass refit on residuals ---
-    TARGET = 0.98
-    if m['r2'] < TARGET and len(peaks) > 0:
-        yhat = result.model.eval(params=result.params, x=q_win)
-        resid_bg = (y_win - bg_detect) - (yhat - bg_detect)
-        sigR = _robust_sigma(resid_bg)
-        cand, cprops = signal.find_peaks(
-            resid_bg, prominence=2.5 * sigR, width=1,
-            distance=int(max(1, round(0.6 * w_guess_pts)))
-        )
-        keep = []
-        for j, pidx in enumerate(cand):
-            if len(peaks) and np.min(np.abs(q_win[peaks] - q_win[pidx])) < (0.6 * w_guess_pts * dq):
-                continue
-            keep.append(j)
-        if keep:
-            peaks = np.concatenate([np.asarray(peaks, int), cand[keep].astype(int)])
-            widths = np.concatenate([np.asarray(props.get("widths", np.full_like(peaks, 3.0))),
-                                     cprops["widths"][keep]])
-            promin = np.concatenate([np.asarray(props.get("prominences", np.ones_like(peaks))),
-                                     cprops["prominences"][keep]])
-            order = np.argsort(q_win[peaks]); peaks = peaks[order]
-            props = {"widths": widths[order], "prominences": promin[order]}
-            result, comps = fit_multi_peaks(q_win, y_win, peaks, props)
-            m = fit_metrics(result, q_win, y_win, weights=_poisson_weights(y_win))
-            print(f"[refit] R2→{m['r2']:.6f}")
 
     # Dense plotting
     q_dense = np.linspace(q_win.min(), q_win.max(), len(q_win) * 5)
@@ -288,7 +395,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
     ax.plot(q_win, y_win, "--", label="Data")
     if show_detect_bg:
         ax.plot(q_win, bg_detect, "-", label="BG (detect, linear)")
-    ax.plot(q_win[peaks], y_det[peaks], "x", label="Detected peaks")
+    ax.plot(q_win[peaks] if len(peaks) else [], (y_det[peaks] if len(peaks) else []), "x", label="Detected peaks")
     ax.plot(q_dense, best_fit_dense, "-", label="Total fit (dense)")
     if "bg_" in comps_dense:
         ax.plot(q_dense, comps_dense["bg_"], "-", label="BG (fit, linear)")
@@ -298,7 +405,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
     ax.set_xlabel("q"); ax.set_ylabel("Intensity")
     ax.legend(loc="upper right", fontsize=8)
 
-    # --- Left 2x2: Cake previews (use the SAME linear baseline idea) ---
+    # --- Left 2x2: Cake previews (linear baseline) ---
     if cake is not None:
         slices = [0, 10, 19, 28]
         for i, cs in enumerate(slices):
@@ -328,10 +435,12 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
         ["BIC", f"{m['bic']:.2f}"],
         ["RMSE", f"{m['rmse']:.3g}"],
         ["Max |res|", f"{m['max_abs']:.3g}"],
-        ["# Peaks", f"{len(peaks)}"],
+        ["# Peaks", f"{len([k for k in comps_dense if k.startswith('g')])}"],
         ["", ""],
     ]
-    for i in range(len(peaks)):
+    # Add centers if any peaks
+    gkeys = sorted(k for k in comps_dense if k.startswith("g"))
+    for i, kname in enumerate(gkeys):
         c = result.params[f"g{i}_center"].value
         table_data.append([f"Peak {i} center", f"{c:.6f}"])
     table = table_ax.table(cellText=table_data,
@@ -345,6 +454,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
+
 # ----------------------------- CLI ----------------------------- #
 def _parse_args():
     p = argparse.ArgumentParser(description="Multi-peak Gaussian fitting with strictly linear background.")
@@ -355,6 +465,7 @@ def _parse_args():
     p.add_argument("--augment", action="store_true", help="Enable one-pass residual augmentation.")
     p.add_argument("--hide-detect-bg", action="store_true", help="Do not plot the detection baseline.")
     return p.parse_args()
+
 
 if __name__ == "__main__":
     args = _parse_args()
