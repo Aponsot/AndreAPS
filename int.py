@@ -9,8 +9,43 @@ import concurrent.futures
 import h5py
 import argparse
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d, median_filter, percentile_filter
 
+def anscombe(y):  # Poisson variance-stabilizing transform
+    return 2.0 * np.sqrt(np.clip(y, 0, None) + 3/8)
 
+def robust_sigma(x):
+    med = np.median(x)
+    return 1.4826 * np.median(np.abs(x - med))
+
+def despike_2d(img, k=6, size=3):
+    """Remove cosmic spikes via median resid threshold."""
+    med = median_filter(img, size=size)
+    r = img - med
+    s = robust_sigma(r[np.isfinite(r)])
+    out = img.copy()
+    mask = np.abs(r) > k * max(s, 1e-6)
+    out[mask] = med[mask]
+    return out
+
+def bg_subtract_1d(y, pct=15, win_pts=301, smooth_sigma=4.0):
+    """Rolling-percentile background along the radial (tth) direction."""
+    if win_pts % 2 == 0: win_pts += 1
+    base = percentile_filter(y, percentile=pct, size=win_pts, mode='nearest')
+    base = gaussian_filter1d(base, sigma=smooth_sigma)
+    return y - base, base
+
+def rebin_1d(y, factor=1):
+    """Average-rebin by integer factor to boost SNR."""
+    if factor <= 1: return y
+    n = (y.shape[-1] // factor) * factor
+    return y[..., :n].reshape(y.shape[:-1] + (n//factor, factor)).mean(axis=-1)
+
+SECTOR_MODE = "mean"   # choices: "mean", "sum", "max"
+Q_REBIN = 1            # e.g., 2 or 3 to trade resolution for SNR
+ROLL_PCT = 15          # rolling-percentile background
+ROLL_WIN = 401         # set ~ several × broadest FWHM in bins
+SMOOTH_SIGMA = 2.0     # light smoothing after BG subtraction
 def integrate_em(Tiff_fold, instr_file, plot=False):
     """
     Perform polar integration of TIFF images and save results in HDF5 format.
@@ -77,31 +112,67 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         masked_image = np.ma.masked_where(background_mask, image)
         return masked_image
 
-    def process_frame(image_1, fluctuation_values=[0.0, 0.5], tolerance=0.2, cake_slices=None):
-        image_1 = np.ma.masked_where((image_1 == (2**32 - 1)) | (image_1 <= 0), image_1)
-        image_1 = mask_background(image_1, fluctuation_values, tolerance=tolerance)
-        background = median_filter(image_1, size=5)
-        image_1 = image_1 - background
-        threshold = 0.7
-        inflate_factor = 20
-        image_1_masked = np.where(image_1_masked > threshold, image_1_masked * inflate_factor, image_1_masked)
-        image_1_masked = np.where(image_1_masked <= threshold, image_1_masked * 0, image_1_masked)
-        local_imsd = dict.fromkeys(det_keys)
-        for det_key in det_keys:
-            local_imsd[det_key] = image_1_masked
-        pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
-        # Integrate over all eta (azimuth) as before
-        Int = np.array(np.ma.average(pimg, axis=0))
-        # If cake_slices is provided, bin by cake slices
-        cake_intensities = None
-        if cake_slices is not None:
+    def process_frame(image_1, cake_slices=None):
+    # 0) Mask invalids early
+        img = np.array(image_1, dtype=float)
+        img = np.where((img == (2**32 - 1)) | (img <= 0) | ~np.isfinite(img), np.nan, img)
+
+    # 1) Gentle despike for cosmics; keep diffuse signal
+        img = np.nan_to_num(img, nan=0.0)
+        img = despike_2d(img, k=6, size=3)
+
+    # 2) Variance-stabilize so smoothing doesn’t erase faint peaks
+        img_vst = anscombe(img)
+
+    # 3) Build the detector dict and polar-warp
+        local_imsd = {det_key: img_vst for det_key in det_keys}
+        pimg = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)  # shape: (n_eta, n_tth)
+
+    # 4) Background subtraction per-η along 2θ with rolling percentile
+        pimg = np.ma.masked_invalid(pimg)
+        pimg_data = pimg.filled(0.0)
+        n_eta, n_tth = pimg_data.shape
+        pimg_bgsub = np.empty_like(pimg_data)
+        for r in range(n_eta):
+            y = pimg_data[r, :]
+            y_bs, _ = bg_subtract_1d(y, pct=ROLL_PCT, win_pts=ROLL_WIN, smooth_sigma=SMOOTH_SIGMA)
+            pimg_bgsub[r, :] = y_bs
+
+    # 5) Optional light radial smoothing (keep small to avoid peak broadening)
+        for r in range(n_eta):
+            pimg_bgsub[r, :] = gaussian_filter1d(pimg_bgsub[r, :], sigma=SMOOTH_SIGMA, mode='nearest')
+
+    # 6) Integrate over η
+        if cake_slices is None:
+            if SECTOR_MODE == "max":
+                Int = np.nanmax(pimg_bgsub, axis=0)
+            elif SECTOR_MODE == "sum":
+                Int = np.nansum(pimg_bgsub, axis=0)
+            else:
+                Int = np.nanmean(pimg_bgsub, axis=0)
+            cake_intensities = None
+        else:
+            eta_axis = np.linspace(pv.eta_min, pv.eta_max, n_eta) * 180 / np.pi
             cake_intensities = []
-            eta_axis = np.linspace(pv.eta_min, pv.eta_max, pimg.shape[0]) * 180 / np.pi
             for eta_start, eta_end in cake_slices:
                 mask = (eta_axis >= eta_start) & (eta_axis < eta_end)
-                # Average only over the eta slice
-                cake_int = np.array(np.ma.average(pimg[mask, :], axis=0))
+                if not np.any(mask):
+                    cake_int = np.zeros((n_tth,), dtype=float)
+                else:
+                    if SECTOR_MODE == "max":
+                        cake_int = np.nanmax(pimg_bgsub[mask, :], axis=0)
+                    elif SECTOR_MODE == "sum":
+                        cake_int = np.nansum(pimg_bgsub[mask, :], axis=0)
+                    else:
+                        cake_int = np.nanmean(pimg_bgsub[mask, :], axis=0)
                 cake_intensities.append(cake_int)
+            Int = np.nanmean(np.stack(cake_intensities, axis=0), axis=0)  # optional: overall mean across sectors
+
+        # 7) Optional q rebin for SNR
+        Int = rebin_1d(Int, factor=Q_REBIN)
+        if cake_slices is not None:
+            cake_intensities = [rebin_1d(ci, factor=Q_REBIN) for ci in cake_intensities]
+
         return Int, cake_intensities
 
     # Prepare cake slices
