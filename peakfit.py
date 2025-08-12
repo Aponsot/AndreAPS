@@ -4,15 +4,12 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 import scipy.signal as signal
-from scipy.ndimage import gaussian_filter1d, percentile_filter
 from lmfit.models import PolynomialModel, GaussianModel
-
 
 # ----------------------------- helpers ----------------------------- #
 def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
     """FWHM -> sigma in x-units via FWHM = 2.355*sigma."""
     return (fwhm_pts * dq) / 2.355
-
 
 def fit_metrics(result, x, y, weights=None):
     yhat = result.model.eval(params=result.params, x=x)
@@ -32,39 +29,32 @@ def fit_metrics(result, x, y, weights=None):
 
     r2 = 1.0 - sse / max(sst, 1e-18)
     adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / max(n - k - 1, 1)
-
     red_chisq = sse / max(n - k, 1)
     aic = result.aic
     bic = result.bic
     rmse = np.sqrt(sse / n)
     max_abs = float(np.max(np.abs(resid)))
-
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
-
 
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
 
-
 def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
                            add_frac=0.45, min_sep_sigma=0.8):
-    """
-    One simple residual pass: build a crude Gaussian sum from seeds,
-    detect extra small peaks on residual, merge if reasonably separated.
-    """
+    """Simple residual pass to add small peaks if reasonably separated."""
     if len(peaks_idx) == 0:
         return peaks_idx, props
 
     widths = np.array(props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), float)
     promin = np.array(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
 
-    # crude model
+    # crude model of current peaks
     yhat = np.zeros_like(q, float)
     for i, pidx in enumerate(peaks_idx):
         mu = float(q[pidx])
         sig = max(_sigma_from_fwhm(widths[i], dq), 1e-6)
-        amp = float(promin[i]) * sig * np.sqrt(2 * np.pi)  # area ≈ prominence * sigma * sqrt(2π)
+        amp = float(promin[i]) * sig * np.sqrt(2 * np.pi)
         yhat += amp * np.exp(-0.5 * ((q - mu) / sig) ** 2)
 
     residual = y_bgsub - yhat
@@ -78,18 +68,15 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
     cand_idx, cand_props = signal.find_peaks(
         residual, prominence=prom_add, width=1, distance=min_dist_pts, rel_height=0.5
     )
-
     if cand_idx.size == 0:
         return peaks_idx, props
 
-    # keep candidates not too close to existing ones
     keep = []
     for j, pidx in enumerate(cand_idx):
         qj = q[pidx]
         if len(peaks_idx) and np.min(np.abs(q[peaks_idx] - qj)) < (min_dist_pts * dq):
             continue
         keep.append(j)
-
     if not keep:
         return peaks_idx, props
 
@@ -104,24 +91,21 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
     order = np.argsort(q[peaks_idx])
     return peaks_idx[order], {"widths": widths[order], "prominences": promin[order]}
 
-
-def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
-    """
-    Robust fit: background = strictly linear (degree 1) + sum of Gaussians.
-    Centers tied to global qshift+qscale with small per-peak wiggle.
-    """
+# ---------------- STRICTLY LINEAR BACKGROUND (fit) ---------------- #
+def fit_multi_peaks(q, y, peaks_idx, props):
+    """Linear background (degree=1) + sum of Gaussians. No higher-degree terms."""
     if len(peaks_idx) == 0:
         return None, {}
 
     dq = float(np.diff(q).mean())
 
-    # ---- STRICTLY LINEAR BACKGROUND ----
+    # Linear background
     composite = PolynomialModel(degree=1, prefix="bg_")
     params = composite.make_params()
     params["bg_c0"].set(value=float(np.median(y)), min=0)
-    params["bg_c1"].set(value=0.0)  # seed slope; no higher-degree terms
+    params["bg_c1"].set(value=0.0)  # slope seed
 
-    # Global q-axis drift/scale
+    # Global q-axis drift/scale for peak centers
     params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
     params.add("qscale", value=1.0, min=0.999, max=1.001)
 
@@ -141,84 +125,75 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
         # tie: center = qscale*base + qshift + tiny per-peak wiggle
         params.add(f"g{i}_c0", value=center0, vary=False)
-
-        # widen the wiggle to ~3 samples or ~0.0018, whichever larger
         dwig = max(3 * dq, 0.0018)
         params.add(f"g{i}_dcenter", value=0.0, min=-dwig, max=dwig)
         params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
 
-        # looser width bounds for melted frames
         params[f"g{i}_sigma"].set(min=0.25 * sigma0, max=4.0 * sigma0)
         params[f"g{i}_amplitude"].set(min=0.2 * abs(amp0), max=10 * abs(amp0))
 
-    # Robust global fit (linear bg)
+    # Fit with Poisson-esque weights, robust loss
     w = _poisson_weights(y)
-    result = composite.fit(
-        y, params, x=q, weights=w,
-        method="least_squares", fit_kws={"loss": "soft_l1", "f_scale": 1.0}
-    )
+    result = composite.fit(y, params, x=q, weights=w,
+                           method="least_squares",
+                           fit_kws={"loss": "soft_l1", "f_scale": 1.0})
     comps = result.model.eval_components(params=result.params, x=q)
-
-    # NO quadratic fallback — background is fixed to degree=1.
     return result, comps
 
-
-# --- detection background helpers --- #
-def detect_background_floor(y_win, pct=15, win_frac=0.05, smooth_sigma=2):
+# -------------- ROBUST LINEAR BASELINE FOR DETECTION -------------- #
+def detect_background_linear(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
     """
-    Percentile-floor baseline for PEAK DETECTION ONLY.
-    pct: lower percentile (smaller => flatter).
-    win_frac: window size as fraction of length.
-    smooth_sigma: tiny Gaussian smooth to de-block the percentile output.
+    Robust straight-line baseline used ONLY for detection & plotting.
+    Iterative sigma-clipped OLS, keeping the lowest-residual fraction to
+    avoid peaks pulling the line upward.
     """
-    n = len(y_win)
-    win = max(7, int(win_frac * n) | 1)  # odd, >=7
-    bg = percentile_filter(y_win, percentile=pct, size=win)
-    if smooth_sigma and smooth_sigma > 0:
-        bg = gaussian_filter1d(bg, sigma=smooth_sigma)
-    return bg
+    q = np.asarray(q_win, float)
+    y = np.asarray(y_win, float)
+    n = y.size
+    if n < 3:
+        a = float(np.median(y)); b = 0.0
+        return a + b*q, {"a": a, "b": b, "iters": 0, "kept": n}
 
-
-def detect_background_adaptive(y_win, floor_pct=14, floor_win_frac=0.05,
-                               floor_smooth=2, gauss_frac=0.03,
-                               target_frac=0.55, max_iter=12):
-    """
-    Blend between floor and Gaussian so that ~target_frac of points lie
-    BELOW the baseline (keeps a true floor while allowing mild slope post-melt).
-    Used only for detection; the fit background is strictly linear.
-    """
-    n = len(y_win)
-    # floor
-    bg_floor = detect_background_floor(y_win, pct=floor_pct,
-                                       win_frac=floor_win_frac,
-                                       smooth_sigma=floor_smooth)
-    # gentle Gaussian
-    sg = max(3, min(12, int(gauss_frac * n)))
-    bg_gauss = gaussian_filter1d(y_win, sigma=sg)
-
-    # binary search for alpha in [0,1]
-    lo, hi = 0.0, 1.0
-    for _ in range(max_iter):
-        alpha = 0.5 * (lo + hi)
-        bg = alpha * bg_gauss + (1 - alpha) * bg_floor
-        frac_below = float(np.mean(y_win <= bg))
-        if frac_below < target_frac:   # baseline too low -> raise toward gauss
-            lo = alpha
-        else:                          # baseline too high -> lower toward floor
-            hi = alpha
-    alpha = 0.5 * (lo + hi)
-    bg = alpha * bg_gauss + (1 - alpha) * bg_floor
-    return bg, dict(alpha=alpha, frac_below=float(np.mean(y_win <= bg)),
-                    sg=sg, floor_pct=floor_pct, win_frac=floor_win_frac)
-
+    mask = np.ones(n, dtype=bool)
+    kept = n
+    a = float(np.median(y)); b = 0.0
+    for it in range(max_iter):
+        X = np.vstack([np.ones(mask.sum()), q[mask]]).T
+        beta, *_ = np.linalg.lstsq(X, y[mask], rcond=None)
+        a, b = float(beta[0]), float(beta[1])
+        bg = a + b*q
+        resid = y - bg
+        # robust sigma from points currently considered background
+        rsel = resid[mask]
+        med = np.median(rsel)
+        sig = 1.4826 * np.median(np.abs(rsel - med)) if rsel.size > 0 else 0.0
+        if sig == 0.0:
+            break
+        # keep points that are not far above the line (downward clipping)
+        below = y <= (bg + clip_sigma * sig)
+        # of those, keep the lowest residual fraction
+        idx = np.where(below)[0]
+        if idx.size < 5:
+            break
+        order = np.argsort(resid[idx])  # most negative (below line) first
+        k = max(5, int(frac_keep * idx.size))
+        newmask = np.zeros(n, dtype=bool)
+        newmask[idx[order[:k]]] = True
+        if newmask.sum() == mask.sum() and np.all(newmask == mask):
+            kept = newmask.sum()
+            mask = newmask
+            break
+        kept = newmask.sum()
+        mask = newmask
+    bg = a + b*q
+    return bg, {"a": a, "b": b, "iters": it + 1, "kept": int(kept)}
 
 def _robust_sigma(x):
     med = np.median(x)
     return 1.4826 * np.median(np.abs(x - med))
 
-
 # ----------------------------- main ----------------------------- #
-def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
+def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_detect_bg=True):
     with h5py.File(h5_path, "r") as f:
         Int = f["int"][:]  # (nframes, q)
         q = f["q"][:]      # (q,)
@@ -232,34 +207,24 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     if q_win.size < 5:
         raise ValueError("Fit window too small or outside q-range.")
 
-    # Figure (2 rows x 3 columns; right column is wider by width_ratios)
+    # Figure (2 rows x 3 columns; right column is wider)
     fig, axes = plt.subplots(2, 3, figsize=(15, 10), gridspec_kw={"width_ratios": [1, 1, 2]})
     fig.suptitle(f"Peak Fit for Frame {frame_number}", fontsize=16)
 
-    # --- Detection (background-sub only) ---
+    # --- Strict linear baseline for detection ---
     dq = float(np.diff(q_win).mean())
-
-    # Adaptive baseline (floor + gaussian blend picked per frame)
-    bg_detect, bg_info = detect_background_adaptive(
-        y_win,
-        floor_pct=14,         # lowered a bit
-        floor_win_frac=0.05,
-        floor_smooth=2,
-        gauss_frac=0.03,
-        target_frac=0.55      # sits a touch lower
-    )
+    bg_detect, bg_info = detect_background_linear(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_iter=10)
     y_det = y_win - bg_detect
-    print(f"[bg] alpha={bg_info['alpha']:.2f} frac_below={bg_info['frac_below']:.2f} "
-          f"sg={bg_info['sg']} floor_pct={bg_info['floor_pct']} win_frac={bg_info['win_frac']}")
+    print(f"[bg-detect-linear] a={bg_info['a']:.3g}  b={bg_info['b']:.3g}  iters={bg_info['iters']}  kept={bg_info['kept']}")
 
-    # Adaptive thresholds for detection (handles melting)
+    # Adaptive thresholds for detection
     sig = _robust_sigma(y_det)
-    K = 3.6  # slightly easier picks post-melt
+    K = 3.6
     prom_full = max(1.0, K * sig)
 
     w_guess_pts = 3.0
     wmin = max(1, int(0.6 * w_guess_pts))
-    wmax = int(20 * w_guess_pts)  # allow broader peaks post-melt
+    wmax = int(20 * w_guess_pts)
     min_dist_pts = int(max(1, round(0.6 * w_guess_pts)))
 
     peaks, props = signal.find_peaks(
@@ -280,13 +245,13 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
             print(f"[detect] after residual augment: {len(peaks)} @ {q_win[peaks]}")
 
     # --- Fit (strict linear BG) ---
-    result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
-    w = 1.0 / np.sqrt(np.clip(y_win, 1.0, None))  # same weights used in fit
+    result, comps = fit_multi_peaks(q_win, y_win, peaks, props)
+    w = _poisson_weights(y_win)
     m = fit_metrics(result, q_win, y_win, weights=w)
     print(f"[METRICS] R2={m['r2']:.6f}  adjR2={m['adj_r2']:.6f}  redχ²={m['red_chisq']:.3g}  "
           f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}")
 
-    # --- If R² still low, try a tiny residual add & refit once ---
+    # --- Optional one-pass refit on residuals ---
     TARGET = 0.98
     if m['r2'] < TARGET and len(peaks) > 0:
         yhat = result.model.eval(params=result.params, x=q_win)
@@ -309,7 +274,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
                                      cprops["prominences"][keep]])
             order = np.argsort(q_win[peaks]); peaks = peaks[order]
             props = {"widths": widths[order], "prominences": promin[order]}
-            result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
+            result, comps = fit_multi_peaks(q_win, y_win, peaks, props)
             m = fit_metrics(result, q_win, y_win, weights=_poisson_weights(y_win))
             print(f"[refit] R2→{m['r2']:.6f}")
 
@@ -321,30 +286,29 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     # --- Right top: Full Azimuthal Integration ---
     ax = axes[0, 2]
     ax.plot(q_win, y_win, "--", label="Data")
-    ax.plot(q_win, bg_detect, "-", label="BG (detect)")
+    if show_detect_bg:
+        ax.plot(q_win, bg_detect, "-", label="BG (detect, linear)")
     ax.plot(q_win[peaks], y_det[peaks], "x", label="Detected peaks")
     ax.plot(q_dense, best_fit_dense, "-", label="Total fit (dense)")
+    if "bg_" in comps_dense:
+        ax.plot(q_dense, comps_dense["bg_"], "-", label="BG (fit, linear)")
     for name in sorted(k for k in comps_dense if k.startswith("g")):
         ax.plot(q_dense, comps_dense[name], ":", alpha=0.85, label=name)
-    if "bg_" in comps_dense:
-        ax.plot(q_dense, comps_dense["bg_"], "-", label="BG (fit)")
-
     ax.set_title("Full Azimuthal Integration")
     ax.set_xlabel("q"); ax.set_ylabel("Intensity")
     ax.legend(loc="upper right", fontsize=8)
 
-    # --- Left 2x2: Cake previews (simple) ---
+    # --- Left 2x2: Cake previews (use the SAME linear baseline idea) ---
     if cake is not None:
         slices = [0, 10, 19, 28]
-        sigma_smooth_detect = max(3, min(12, int(0.03 * len(q_win))))  # for preview only
         for i, cs in enumerate(slices):
             r, c = divmod(i, 2)
             y_c = cake[frame_number, cs, :][mask]
-            bg_c = gaussian_filter1d(y_c, sigma=sigma_smooth_detect)
+            bg_c, _ = detect_background_linear(q_win, y_c, frac_keep=0.60, clip_sigma=2.5, max_iter=8)
             ysub = y_c - bg_c
             pk_c, _ = signal.find_peaks(ysub, prominence=prom_full, width=(wmin, wmax))
             axes[r, c].plot(q_win, y_c, "--", label="Cake data")
-            axes[r, c].plot(q_win, bg_c, "-", label="BG (detect)")
+            axes[r, c].plot(q_win, bg_c, "-", label="BG (detect, linear)")
             axes[r, c].plot(q_win[pk_c], ysub[pk_c], "x", label="Peaks")
             axes[r, c].set_title(f"Cake slice {cs}")
             axes[r, c].set_xlabel("q"); axes[r, c].set_ylabel("Intensity")
@@ -356,7 +320,6 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     # --- Bottom-right: Table with metrics + peak centers ---
     table_ax = axes[1, 2]
     table_ax.axis("off")
-
     table_data = [
         ["R²", f"{m['r2']:.6f}"],
         ["Adj R²", f"{m['adj_r2']:.6f}"],
@@ -366,12 +329,11 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
         ["RMSE", f"{m['rmse']:.3g}"],
         ["Max |res|", f"{m['max_abs']:.3g}"],
         ["# Peaks", f"{len(peaks)}"],
-        ["", ""],  # spacer
+        ["", ""],
     ]
     for i in range(len(peaks)):
         c = result.params[f"g{i}_center"].value
         table_data.append([f"Peak {i} center", f"{c:.6f}"])
-
     table = table_ax.table(cellText=table_data,
                            colLabels=["Metric / Peak", "Value"],
                            cellLoc="center",
@@ -383,18 +345,18 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False):
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
-
 # ----------------------------- CLI ----------------------------- #
 def _parse_args():
-    p = argparse.ArgumentParser(description="Multi-peak Gaussian fitting with STRICT linear background.")
+    p = argparse.ArgumentParser(description="Multi-peak Gaussian fitting with strictly linear background.")
     p.add_argument("h5", type=str)
     p.add_argument("frame_number", type=int)
     p.add_argument("peak_pos", type=float)
     p.add_argument("--window", type=float, default=0.1, help="Half-window in q.")
     p.add_argument("--augment", action="store_true", help="Enable one-pass residual augmentation.")
+    p.add_argument("--hide-detect-bg", action="store_true", help="Do not plot the detection baseline.")
     return p.parse_args()
-
 
 if __name__ == "__main__":
     args = _parse_args()
-    peak_fit(args.h5, args.frame_number, args.peak_pos, args.window, augment=args.augment)
+    peak_fit(args.h5, args.frame_number, args.peak_pos, args.window,
+             augment=args.augment, show_detect_bg=not args.hide_detect_bg)
