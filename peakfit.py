@@ -298,7 +298,7 @@ def _derivative_shoulder_seeds(q, y_det, dq, w_guess_pts, min_dist_pts, existing
         if y_det[idx] < thr:
             continue
         # not too close to an existing max-peak
-        if len(existing_peaks) and np.min(np.abs(q[existing_peaks] - q[idx])) < (0.6 * w_guess_pts * dq):
+        if len(existing_peaks) and np.min(np.abs(q[existing_peaks] - q[idx])) < (1.0*w_guess_pts*dq):
             continue
         keep.append(idx)
 
