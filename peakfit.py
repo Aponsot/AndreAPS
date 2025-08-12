@@ -4,265 +4,203 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 import scipy.signal as signal
-from lmfit.models import GaussianModel, PolynomialModel
+from scipy.ndimage import gaussian_filter1d
 
+# ========= ONLY TWO TUNABLES =========
+WIDTH_PTS    = 6.0   # typical points across a peak FWHM in your window
+SENSITIVITY  = 0.6   # 0 (conservative) … 1 (eager). Higher = find more shoulders
+# =====================================
 
-# ===================== TUNABLES (edit here) =====================
-W_FWHM_PTS      = 6.0    # nominal points-per-FWHM in your data window
-K_PROM          = 4.0    # detection strictness (higher = fewer peaks)
-MIN_PROM_FRAC   = 0.03   # min prominence as fraction of (y - linear BG) dynamic range
-PROM_ABS_FLOOR  = 1.0    # absolute minimum prominence (counts)
-MIN_DIST_FRAC   = 0.6    # min distance between detected peaks (in points) = MIN_DIST_FRAC*W_FWHM_PTS
-MAX_INIT_PEAKS  = 8      # cap on number of seeds taken into the fit (keeps things sane)
+# fixed, sane internals (don’t touch unless you must)
+VALLEY_FRAC = 0.15            # require ≥15% valley depth to accept close neighbors
+MS_SCALES   = [1.0, 1.6]      # matched-filter scales (× WIDTH_PTS)
+MAX_CAND    = 12
 
-# Optional: force an exact number of Gaussians (None = use detected count)
-EXACT_N_PEAKS   = None   # e.g., set to 2 or 4 if you know the count; leave None for fluid
-
-# (light) bounds to keep parameters reasonable but not boxed-in
-CENTER_WIGGLE_PTS = 10.0  # each center can move ± this many points from its seed during fit
-SIGMA_MIN_FRAC    = 0.25  # sigma lower bound = SIGMA_MIN_FRAC * sigma_seed
-SIGMA_MAX_MULT    = 4.0   # sigma upper bound = SIGMA_MAX_MULT * sigma_seed
-AMP_MIN_FRAC      = 0.05  # area lower bound   = AMP_MIN_FRAC   * area_seed
-AMP_MAX_MULT      = 20.0  # area upper bound   = AMP_MAX_MULT   * area_seed
-# ===============================================================
-
-
-def robust_sigma(x: np.ndarray) -> float:
+def robust_sigma(x):
     med = np.median(x)
     return 1.4826 * np.median(np.abs(x - med))
 
+def linear_bg_strict(q, y, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
+    q = np.asarray(q, float); y = np.asarray(y, float)
+    n = y.size
+    if n < 3:
+        a = float(np.median(y)); b = 0.0
+        return a + b*q, dict(a=a,b=b,kept=n,iters=0)
+    mask = np.ones(n, bool); kept = n; a = float(np.median(y)); b = 0.0
+    for it in range(max_iter):
+        X = np.vstack([np.ones(mask.sum()), q[mask]]).T
+        beta, *_ = np.linalg.lstsq(X, y[mask], rcond=None)
+        a, b = float(beta[0]), float(beta[1])
+        bg = a + b*q
+        resid = y - bg
+        rsel = resid[mask]
+        sig = 1.4826 * np.median(np.abs(rsel - np.median(rsel))) if rsel.size else 0.0
+        if sig == 0.0: break
+        below = y <= (bg + clip_sigma*sig)
+        idx = np.where(below)[0]
+        if idx.size < 5: break
+        order = np.argsort(resid[idx])
+        k = max(5, int(frac_keep*idx.size))
+        newmask = np.zeros(n, bool); newmask[idx[order[:k]]] = True
+        if newmask.sum()==mask.sum() and np.all(newmask==mask):
+            kept = newmask.sum(); break
+        mask = newmask; kept = mask.sum()
+    return a + b*q, dict(a=a,b=b,kept=kept,iters=it+1)
 
-def seed_peaks(q, y, peak_pos, w_fwhm_pts):
-    """
-    Seed peak centers on a background-subtracted signal using a simple linear BG
-    and scipy.find_peaks with an adaptive prominence threshold.
-    """
-    # simple linear background (for detection only)
-    X = np.vstack([np.ones_like(q), q]).T
-    (c0, c1), *_ = np.linalg.lstsq(X, y, rcond=None)
-    bg = c0 + c1 * q
+def nms(idx, scores, radius_pts):
+    order = np.argsort(-scores)
+    picked = []
+    for o in order:
+        i = int(idx[o])
+        if all(abs(i - p) > radius_pts for p in picked):
+            picked.append(i)
+    return np.array(picked, int)
+
+def valley_ok(y_line, i, j, frac=VALLEY_FRAC):
+    a,b = (i,j) if i<j else (j,i)
+    if b-a < 2: return False
+    valley = float(np.min(y_line[a:b+1]))
+    h_i, h_j = float(y_line[i]), float(y_line[j])
+    return (min(h_i,h_j) - valley) >= frac * max(1.0, min(h_i,h_j))
+
+def detect_peaks(q, y, hint=None):
+    # 0) derive thresholds from the single SENSITIVITY knob
+    #    (higher sensitivity → lower thresholds)
+    K_PROM    = 5.0 - 2.0*SENSITIVITY      # 5 → 3 as SENS goes 0→1
+    MIN_FRAC  = 0.06 - 0.04*SENSITIVITY    # 6% → 2%
+    PROM_FLOOR= 1.0
+
+    # 1) strict linear BG, bg-sub signal
+    bg, _ = linear_bg_strict(q, y)
     y_det = y - bg
 
-    # noise & thresholds
-    # use a gentle high-pass to estimate noise without overcomplicating
-    if len(y_det) > 7:
-        sm = signal.windows.gaussian(M=7, std=1.5)
-        sm = sm / sm.sum()
-        smooth = np.convolve(y_det, sm, mode="same")
-        resid = y_det - smooth
-    else:
-        resid = y_det
-    sig = robust_sigma(resid)
+    # 2) noise & thresholds
+    hp_sigma_pts = max(3.0, 0.5*WIDTH_PTS)
+    smooth = gaussian_filter1d(y_det, sigma=hp_sigma_pts) if len(y_det)>7 else y_det
+    sig = robust_sigma(y_det - smooth)
     dyn = max(float(y_det.max() - y_det.min()), 1.0)
-    prom = max(K_PROM * sig, MIN_PROM_FRAC * dyn, PROM_ABS_FLOOR)
+    prom_thr = max(K_PROM*sig, MIN_FRAC*dyn, PROM_FLOOR)
 
-    # distances in points
-    min_dist_pts = max(1, int(round(MIN_DIST_FRAC * w_fwhm_pts)))
-    # allow a wide width range for detection; lmfit will refine
-    wmin = 1
-    wmax = max(3, int(round(4.0 * w_fwhm_pts)))
+    wmin = max(1, int(round(0.4*WIDTH_PTS)))
+    wmax = int(round(10.0*WIDTH_PTS))
+    nms_rad = max(1, int(round(0.5*WIDTH_PTS)))
 
-    peaks, props = signal.find_peaks(y_det, prominence=prom, width=(wmin, wmax), distance=min_dist_pts)
+    # 3) multi-scale matched filtering → raw candidates
+    c_idx, c_prom, c_w = [], [], []
+    for sc in MS_SCALES:
+        sigma_pts = max(1.0, (WIDTH_PTS*sc)/2.355)
+        y_s = gaussian_filter1d(y_det, sigma=sigma_pts)
+        pks, props = signal.find_peaks(y_s, prominence=prom_thr, width=(wmin,wmax), rel_height=0.5)
+        if pks.size:
+            prom = props["prominences"] if "prominences" in props else np.ones_like(pks, float)
+            wid  = props["widths"] if "widths" in props else np.full_like(pks, WIDTH_PTS, float)
+            c_idx.append(pks.astype(int)); c_prom.append(prom.astype(float)); c_w.append(wid.astype(float))
+    if not c_idx:
+        # fallback: one at the hint (or global max of bg-sub)
+        i0 = int(np.argmin(np.abs(q - hint))) if hint is not None else int(np.argmax(y_det))
+        return dict(idx=np.array([i0]), q=np.array([q[i0]]), height_bgsub=np.array([float(y_det[i0])]),
+                    width_pts=np.array([WIDTH_PTS], float), prom=np.array([float(y_det[i0])]), snr=np.array([float(y_det[i0]/max(sig,1e-9))]),
+                    y_det=y_det, bg=bg, prom_thr=prom_thr)
 
-    # sort candidates by closeness to requested peak_pos, then by prominence
-    if peaks.size:
-        order = np.argsort(np.abs(q[peaks] - peak_pos) + 1e-6 * (-props["prominences"]))
-        peaks = peaks[order]
-        props = {k: props[k][order] for k in props}
+    c_idx  = np.concatenate(c_idx)
+    c_prom = np.concatenate(c_prom)
+    c_w    = np.concatenate(c_w)
 
-    # cap total seeds
-    if len(peaks) > MAX_INIT_PEAKS:
-        peaks = peaks[:MAX_INIT_PEAKS]
-        for k in ["widths", "prominences"]:
-            props[k] = props[k][:len(peaks)]
+    # 4) non-maximum suppression
+    keep = nms(c_idx, c_prom, nms_rad)
+    mask = np.isin(c_idx, keep)
+    c_idx, c_prom, c_w = c_idx[mask], c_prom[mask], c_w[mask]
 
-    # fallback: ensure at least one seed near peak_pos
-    if len(peaks) == 0:
-        i0 = int(np.argmin(np.abs(q - peak_pos)))
-        peaks = np.array([i0], dtype=int)
-        props = {"widths": np.array([w_fwhm_pts], float), "prominences": np.array([max(y_det[i0], 1.0)], float)}
+    # 5) sort (if hint given, prioritize closeness; else by prominence)
+    if hint is not None:
+        order = np.argsort(np.abs(q[c_idx] - hint) + 1e-9*(-c_prom))
+    else:
+        order = np.argsort(-c_prom)
+    c_idx, c_prom, c_w = c_idx[order], c_prom[order], c_w[order]
 
-    return peaks, props, bg, y_det, dict(prom_used=prom, min_dist_pts=min_dist_pts)
+    # 6) valley gating on a lightly smoothed bg-sub trace
+    y_line = gaussian_filter1d(y_det, sigma=max(1.0, WIDTH_PTS/2.355))
+    kept = []
+    for i in c_idx:
+        if not kept:
+            kept.append(int(i)); continue
+        nearest = kept[np.argmin(np.abs(np.array(kept)-i))]
+        if valley_ok(y_line, int(i), int(nearest)):
+            kept.append(int(i))
+        # If there is no clear valley, skip (prevents splitting noise shoulders)
 
+    if len(kept) > MAX_CAND:
+        kept = kept[:MAX_CAND]
 
-def build_linear_plus_gaussians(q, y, peaks_idx, props, w_fwhm_pts):
-    """
-    Build a linear background + sum of Gaussians model with reasonable initial params
-    and mild bounds (centers can move, widths/amplitudes can scale).
-    """
-    dq = float(np.mean(np.diff(q)))
-    sigma_seed = (w_fwhm_pts * dq) / 2.355
+    kept = np.array(kept, int)
+    # attach width/prom from nearest candidate entries
+    width_pts = np.zeros_like(kept, float)
+    prom_vals = np.zeros_like(kept, float)
+    for j, k in enumerate(kept):
+        jj = int(np.argmin(np.abs(c_idx - k)))
+        width_pts[j] = float(c_w[jj]); prom_vals[j] = float(c_prom[jj])
 
-    poly = PolynomialModel(degree=1, prefix="bg_")
-    model = poly
-    params = poly.make_params()
-    params["bg_c0"].set(value=float(np.median(y)), min=0.0)
-    params["bg_c1"].set(value=0.0)  # keep linear; no extra degrees
+    heights = y_det[kept].astype(float)
+    snr = heights / max(sig, 1e-9)
 
-    for i, pidx in enumerate(peaks_idx):
-        g = GaussianModel(prefix=f"g{i}_")
-        model += g
+    return dict(idx=kept, q=q[kept].astype(float), height_bgsub=heights,
+                width_pts=width_pts, prom=prom_vals, snr=snr,
+                y_det=y_det, bg=bg, prom_thr=prom_thr)
 
-        c0 = float(q[pidx])
-        # use detected width if present; otherwise nominal
-        if "widths" in props and len(props["widths"]) > i:
-            wpts = float(props["widths"][i])
-            s0 = max(1e-9, (wpts * dq) / 2.355)
-        else:
-            s0 = sigma_seed
-
-        # lmfit Gaussian amplitude is AREA
-        height0 = max(float(y[pidx]), 1.0)
-        area0 = height0 * s0 * np.sqrt(2.0 * np.pi)
-
-        params.update(g.make_params(center=c0, sigma=s0, amplitude=area0))
-
-        # mild, symmetric bounds
-        wig = CENTER_WIGGLE_PTS * dq
-        params[f"g{i}_center"].set(min=c0 - wig, max=c0 + wig)
-        params[f"g{i}_sigma"].set(min=max(1e-9, SIGMA_MIN_FRAC * s0),
-                                  max=max(2e-9, SIGMA_MAX_MULT * s0))
-        params[f"g{i}_amplitude"].set(min=max(1e-9, AMP_MIN_FRAC * abs(area0)),
-                                      max=max(2e-9, AMP_MAX_MULT * abs(area0)))
-
-    return model, params
-
-
-def fit_and_summarize(q, y, model, params):
-    # light Poisson-ish weights help when counts change across the window
-    w = 1.0 / np.sqrt(np.clip(y, 1.0, None))
-    result = model.fit(y, params, x=q, weights=w, method="least_squares",
-                       fit_kws={"loss": "soft_l1", "f_scale": 1.0})
-
-    # metrics
-    yhat = result.best_fit
-    resid = y - yhat
-    n, k = len(y), sum(p.vary for p in result.params.values())
-    sse = float(np.sum((w * resid) ** 2))
-    ybar = float(np.sum((w**2) * y) / np.sum(w**2))
-    sst = float(np.sum((w * (y - ybar)) ** 2))
-    r2 = 1.0 - sse / max(sst, 1e-18)
-    adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / max(n - k - 1, 1)
-    red_chisq = sse / max(n - k, 1)
-    rmse = np.sqrt(sse / n)
-    return result, dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, rmse=rmse,
-                        aic=result.aic, bic=result.bic, max_abs=float(np.max(np.abs(resid)))), resid
-
-
-def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
-    # --- load
+def main(h5_path, frame_number, peak_pos, window=0.1, save_png=False):
     with h5py.File(h5_path, "r") as f:
-        Int = f["int"][:]   # shape: (nframes, nq)
+        Int = f["int"][:]       # (nframes, nq)
         q   = f["q"][:].astype(float)
 
-    # --- window
     q_min, q_max = float(peak_pos - window), float(peak_pos + window)
-    mask = (q >= q_min) & (q <= q_max)
-    q_win = q[mask]
-    y_win = Int[int(frame_number), mask].astype(float)
-    if q_win.size < max(20, int(4 * W_FWHM_PTS)):
-        raise ValueError("Fit window too small or outside q-range.")
+    m = (q >= q_min) & (q <= q_max)
+    q_win = q[m]; y_win = Int[int(frame_number), m].astype(float)
+    if q_win.size < max(20, int(4*WIDTH_PTS)):
+        raise ValueError("Window too small or outside q-range.")
 
-    # --- seeding
-    peaks, props, bg_det, y_det, detinfo = seed_peaks(q_win, y_win, peak_pos, W_FWHM_PTS)
+    det = detect_peaks(q_win, y_win, hint=peak_pos)
 
-    # choose how many to fit (fluid by default)
-    if EXACT_N_PEAKS is None:
-        npeaks = len(peaks)
-    else:
-        npeaks = int(EXACT_N_PEAKS)
-        # ensure we have that many seeds: trim or pad by splitting strongest
-        if len(peaks) > npeaks:
-            peaks = peaks[:npeaks]
-            for k in ["widths", "prominences"]:
-                props[k] = props[k][:npeaks]
-        while len(peaks) < npeaks:
-            # duplicate the strongest (by prominence) with a tiny offset
-            j = int(np.argmax(props["prominences"]))
-            p = int(peaks[j])
-            off = max(1, int(round(W_FWHM_PTS * 0.3)))
-            new = min(len(q_win)-1, p + off)
-            peaks = np.append(peaks, new)
-            for k in ["widths", "prominences"]:
-                props[k] = np.append(props[k], props[k][j])
+    # print compact table
+    print(f"[detect] prom≥{det['prom_thr']:.3g}  |  peaks: {len(det['idx'])}  |  knobs: WIDTH_PTS={WIDTH_PTS}, SENSITIVITY={SENSITIVITY}")
+    print(" idx   q_pos         height_bgsub   width_pts   SNR")
+    for ix, qq, hh, ww, ss in zip(det["idx"], det["q"], det["height_bgsub"], det["width_pts"], det["snr"]):
+        print(f"{ix:4d}  {qq: .6f}    {hh: .3g}       {ww: .2f}     {ss: .2f}")
 
-    # --- model + fit
-    model, params = build_linear_plus_gaussians(q_win, y_win, peaks, props, W_FWHM_PTS)
-    result, metrics, resid = fit_and_summarize(q_win, y_win, model, params)
+    # plot
+    fig, ax = plt.subplots(1, 1, figsize=(11, 4.5))
+    ax.plot(q_win, y_win, "k.", ms=3, label="Data")
+    ax.plot(q_win, det["bg"], "-", lw=1.0, label="BG (linear)")
+    ax.plot(q_win, det["y_det"], "-", lw=1.0, alpha=0.55, label="Data - BG")
 
-    # --- plotting (top: fit; bottom: metrics & per-peak)
-    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(11, 8), gridspec_kw={"height_ratios": [3, 2]})
-    ax0.plot(q_win, y_win, "k.", ms=3, label="Data")
+    for qpk, hpk in zip(det["q"], det["height_bgsub"]):
+        ax.axvline(qpk, color="tab:red", ls="--", lw=1.0, alpha=0.85)
+        ax.plot(qpk, hpk + np.interp(qpk, q_win, det["bg"]), "x", ms=8, color="tab:red")
 
-    # fitted BG (linear)
-    comps_dense = result.eval_components(x=q_win)
-    if "bg_" in comps_dense:
-        ax0.plot(q_win, comps_dense["bg_"], "-", lw=1.2, label="BG (fit, linear)")
-
-    # total fit (dense)
-    q_dense = np.linspace(q_win.min(), q_win.max(), len(q_win) * 5)
-    y_dense = result.eval(x=q_dense)
-    ax0.plot(q_dense, y_dense, "-", lw=1.6, label=f"Total fit ({len(peaks)} Gaussian{'s' if len(peaks)>1 else ''})")
-
-    # components
-    comp_dense = result.model.eval_components(params=result.params, x=q_dense)
-    gnames = sorted([k for k in comp_dense if k.startswith("g")])
-    for k in gnames:
-        ax0.plot(q_dense, comp_dense[k], ":", lw=1.0, label=k)
-
-    # mark fitted centers
-    centers = []
-    for i in range(len(gnames)):
-        centers.append(result.params[f"g{i}_center"].value)
-    ax0.plot(centers, [np.interp(c, q_dense, y_dense) for c in centers], "x", ms=8, label="Centers")
-
-    ax0.set_xlabel("q"); ax0.set_ylabel("Intensity")
-    ax0.set_title(f"Frame {frame_number} | seeds used: {len(peaks)} | det prom≥ {detinfo['prom_used']:.3g}")
-    ax0.legend(loc="best", fontsize=8)
-
-    # table
-    ax1.axis("off")
-    rows = [
-        ["R²", f"{metrics['r2']:.6f}"],
-        ["Adj R²", f"{metrics['adj_r2']:.6f}"],
-        ["Reduced χ²", f"{metrics['red_chisq']:.3g}"],
-        ["AIC", f"{metrics['aic']:.2f}"],
-        ["BIC", f"{metrics['bic']:.2f}"],
-        ["RMSE", f"{metrics['rmse']:.3g}"],
-        ["Max |res|", f"{metrics['max_abs']:.3g}"],
-        ["# Peaks fit", f"{len(gnames)}"],
-        ["", ""],
-    ]
-    for i in range(len(gnames)):
-        c = result.params[f"g{i}_center"].value
-        s = result.params[f"g{i}_sigma"].value
-        a = result.params[f"g{i}_amplitude"].value  # AREA for lmfit Gaussian
-        height = a / (np.sqrt(2*np.pi) * s)
-        rows += [
-            [f"Peak {i} center", f"{c:.6f}"],
-            [f"Peak {i} height", f"{height:.3g}"],
-            [f"Peak {i} sigma",  f"{s:.6g}"],
-            [f"Peak {i} FWHM",   f"{2.355*s:.6g}"],
-            [f"Peak {i} area",   f"{a:.3g}"],
-            ["", ""],
-        ]
-    table = ax1.table(cellText=rows, colLabels=None, loc="center", cellLoc="center")
-    table.auto_set_font_size(False); table.set_fontsize(8); table.scale(1.1, 1.18)
-
+    ax.set_xlabel("q"); ax.set_ylabel("Intensity")
+    ax.set_title(f"Frame {frame_number} | detected peaks: {len(det['idx'])}")
+    ax.legend(loc="best", fontsize=8)
     plt.tight_layout()
+
+    if save_png:
+        import os
+        base = os.path.splitext(os.path.basename(h5_path))[0]
+        out = f"{base}_f{frame_number}_q{peak_pos:.5f}_w{window:.3f}_peaks.png"
+        fig.savefig(out, dpi=220, bbox_inches="tight")
+        print(f"[saved] {out}")
+
     plt.show()
+    return det
 
-
-# ----------------------------- CLI ----------------------------- #
+# ---------- CLI ----------
 def _parse_args():
-    p = argparse.ArgumentParser(description="Linear-background Gaussian peak fitting (simple & fluid).")
+    p = argparse.ArgumentParser(description="Minimal peak detection (strict linear BG).")
     p.add_argument("h5", type=str)
     p.add_argument("frame_number", type=int)
     p.add_argument("peak_pos", type=float)
-    p.add_argument("--window", type=float, default=0.1, help="Half-window in q around peak_pos")
+    p.add_argument("--window", type=float, default=0.1)
+    p.add_argument("--save-png", action="store_true")
     return p.parse_args()
-
 
 if __name__ == "__main__":
     args = _parse_args()
-    peak_fit(args.h5, args.frame_number, args.peak_pos, args.window)
+    main(args.h5, args.frame_number, args.peak_pos, args.window, save_png=args.save_png)
