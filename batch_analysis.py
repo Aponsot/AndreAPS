@@ -235,6 +235,6 @@ if __name__ == "__main__":
     parser.add_argument("h5", type=str, help="Path to the folder containing TIFF images.")
     parser.add_argument("peak_pos", type=float, help="Location of Peak of study")
     args = parser.parse_args()
-    sweep_frames(args.h5, args.peak_pos, window=0.1, frames=None, csv_path="peakfit_with_peaks.csv")
+    sweep_frames(args.h5, args.peak_pos, window=0.1, frames=None)
 
 
