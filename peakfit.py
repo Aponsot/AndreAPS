@@ -530,4 +530,4 @@ def _parse_args():
 if __name__ == "__main__":
     args = _parse_args()
     peak_fit(args.h5, args.frame_number, args.peak_pos, args.window,
-             augment=args.augment, use_derivatives=not args.no-deriv)
+             augment=args.augment)
