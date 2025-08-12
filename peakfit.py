@@ -291,7 +291,7 @@ def _derivative_shoulder_seeds(q, y_det, dq, w_guess_pts, min_dist_pts, existing
 
     # Filter: keep only where intensity is positive enough and not too close to existing peaks
     ysig = _robust_sigma(y_det)
-    thr = max(2.5 * ysig, 0.1 * float(np.max(y_det)) if np.max(y_det) > 0 else 0.0)
+    thr = max(3.5 * ysig, 0.25 * float(np.max(y_det)) if np.max(y_det) > 0 else 0.0)
 
     keep = []
     for idx in cand:
