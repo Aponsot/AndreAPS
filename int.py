@@ -82,7 +82,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         image_1 = mask_background(image_1, fluctuation_values, tolerance=tolerance)
         background = median_filter(image_1, size=5)
         image_1 = image_1 - background
-
+        image_1_masked = np.ma.masked_where(image_1 <= 0, image_1)
         threshold = 0.7
         inflate_factor = 20
         image_1_masked = np.where(image_1_masked > threshold, image_1_masked * inflate_factor, image_1_masked)
