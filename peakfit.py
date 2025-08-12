@@ -4,32 +4,42 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 import scipy.signal as signal
-from scipy.ndimage import gaussian_filter1d  # for noise estimate
+from scipy.ndimage import gaussian_filter1d  # for noise estimate + matched filter
 from lmfit.models import PolynomialModel, GaussianModel
 
 
 # ===================== TUNABLE PEAK-FIT PARAMS =====================
-# Set these to refine detection & fit behavior.
+# Detection & noise
 W_GUESS_PTS       = 3.0   # nominal FWHM in *points*
 HP_SIGMA_MULT     = 2.0   # high-pass smoothing = HP_SIGMA_MULT * W_GUESS_PTS
 K_PROM            = 4.0   # noise multiplier for prominence threshold
 MIN_PROM_ABS_FRAC = 0.03  # 3% of local dynamic range as absolute floor
 PROM_ABS_FLOOR    = 1.0   # absolute minimum prominence (counts)
 
-WMIN_FRAC         = 0.6   # min width (points) = WMIN_FRAC * W_GUESS_PTS
-WMAX_MULT         = 8.0   # max width (points) = WMAX_MULT * W_GUESS_PTS
-MIN_DIST_FRAC     = 0.8   # min distance between peaks (points) = MIN_DIST_FRAC * W_GUESS_PTS
+# Match-filter seeding (helps late/broad/weak peaks)
+DETECT_ON_MATCHED = True
+MF_SIGMA_MULT     = 1.0   # matched-filter σ = MF_SIGMA_MULT * (W_GUESS_PTS/2.355) in *points*
 
+# Peak spacing/width constraints
+WMIN_FRAC         = 0.6   # min width (points) = WMIN_FRAC * W_GUESS_PTS
+WMAX_MULT         = 10.0  # max width (points) = WMAX_MULT * W_GUESS_PTS  (↑ from 8.0)
+MIN_DIST_FRAC     = 0.8   # min distance between peaks (points) = MIN_DIST_FRAC * W_GUESS_PTS
 MERGE_FRAC        = 0.75  # merge peaks closer than MERGE_FRAC * W_GUESS_PTS (keep higher prom)
 MAX_PEAKS         = 4     # hard cap on number of peaks to fit
 
+# Background slope bound
 SLOPE_LIMIT_SCALE = 2.0   # |bg_c1| <= SLOPE_LIMIT_SCALE * (yspan/qspan)
 
+# Gaussian parameter bounds
 SIGMA_MIN_FRAC    = 0.20  # lower bound on sigma = SIGMA_MIN_FRAC * sigma0
-SIGMA_MAX_MULT    = 3.0   # upper bound on sigma = SIGMA_MAX_MULT * sigma0
+SIGMA_MAX_MULT    = 4.0   # upper bound on sigma = SIGMA_MAX_MULT * sigma0  (↑ from 3.0)
 AMP_MIN_FRAC      = 0.10  # min amplitude = AMP_MIN_FRAC * initial amplitude
 AMP_MAX_MULT      = 10.0  # max amplitude = AMP_MAX_MULT * initial amplitude
 
+# Center handling (decouple from global qscale/qshift)
+CENTER_WIGGLE_PTS = 8.0   # each peak center can move ± CENTER_WIGGLE_PTS * dq from its seed
+
+# Refit trigger
 REFIT_TARGET_R2   = 0.98  # if R^2 below this, try one residual-based augment+refit
 # ==================================================================
 
@@ -39,13 +49,11 @@ def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
     """FWHM -> sigma in x-units via FWHM = 2.355*sigma."""
     return (fwhm_pts * dq) / 2.355
 
-
 def fit_metrics(result, x, y, weights=None):
     yhat = result.model.eval(params=result.params, x=x)
     resid = y - yhat
     n = len(y)
-    k = sum(p.vary for p in result.params.values())  # #free params
-
+    k = sum(p.vary for p in result.params.values())
     if weights is not None:
         w = np.asarray(weights, float)
         sse = float(np.sum((w * resid) ** 2))
@@ -55,7 +63,6 @@ def fit_metrics(result, x, y, weights=None):
         sse = float(np.sum(resid ** 2))
         ybar = float(np.mean(y))
         sst = float(np.sum((y - ybar) ** 2))
-
     r2 = 1.0 - sse / max(sst, 1e-18)
     adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / max(n - k - 1, 1)
     red_chisq = sse / max(n - k, 1)
@@ -63,14 +70,11 @@ def fit_metrics(result, x, y, weights=None):
     bic = result.bic
     rmse = np.sqrt(sse / n)
     max_abs = float(np.max(np.abs(resid)))
-
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
 
-
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
-
 
 def _estimate_noise(y_det, hp_sigma_pts=6):
     """Estimate noise via high-pass residual: y_det - gaussian_smooth(y_det)."""
@@ -80,24 +84,20 @@ def _estimate_noise(y_det, hp_sigma_pts=6):
     resid = y_det - smooth
     return _robust_sigma(resid), resid
 
-
 def _prune_and_merge_peaks(q, y_det, peaks, props, dq,
                            w_guess_pts=W_GUESS_PTS, merge_frac=MERGE_FRAC,
                            max_peaks=MAX_PEAKS):
     """Merge too-close peaks, then cap by prominence."""
     if len(peaks) <= 1:
         return peaks, props
-
     order = np.argsort(peaks)
     peaks = peaks[order]
     widths = np.asarray(props.get("widths", np.full_like(peaks, w_guess_pts)), float)[order]
     promin = np.asarray(props.get("prominences", np.ones_like(peaks)), float)[order]
-
     keep = [0]
     for i in range(1, len(peaks)):
         prev = keep[-1]
         if (peaks[i] - peaks[prev]) < int(max(1, merge_frac * w_guess_pts)):
-            # keep the more prominent
             if promin[i] > promin[prev]:
                 keep[-1] = i
         else:
@@ -105,16 +105,11 @@ def _prune_and_merge_peaks(q, y_det, peaks, props, dq,
     peaks = peaks[keep]
     widths = widths[keep]
     promin = promin[keep]
-
     if len(peaks) > max_peaks:
         idx = np.argsort(promin)[-max_peaks:]
         idx.sort()
-        peaks = peaks[idx]
-        widths = widths[idx]
-        promin = promin[idx]
-
+        peaks = peaks[idx]; widths = widths[idx]; promin = promin[idx]
     return peaks, {"widths": widths, "prominences": promin}
-
 
 def _fit_linear_only(q, y):
     """Fit only the linear background (used when no peaks are detected)."""
@@ -128,38 +123,29 @@ def _fit_linear_only(q, y):
     comps = res.model.eval_components(params=res.params, x=q)
     return res, comps
 
-
 def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
                            add_frac=0.45, min_sep_sigma=0.8):
     """Simple residual pass to add small peaks if reasonably separated."""
     if len(peaks_idx) == 0:
         return peaks_idx, props
-
     widths = np.array(props.get("widths", np.full_like(peaks_idx, W_GUESS_PTS, dtype=float)), float)
     promin = np.array(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
-
-    # crude model of current peaks
     yhat = np.zeros_like(q, float)
     for i, pidx in enumerate(peaks_idx):
         mu = float(q[pidx])
         sig = max(_sigma_from_fwhm(widths[i], dq), 1e-6)
         amp = float(promin[i]) * sig * np.sqrt(2 * np.pi)
         yhat += amp * np.exp(-0.5 * ((q - mu) / sig) ** 2)
-
     residual = y_bgsub - yhat
-
     mean_w_pts = float(np.clip(np.nanmean(widths) if widths.size else W_GUESS_PTS, 2.0, 20.0))
     min_dist_pts = int(max(1, round(min_sep_sigma * mean_w_pts)))
-
     prom_base = float(np.median(promin)) if promin.size else 2.0
     prom_add = add_frac * max(0.5, prom_base)
-
     cand_idx, cand_props = signal.find_peaks(
         residual, prominence=prom_add, width=1, distance=min_dist_pts, rel_height=0.5
     )
     if cand_idx.size == 0:
         return peaks_idx, props
-
     keep = []
     for j, pidx in enumerate(cand_idx):
         qj = q[pidx]
@@ -168,25 +154,21 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
         keep.append(j)
     if not keep:
         return peaks_idx, props
-
     new_idx = cand_idx[keep].astype(int)
     new_w = cand_props["widths"][keep]
     new_p = cand_props["prominences"][keep]
-
     peaks_idx = np.concatenate([np.asarray(peaks_idx, int), new_idx])
     widths = np.concatenate([widths, np.asarray(new_w, float)])
     promin = np.concatenate([promin, np.asarray(new_p, float)])
-
     order = np.argsort(q[peaks_idx])
     return peaks_idx[order], {"widths": widths[order], "prominences": promin[order]}
 
 
 # ---------------- STRICT LINEAR BACKGROUND FOR FIT ---------------- #
 def fit_multi_peaks(q, y, peaks_idx, props):
-    """Linear background (degree=1) + sum of Gaussians. No higher-degree terms."""
+    """Linear background (degree=1) + sum of Gaussians with per-peak centers (no global qscale/qshift)."""
     if len(peaks_idx) == 0:
         return None, {}
-
     dq = float(np.diff(q).mean())
 
     # Linear background with bounded slope
@@ -194,7 +176,6 @@ def fit_multi_peaks(q, y, peaks_idx, props):
     params = composite.make_params()
     params["bg_c0"].set(value=float(np.median(y)), min=0)
     params["bg_c1"].set(value=0.0)
-
     qspan = max(q.max() - q.min(), 1e-9)
     yspan = max(np.percentile(y, 95) - np.percentile(y, 5), 1.0)
     smax = SLOPE_LIMIT_SCALE * yspan / qspan
@@ -214,21 +195,16 @@ def fit_multi_peaks(q, y, peaks_idx, props):
         amp0 = max(height0 * sigma0 * np.sqrt(2 * np.pi), 1e-9)  # area
 
         params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
-        # tie: center = qscale*base + qshift + tiny per-peak wiggle
-        params.add(f"g{i}_c0", value=center0, vary=False)
-        dwig = max(3 * dq, 0.0018)
-        params.add(f"g{i}_dcenter", value=0.0, min=-dwig, max=dwig)
-        params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
 
-        # width & amplitude bounds (tighter than before)
+        # ---- per-peak center wiggle (in points, not global ties) ----
+        wig = CENTER_WIGGLE_PTS * dq
+        params[f"g{i}_center"].set(min=center0 - wig, max=center0 + wig)
+
+        # width & amplitude bounds (loosened max)
         params[f"g{i}_sigma"].set(min=SIGMA_MIN_FRAC * sigma0, max=SIGMA_MAX_MULT * sigma0)
         params[f"g{i}_amplitude"].set(min=AMP_MIN_FRAC * abs(amp0), max=AMP_MAX_MULT * abs(amp0))
 
-    # Global q-axis drift/scale for peak centers
-    params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
-    params.add("qscale", value=1.0, min=0.999, max=1.001)
-
-    # Fit with Poisson-like weights, robust loss
+    # Fit
     w = _poisson_weights(y)
     result = composite.fit(y, params, x=q, weights=w,
                            method="least_squares",
@@ -239,21 +215,14 @@ def fit_multi_peaks(q, y, peaks_idx, props):
 
 # -------------- ROBUST LINEAR BASELINE FOR DETECTION -------------- #
 def detect_background_linear(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
-    """
-    Robust straight-line baseline used ONLY for detection & plotting.
-    Iterative sigma-clipped OLS, keeping the lowest-residual fraction to
-    avoid peaks pulling the line upward.
-    """
-    q = np.asarray(q_win, float)
-    y = np.asarray(y_win, float)
+    """Iterative sigma-clipped straight line for detection/plotting."""
+    q = np.asarray(q_win, float); y = np.asarray(y_win, float)
     n = y.size
     if n < 3:
         a = float(np.median(y)); b = 0.0
         return a + b*q, {"a": a, "b": b, "iters": 0, "kept": n}
-
     mask = np.ones(n, dtype=bool)
-    kept = n
-    a = float(np.median(y)); b = 0.0
+    kept = n; a = float(np.median(y)); b = 0.0
     for it in range(max_iter):
         X = np.vstack([np.ones(mask.sum()), q[mask]]).T
         beta, *_ = np.linalg.lstsq(X, y[mask], rcond=None)
@@ -261,27 +230,20 @@ def detect_background_linear(q_win, y_win, frac_keep=0.60, clip_sigma=2.5, max_i
         bg = a + b*q
         resid = y - bg
         rsel = resid[mask]
-        med = np.median(rsel)
-        sig = 1.4826 * np.median(np.abs(rsel - med)) if rsel.size > 0 else 0.0
+        sig = 1.4826 * np.median(np.abs(rsel - np.median(rsel))) if rsel.size > 0 else 0.0
         if sig == 0.0:
             break
         below = y <= (bg + clip_sigma * sig)
         idx = np.where(below)[0]
-        if idx.size < 5:
-            break
+        if idx.size < 5: break
         order = np.argsort(resid[idx])
         k = max(5, int(frac_keep * idx.size))
-        newmask = np.zeros(n, dtype=bool)
-        newmask[idx[order[:k]]] = True
+        newmask = np.zeros(n, dtype=bool); newmask[idx[order[:k]]] = True
         if newmask.sum() == mask.sum() and np.all(newmask == mask):
-            kept = newmask.sum()
-            mask = newmask
-            break
-        kept = newmask.sum()
-        mask = newmask
+            kept = newmask.sum(); mask = newmask; break
+        kept = newmask.sum(); mask = newmask
     bg = a + b*q
     return bg, {"a": a, "b": b, "iters": it + 1, "kept": int(kept)}
-
 
 def _robust_sigma(x):
     med = np.median(x)
@@ -303,7 +265,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
     if q_win.size < 5:
         raise ValueError("Fit window too small or outside q-range.")
 
-    # Figure (2 rows x 3 columns; right column is wider)
+    # Figure
     fig, axes = plt.subplots(2, 3, figsize=(15, 10), gridspec_kw={"width_ratios": [1, 1, 2]})
     fig.suptitle(f"Peak Fit for Frame {frame_number}", fontsize=16)
 
@@ -313,35 +275,41 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
     y_det = y_win - bg_detect
     print(f"[bg-detect-linear] a={bg_info['a']:.3g}  b={bg_info['b']:.3g}  iters={bg_info['iters']}  kept={bg_info['kept']}")
 
-    # --- Conservative detection on high-pass residual ---
+    # --- Conservative detection; optional matched-filter localization ---
     hp_sigma_pts = int(round(HP_SIGMA_MULT * W_GUESS_PTS))
     sig_hp, hp_resid = _estimate_noise(y_det, hp_sigma_pts=max(3, hp_sigma_pts))
     dyn = max(y_det.max() - y_det.min(), 1.0)
     prom_full = max(MIN_PROM_ABS_FRAC * dyn, K_PROM * sig_hp, PROM_ABS_FLOOR)
+
+    y_for_detect = y_det
+    if DETECT_ON_MATCHED:
+        mf_sigma_pts = max(1.0, MF_SIGMA_MULT * (W_GUESS_PTS / 2.355))  # σ in points
+        y_for_detect = gaussian_filter1d(y_det, sigma=mf_sigma_pts)
 
     wmin = max(1, int(WMIN_FRAC * W_GUESS_PTS))
     wmax = int(WMAX_MULT * W_GUESS_PTS)
     min_dist_pts = int(max(1, round(MIN_DIST_FRAC * W_GUESS_PTS)))
 
     peaks, props = signal.find_peaks(
-        y_det,
+        y_for_detect,
         prominence=prom_full,
         width=(wmin, wmax),
         distance=min_dist_pts,
         rel_height=0.5,
     )
 
+    # Use props from detection; prune/merge/cap
     peaks, props = _prune_and_merge_peaks(
         q_win, y_det, peaks, props, dq,
         w_guess_pts=W_GUESS_PTS, merge_frac=MERGE_FRAC, max_peaks=MAX_PEAKS
     )
     print(f"[detect] hp_sig={sig_hp:.3g} prom>={prom_full:.3g} width∈[{wmin},{wmax}] N={len(peaks)}")
 
-    # If none, fit linear only and plot
+    # If none, fit linear only
     if len(peaks) == 0:
         result, comps = _fit_linear_only(q_win, y_win)
     else:
-        # Optionally augment once from residuals (conservative seeds now)
+        # Optional residual augment (now conservative)
         if augment:
             peaks_try, props_try = _augment_once_residual(
                 q_win, y_det, peaks, props, dq, add_frac=0.40, min_sep_sigma=0.8
@@ -350,10 +318,10 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
                 peaks, props = peaks_try, props_try
                 print(f"[detect] after residual augment: {len(peaks)} @ {q_win[peaks]}")
 
-        # --- Fit (strict linear BG) ---
+        # Fit (linear BG, per-peak centers)
         result, comps = fit_multi_peaks(q_win, y_win, peaks, props)
 
-        # Optional one-pass refit if R² is low
+        # Optional refit on residuals if R² low
         w = _poisson_weights(y_win)
         m = fit_metrics(result, q_win, y_win, weights=w)
         if m['r2'] < REFIT_TARGET_R2 and len(peaks) > 0:
@@ -427,6 +395,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
     # --- Bottom-right: Table with metrics + peak centers ---
     table_ax = axes[1, 2]
     table_ax.axis("off")
+    gkeys = sorted(k for k in comps_dense if k.startswith("g"))
     table_data = [
         ["R²", f"{m['r2']:.6f}"],
         ["Adj R²", f"{m['adj_r2']:.6f}"],
@@ -435,11 +404,9 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, show_de
         ["BIC", f"{m['bic']:.2f}"],
         ["RMSE", f"{m['rmse']:.3g}"],
         ["Max |res|", f"{m['max_abs']:.3g}"],
-        ["# Peaks", f"{len([k for k in comps_dense if k.startswith('g')])}"],
+        ["# Peaks", f"{len(gkeys)}"],
         ["", ""],
     ]
-    # Add centers if any peaks
-    gkeys = sorted(k for k in comps_dense if k.startswith("g"))
     for i, kname in enumerate(gkeys):
         c = result.params[f"g{i}_center"].value
         table_data.append([f"Peak {i} center", f"{c:.6f}"])
@@ -465,7 +432,6 @@ def _parse_args():
     p.add_argument("--augment", action="store_true", help="Enable one-pass residual augmentation.")
     p.add_argument("--hide-detect-bg", action="store_true", help="Do not plot the detection baseline.")
     return p.parse_args()
-
 
 if __name__ == "__main__":
     args = _parse_args()
