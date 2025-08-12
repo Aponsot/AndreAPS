@@ -68,17 +68,6 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         cache_coordinate_map=True
     )
 
-    from sklearn.cluster import DBSCAN
-
-    def detect_spots(image, eps=5, min_samples=3):
-        coords = np.column_stack(np.where(image > 0))
-        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
-        spot_mask = np.zeros_like(image, dtype=bool)
-        for cluster_label in np.unique(clustering.labels_):
-            if cluster_label != -1:
-                cluster_coords = coords[clustering.labels_ == cluster_label]
-                spot_mask[cluster_coords[:, 0], cluster_coords[:, 1]] = True
-        return spot_mask
 
     from scipy.ndimage import median_filter
     def mask_background(image, fluctuation_values=[0.0, .5], tolerance=0.2):
@@ -93,8 +82,6 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
         image_1 = mask_background(image_1, fluctuation_values, tolerance=tolerance)
         background = median_filter(image_1, size=5)
         image_1 = image_1 - background
-        spot_mask = detect_spots(image_1)
-        image_1_masked = np.ma.masked_where(~spot_mask, image_1)
         threshold = 0.7
         inflate_factor = 20
         image_1_masked = np.where(image_1_masked > threshold, image_1_masked * inflate_factor, image_1_masked)
