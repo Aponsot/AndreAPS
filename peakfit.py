@@ -281,9 +281,8 @@ def _derivative_shoulder_seeds(q, y_det, dq, w_guess_pts, min_dist_pts, existing
     sig1 = _robust_sigma(y1)
     sig2 = _robust_sigma(y2)
     # slope extremes and curvature minima
-    slope_idx, _ = signal.find_peaks(np.abs(y1), prominence=max(2.5 * sig1, 1e-12), distance=min_dist_pts)
-    curv_idx, _ = signal.find_peaks(-y2, prominence=max(2.0 * sig2, 1e-12), distance=min_dist_pts)
-
+    slope_idx, _ = signal.find_peaks(np.abs(y1), prominence=max(4.0*sig1, 1e-12), distance=min_dist_pts)
+    curv_idx,  _ = signal.find_peaks(-y2,    prominence=max(3.5*sig2, 1e-12), distance=min_dist_pts)
     # union
     cand = np.unique(np.concatenate([slope_idx, curv_idx]))
     if cand.size == 0:
