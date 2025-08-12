@@ -32,6 +32,7 @@ SIGMA_MIN_FRAC    = 0.20  # lower bound on sigma = SIGMA_MIN_FRAC * sigma_seed
 SIGMA_MAX_MULT    = 4.0   # upper bound on sigma = SIGMA_MAX_MULT * sigma_seed
 AMP_MIN_FRAC      = 0.05  # min amplitude (AREA) = AMP_MIN_FRAC * area_seed
 AMP_MAX_MULT      = 20.0  # max amplitude (AREA) = AMP_MAX_MULT * area_seed
+MERGE_FRAC        = .75
 
 # Centers: per-peak, not globally tied
 CENTER_WIGGLE_PTS = 8.0   # each center can move ± CENTER_WIGGLE_PTS * dq from its seed
