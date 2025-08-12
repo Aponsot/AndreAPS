@@ -230,7 +230,7 @@ def sweep_frames(h5_path, peak_pos, window=0.1, frames=None, csv_path=None, prin
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Polar integration of diffraction experiments.")
     parser.add_argument("h5", type=str, help="Path to the folder containing TIFF images.")
-    parser.add_argument("peak_pos", type=str, required=True, help="Path to the instrument YAML file.")
+    parser.add_argument("peak_pos", type=float, help="Location of Peak of study")
     args = parser.parse_args()
     sweep_frames(args.h5, args.peak_pos, window=0.1, frames=None, csv_path="peakfit_with_peaks.csv")
 
