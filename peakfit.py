@@ -7,12 +7,10 @@ import scipy.signal as signal
 from scipy.ndimage import gaussian_filter1d, percentile_filter
 from lmfit.models import PolynomialModel, GaussianModel
 
-
 # ----------------------------- helpers ----------------------------- #
 def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
     """FWHM -> sigma in x-units via FWHM = 2.355*sigma."""
     return (fwhm_pts * dq) / 2.355
-
 
 def fit_metrics(result, x, y, weights=None):
     yhat = result.model.eval(params=result.params, x=x)
@@ -42,17 +40,43 @@ def fit_metrics(result, x, y, weights=None):
     return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
                 rmse=rmse, max_abs=max_abs, n=n, k=k)
 
-
 def _poisson_weights(y):
     return 1.0 / np.sqrt(np.clip(y, 1.0, None))
 
+def _robust_sigma(x):
+    med = np.median(x)
+    return 1.4826 * np.median(np.abs(x - med))
+
+# --- strict linear background for detection (sigma-clipped LSQ) ---
+def _linear_bg_strict(q, y, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
+    q = np.asarray(q, float); y = np.asarray(y, float); n = y.size
+    if n < 3:
+        a = float(np.median(y)); b = 0.0
+        return a + b*q, dict(a=a, b=b, kept=n, iters=0)
+    mask = np.ones(n, bool); a = float(np.median(y)); b = 0.0; kept = n
+    for it in range(max_iter):
+        X = np.vstack([np.ones(mask.sum()), q[mask]]).T
+        beta, *_ = np.linalg.lstsq(X, y[mask], rcond=None)
+        a, b = float(beta[0]), float(beta[1])
+        bg = a + b*q
+        resid = y - bg
+        rsel = resid[mask]
+        sig = 1.4826 * np.median(np.abs(rsel - np.median(rsel))) if rsel.size else 0.0
+        if sig == 0.0: break
+        below = y <= (bg + clip_sigma*sig)
+        idx = np.where(below)[0]
+        if idx.size < 5: break
+        order = np.argsort(resid[idx])
+        k = max(5, int(frac_keep * idx.size))
+        newmask = np.zeros(n, bool); newmask[idx[order[:k]]] = True
+        if newmask.sum()==mask.sum() and np.all(newmask==mask):
+            kept = newmask.sum(); break
+        mask = newmask; kept = mask.sum()
+    return a + b*q, dict(a=a, b=b, kept=kept, iters=it+1)
 
 def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
                            add_frac=0.45, min_sep_sigma=0.8):
-    """
-    One simple residual pass: build a crude Gaussian sum from seeds,
-    detect extra small peaks on residual, merge if reasonably separated.
-    """
+    """One simple residual pass: build crude Gaussian sum from seeds, detect small peaks on residual."""
     if len(peaks_idx) == 0:
         return peaks_idx, props
 
@@ -104,56 +128,53 @@ def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
     order = np.argsort(q[peaks_idx])
     return peaks_idx[order], {"widths": widths[order], "prominences": promin[order]}
 
-
 def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     """
-    Robust fit: background poly + sum of Gaussians.
+    Linear background + sum of Gaussians. (No quadratic fallback.)
     Centers tied to global qshift+qscale with small per-peak wiggle.
-    Also tries quadratic background and keeps it if AIC improves.
     """
-    if len(peaks_idx) == 0:
-        return None, {}
-
     dq = float(np.diff(q).mean())
 
-    # Background (linear by default)
+    # Background (strictly linear if bg_degree=1)
     composite = PolynomialModel(degree=bg_degree, prefix="bg_")
     params = composite.make_params()
-    params["bg_c0"].set(value=float(np.median(y)), min=0)
+    params["bg_c0"].set(value=float(np.median(y)), min=0.0)
     if bg_degree >= 1:
-        params["bg_c1"].set(value=0)
+        params["bg_c1"].set(value=0.0)
 
-    # Global q-axis drift/scale
+    # global transforms (kept; harmless if no peaks)
     params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
     params.add("qscale", value=1.0, min=0.999, max=1.001)
 
-    fwhm_pts = np.asarray(props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), float)
-    prominences = np.asarray(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
+    # Add Gaussians if any peaks
+    if len(peaks_idx) > 0:
+        fwhm_pts = np.asarray(props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), float)
+        prominences = np.asarray(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
 
-    for i, pidx in enumerate(peaks_idx):
-        center0 = float(q[pidx])
-        sigma0 = max(_sigma_from_fwhm(float(fwhm_pts[i]), dq), 1e-6)
+        for i, pidx in enumerate(peaks_idx):
+            center0 = float(q[pidx])
+            sigma0 = max(_sigma_from_fwhm(float(fwhm_pts[i]), dq), 1e-6)
 
-        g = GaussianModel(prefix=f"g{i}_")
-        composite += g
+            g = GaussianModel(prefix=f"g{i}_")
+            composite += g
 
-        height0 = float(prominences[i])
-        amp0 = max(height0 * sigma0 * np.sqrt(2 * np.pi), 1e-9)  # area
+            height0 = float(prominences[i])
+            amp0 = max(height0 * sigma0 * np.sqrt(2 * np.pi), 1e-9)  # area
 
-        params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
-        # tie: center = qscale*base + qshift + tiny per-peak wiggle
-        params.add(f"g{i}_c0", value=center0, vary=False)
+            params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
+            # tie: center = qscale*base + qshift + tiny per-peak wiggle
+            params.add(f"g{i}_c0", value=center0, vary=False)
 
-        # widen the wiggle to ~3 samples or ~0.0018, whichever larger
-        dwig = max(3 * dq, 0.0018)
-        params.add(f"g{i}_dcenter", value=0.0, min=-dwig, max=dwig)
-        params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
+            # wiggle ~3 samples or ~0.0018
+            dwig = max(3 * dq, 0.0018)
+            params.add(f"g{i}_dcenter", value=0.0, min=-dwig, max=dwig)
+            params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
 
-        # looser width bounds for melted frames
-        params[f"g{i}_sigma"].set(min=0.25 * sigma0, max=4.0 * sigma0)
-        params[f"g{i}_amplitude"].set(min=0.2 * abs(amp0), max=10 * abs(amp0))
+            # width/amplitude bounds
+            params[f"g{i}_sigma"].set(min=0.25 * sigma0, max=4.0 * sigma0)
+            params[f"g{i}_amplitude"].set(min=0.2 * abs(amp0), max=10 * abs(amp0))
 
-    # Robust global fit (linear bg)
+    # Fit
     w = _poisson_weights(y)
     result = composite.fit(
         y, params, x=q, weights=w,
@@ -161,114 +182,21 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     )
     comps = result.model.eval_components(params=result.params, x=q)
 
-    # --- Try quadratic background; keep if AIC improves meaningfully ---
-    best_result, best_comps, best_aic = result, comps, result.aic
-    if bg_degree == 1:
-        comp2 = PolynomialModel(degree=2, prefix="bg2_")
-        m2 = comp2
-        p2 = comp2.make_params()
-        p2["bg2_c0"].set(value=float(np.median(y)), min=0)
-        p2["bg2_c1"].set(value=0)
-        p2["bg2_c2"].set(value=0)
-
-        # Re-add Gaussians seeded from the linear-bg solution
-        for i, _ in enumerate(peaks_idx):
-            g = GaussianModel(prefix=f"g{i}_")
-            m2 += g
-            p2.update(g.make_params(
-                center=best_result.params[f"g{i}_center"].value,
-                sigma=best_result.params[f"g{i}_sigma"].value,
-                amplitude=best_result.params[f"g{i}_amplitude"].value
-            ))
-            # keep center ties and bounds
-            p2.add(f"g{i}_c0", value=best_result.params[f"g{i}_c0"].value, vary=False)
-            p2.add(f"g{i}_dcenter",
-                   value=best_result.params[f"g{i}_dcenter"].value,
-                   min=best_result.params[f"g{i}_dcenter"].min,
-                   max=best_result.params[f"g{i}_dcenter"].max)
-            p2[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
-
-        # global transforms
-        p2.add("qshift", value=best_result.params["qshift"].value,
-               min=best_result.params["qshift"].min, max=best_result.params["qshift"].max)
-        p2.add("qscale", value=best_result.params["qscale"].value,
-               min=best_result.params["qscale"].min, max=best_result.params["qscale"].max)
-
-        r2 = m2.fit(y, p2, x=q, weights=w,
-                    method="least_squares", fit_kws={"loss": "soft_l1", "f_scale": 1.0})
-        if (best_aic - r2.aic) > 2.0:  # worth the extra term
-            best_result = r2
-            best_comps = m2.eval_components(params=r2.params, x=q)
-
+    # return (no quadratic option)
+    best_result, best_comps = result, comps
     return best_result, best_comps
 
-
-# --- detection background helpers --- #
-def detect_background_floor(y_win, pct=15, win_frac=0.05, smooth_sigma=2):
-    """
-    Percentile-floor baseline for PEAK DETECTION ONLY.
-    pct: lower percentile (smaller => flatter).
-    win_frac: window size as fraction of length.
-    smooth_sigma: tiny Gaussian smooth to de-block the percentile output.
-    """
-    n = len(y_win)
-    win = max(7, int(win_frac * n) | 1)  # odd, >=7
-    bg = percentile_filter(y_win, percentile=pct, size=win)
-    if smooth_sigma and smooth_sigma > 0:
-        bg = gaussian_filter1d(bg, sigma=smooth_sigma)
-    return bg
-
-
-def detect_background_adaptive(y_win, floor_pct=14, floor_win_frac=0.05,
-                               floor_smooth=2, gauss_frac=0.03,
-                               target_frac=0.55, max_iter=12):
-    """
-    Blend between floor and Gaussian so that ~target_frac of points lie
-    BELOW the baseline (keeps a true floor while allowing mild slope post-melt).
-    """
-    n = len(y_win)
-    # floor
-    bg_floor = detect_background_floor(y_win, pct=floor_pct,
-                                       win_frac=floor_win_frac,
-                                       smooth_sigma=floor_smooth)
-    # gentle Gaussian
-    sg = max(3, min(12, int(gauss_frac * n)))
-    bg_gauss = gaussian_filter1d(y_win, sigma=sg)
-
-    # binary search for alpha in [0,1]
-    lo, hi = 0.0, 1.0
-    for _ in range(max_iter):
-        alpha = 0.5 * (lo + hi)
-        bg = alpha * bg_gauss + (1 - alpha) * bg_floor
-        frac_below = float(np.mean(y_win <= bg))
-        if frac_below < target_frac:   # baseline too low -> raise toward gauss
-            lo = alpha
-        else:                          # baseline too high -> lower toward floor
-            hi = alpha
-    alpha = 0.5 * (lo + hi)
-    bg = alpha * bg_gauss + (1 - alpha) * bg_floor
-    return bg, dict(alpha=alpha, frac_below=float(np.mean(y_win <= bg)),
-                    sg=sg, floor_pct=floor_pct, win_frac=floor_win_frac)
-
-
-def _robust_sigma(x):
-    med = np.median(x)
-    return 1.4826 * np.median(np.abs(x - med))
-
-
-# -------- shoulder seeding via derivatives (NEW) -------- #
+# -------- shoulder seeding via derivatives -------- #
 def _derivative_shoulder_seeds(q, y_det, dq, w_guess_pts, min_dist_pts, existing_peaks):
     """
-    Seed extra components using slope/curvature cues:
-    - y1: first derivative (large |y1| can indicate shoulder edges)
-    - y2: second derivative (strong negative curvature points)
+    Seed extra components using slope/curvature cues (Savitzky–Golay derivatives).
     Returns indices for additional seeds that are not near existing peaks.
     """
     n = len(y_det)
     if n < 7:
         return np.array([], dtype=int), {}
 
-    # Savitzky–Golay window for derivatives (odd, <= n)
+    # SG window (odd)
     wlen = max(7, int(round(2.5 * w_guess_pts)) | 1)
     max_wlen = n if (n % 2 == 1) else (n - 1)
     wlen = min(wlen, max_wlen)
@@ -283,28 +211,24 @@ def _derivative_shoulder_seeds(q, y_det, dq, w_guess_pts, min_dist_pts, existing
     # slope extremes and curvature minima
     slope_idx, _ = signal.find_peaks(np.abs(y1), prominence=max(4.0*sig1, 1e-12), distance=min_dist_pts)
     curv_idx,  _ = signal.find_peaks(-y2,    prominence=max(3.5*sig2, 1e-12), distance=min_dist_pts)
-    # union
     cand = np.unique(np.concatenate([slope_idx, curv_idx]))
     if cand.size == 0:
         return cand.astype(int), {"wlen": wlen, "sig1": sig1, "sig2": sig2, "n_cand": 0}
 
-    # Filter: keep only where intensity is positive enough and not too close to existing peaks
+    # intensity gate + avoid near existing peaks
     ysig = _robust_sigma(y_det)
     thr = max(3.5 * ysig, 0.25 * float(np.max(y_det)) if np.max(y_det) > 0 else 0.0)
 
     keep = []
     for idx in cand:
-        # intensity threshold
         if y_det[idx] < thr:
             continue
-        # not too close to an existing max-peak
         if len(existing_peaks) and np.min(np.abs(q[existing_peaks] - q[idx])) < (1.0*w_guess_pts*dq):
             continue
         keep.append(idx)
 
     out = np.array(keep, dtype=int)
     return out, {"wlen": wlen, "sig1": sig1, "sig2": sig2, "n_cand": len(cand), "n_kept": len(out)}
-
 
 # ----------------------------- main ----------------------------- #
 def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_derivatives=True):
@@ -325,30 +249,19 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
     fig, axes = plt.subplots(2, 3, figsize=(15, 10), gridspec_kw={"width_ratios": [1, 1, 2]})
     fig.suptitle(f"Peak Fit for Frame {frame_number}", fontsize=16)
 
-    # --- Detection (background-sub only) ---
+    # --- Detection (background-sub only, STRICT LINEAR) ---
     dq = float(np.diff(q_win).mean())
-
-    # Adaptive baseline (floor + gaussian blend picked per frame)
-    bg_detect, bg_info = detect_background_adaptive(
-        y_win,
-        floor_pct=14,
-        floor_win_frac=0.05,
-        floor_smooth=2,
-        gauss_frac=0.03,
-        target_frac=0.55
-    )
+    bg_detect, _bginfo = _linear_bg_strict(q_win, y_win)
     y_det = y_win - bg_detect
-    print(f"[bg] alpha={bg_info['alpha']:.2f} frac_below={bg_info['frac_below']:.2f} "
-          f"sg={bg_info['sg']} floor_pct={bg_info['floor_pct']} win_frac={bg_info['win_frac']}")
 
-    # Adaptive thresholds for detection (handles melting)
+    # thresholds for detection
     sig = _robust_sigma(y_det)
-    K = 3.6  # slightly easier picks post-melt
+    K = 3.6  # slightly easier picks
     prom_full = max(1.0, K * sig)
 
     w_guess_pts = 3.0
     wmin = max(1, int(0.6 * w_guess_pts))
-    wmax = int(20 * w_guess_pts)  # allow broader peaks post-melt
+    wmax = int(20 * w_guess_pts)
     min_dist_pts = int(max(1, round(0.6 * w_guess_pts)))
 
     # Primary maxima
@@ -361,22 +274,20 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
     )
     print(f"[detect] primary maxima: sig={sig:.3g} prom>={prom_full:.3g} width∈[{wmin},{wmax}] N={len(peaks)}")
 
-    # ---- NEW: derivative-based shoulder seeds for initial fit ----
+    # derivative-based shoulder seeds (optional)
     deriv_idx = np.array([], dtype=int)
     if use_derivatives:
         deriv_idx, dinfo = _derivative_shoulder_seeds(q_win, y_det, dq, w_guess_pts, min_dist_pts, peaks)
         if deriv_idx.size:
             print(f"[deriv] kept {dinfo['n_kept']}/{dinfo['n_cand']} derivative seeds "
                   f"(wlen={dinfo['wlen']} sig1={dinfo['sig1']:.3g} sig2={dinfo['sig2']:.3g})")
-            # Merge derivative seeds into peaks & props
+            # merge seeds
             peaks = np.concatenate([peaks.astype(int), deriv_idx.astype(int)])
-            # widths: no strong estimate for shoulders -> seed with w_guess_pts
             widths = np.asarray(props.get("widths", np.full(0, w_guess_pts)), float)
             promin = np.asarray(props.get("prominences", np.full(0, max(1.0, 2.5 * sig))), float)
 
             new_w = np.full(deriv_idx.size, w_guess_pts, dtype=float)
 
-            # simple local prominence proxy for seeds (shoulders may not be true maxima)
             def _local_prom(i, L=int(round(2.0 * w_guess_pts))):
                 lo = max(0, i - L); hi = min(len(y_det), i + L + 1)
                 baseline = np.min(y_det[lo:hi]) if hi > lo else 0.0
@@ -407,9 +318,9 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
             peaks, props = peaks_try, props_try
             print(f"[detect] after residual augment: {len(peaks)} @ {q_win[peaks]}")
 
-    # --- Fit ---
+    # --- Fit (linear BG only) ---
     result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
-    w = 1.0 / np.sqrt(np.clip(y_win, 1.0, None))  # same weights used in fit
+    w = _poisson_weights(y_win)
     m = fit_metrics(result, q_win, y_win, weights=w)
     print(f"[METRICS] R2={m['r2']:.6f}  adjR2={m['adj_r2']:.6f}  redχ²={m['red_chisq']:.3g}  "
           f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}")
@@ -449,7 +360,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
     # --- Right top: Full Azimuthal Integration ---
     ax = axes[0, 2]
     ax.plot(q_win, y_win, "--", label="Data")
-    ax.plot(q_win, bg_detect, "-", label="BG (detect)")
+    ax.plot(q_win, bg_detect, "-", label="BG (detect, linear)")
     ax.plot(q_win[peaks], y_det[peaks], "x", label="Detected peaks")
     if use_derivatives and deriv_idx.size:
         ax.plot(q_win[deriv_idx], y_det[deriv_idx], "^", ms=7, label="Derivative seeds")
@@ -457,7 +368,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
     for name in sorted(k for k in comps_dense if k.startswith("g")):
         ax.plot(q_dense, comps_dense[name], ":", alpha=0.85, label=name)
     if "bg_" in comps_dense:
-        ax.plot(q_dense, comps_dense["bg_"], "-", label="BG (fit)")
+        ax.plot(q_dense, comps_dense["bg_"], "-", label="BG (fit, linear)")
 
     ax.set_title("Full Azimuthal Integration")
     ax.set_xlabel("q"); ax.set_ylabel("Intensity")
@@ -513,10 +424,9 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
-
 # ----------------------------- CLI ----------------------------- #
 def _parse_args():
-    p = argparse.ArgumentParser(description="Lean multi-peak Gaussian fitting with derivative-based shoulder seeding.")
+    p = argparse.ArgumentParser(description="Lean multi-peak Gaussian fitting with derivative-based shoulder seeding (linear BG).")
     p.add_argument("h5", type=str)
     p.add_argument("frame_number", type=int)
     p.add_argument("peak_pos", type=float)
@@ -525,8 +435,7 @@ def _parse_args():
     p.add_argument("--no-deriv", action="store_true", help="Disable derivative-based shoulder seeding.")
     return p.parse_args()
 
-
 if __name__ == "__main__":
     args = _parse_args()
     peak_fit(args.h5, args.frame_number, args.peak_pos, args.window,
-             augment=args.augment)
+             augment=args.augment, use_derivatives=(not args.no_deriv))
