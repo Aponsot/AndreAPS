@@ -29,7 +29,7 @@ def fit_metrics(result, x, y, weights=None):
     resid = y - yhat
     n = len(y)
     # count only params that actually vary and appear in the model
-    k = sum(p.vary for p in result.params.values() if p in result.eval_components(x=x, **result.best_values))
+    k = sum(1 for p in result.params.values() if p.vary)
 
     if weights is not None:
         w = np.asarray(weights, float)
