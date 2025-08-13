@@ -74,59 +74,6 @@ def _linear_bg_strict(q, y, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
         mask = newmask; kept = mask.sum()
     return a + b*q, dict(a=a, b=b, kept=kept, iters=it+1)
 
-def _augment_once_residual(q, y_bgsub, peaks_idx, props, dq,
-                           add_frac=0.45, min_sep_sigma=0.8):
-    """One simple residual pass: build crude Gaussian sum from seeds, detect small peaks on residual."""
-    if len(peaks_idx) == 0:
-        return peaks_idx, props
-
-    widths = np.array(props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), float)
-    promin = np.array(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
-
-    # crude model
-    yhat = np.zeros_like(q, float)
-    for i, pidx in enumerate(peaks_idx):
-        mu = float(q[pidx])
-        sig = max(_sigma_from_fwhm(widths[i], dq), 1e-6)
-        amp = float(promin[i]) * sig * np.sqrt(2 * np.pi)  # area ≈ prominence * sigma * sqrt(2π)
-        yhat += amp * np.exp(-0.5 * ((q - mu) / sig) ** 2)
-
-    residual = y_bgsub - yhat
-
-    mean_w_pts = float(np.clip(np.nanmean(widths) if widths.size else 3.0, 2.0, 20.0))
-    min_dist_pts = int(max(1, round(min_sep_sigma * mean_w_pts)))
-
-    prom_base = float(np.median(promin)) if promin.size else 2.0
-    prom_add = add_frac * max(0.5, prom_base)
-
-    cand_idx, cand_props = signal.find_peaks(
-        residual, prominence=prom_add, width=1, distance=min_dist_pts, rel_height=0.5
-    )
-
-    if cand_idx.size == 0:
-        return peaks_idx, props
-
-    # keep candidates not too close to existing ones
-    keep = []
-    for j, pidx in enumerate(cand_idx):
-        qj = q[pidx]
-        if len(peaks_idx) and np.min(np.abs(q[peaks_idx] - qj)) < (min_dist_pts * dq):
-            continue
-        keep.append(j)
-
-    if not keep:
-        return peaks_idx, props
-
-    new_idx = cand_idx[keep].astype(int)
-    new_w = cand_props["widths"][keep]
-    new_p = cand_props["prominences"][keep]
-
-    peaks_idx = np.concatenate([np.asarray(peaks_idx, int), new_idx])
-    widths = np.concatenate([widths, np.asarray(new_w, float)])
-    promin = np.concatenate([promin, np.asarray(new_p, float)])
-
-    order = np.argsort(q[peaks_idx])
-    return peaks_idx[order], {"widths": widths[order], "prominences": promin[order]}
 
 def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     """
@@ -185,53 +132,8 @@ def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
     # return (no quadratic option)
     best_result, best_comps = result, comps
     return best_result, best_comps
-
-# -------- shoulder seeding via derivatives -------- #
-def _derivative_shoulder_seeds(q, y_det, dq, w_guess_pts, min_dist_pts, existing_peaks):
-    """
-    Seed extra components using slope/curvature cues (Savitzky–Golay derivatives).
-    Returns indices for additional seeds that are not near existing peaks.
-    """
-    n = len(y_det)
-    if n < 7:
-        return np.array([], dtype=int), {}
-
-    # SG window (odd)
-    wlen = max(7, int(round(2.5 * w_guess_pts)) | 1)
-    max_wlen = n if (n % 2 == 1) else (n - 1)
-    wlen = min(wlen, max_wlen)
-    if wlen < 5:
-        return np.array([], dtype=int), {}
-
-    y1 = signal.savgol_filter(y_det, window_length=wlen, polyorder=3, deriv=1, delta=dq, mode="interp")
-    y2 = signal.savgol_filter(y_det, window_length=wlen, polyorder=3, deriv=2, delta=dq, mode="interp")
-
-    sig1 = _robust_sigma(y1)
-    sig2 = _robust_sigma(y2)
-    # slope extremes and curvature minima
-    slope_idx, _ = signal.find_peaks(np.abs(y1), prominence=max(4.0*sig1, 1e-12), distance=min_dist_pts)
-    curv_idx,  _ = signal.find_peaks(-y2,    prominence=max(3.5*sig2, 1e-12), distance=min_dist_pts)
-    cand = np.unique(np.concatenate([slope_idx, curv_idx]))
-    if cand.size == 0:
-        return cand.astype(int), {"wlen": wlen, "sig1": sig1, "sig2": sig2, "n_cand": 0}
-
-    # intensity gate + avoid near existing peaks
-    ysig = _robust_sigma(y_det)
-    thr = max(3.5 * ysig, 0.25 * float(np.max(y_det)) if np.max(y_det) > 0 else 0.0)
-
-    keep = []
-    for idx in cand:
-        if y_det[idx] < thr:
-            continue
-        if len(existing_peaks) and np.min(np.abs(q[existing_peaks] - q[idx])) < (1.0*w_guess_pts*dq):
-            continue
-        keep.append(idx)
-
-    out = np.array(keep, dtype=int)
-    return out, {"wlen": wlen, "sig1": sig1, "sig2": sig2, "n_cand": len(cand), "n_kept": len(out)}
-
 # ----------------------------- main ----------------------------- #
-def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_derivatives=True):
+def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     with h5py.File(h5_path, "r") as f:
         Int = f["int"][:]  # (nframes, q)
         q = f["q"][:]      # (q,)
@@ -273,50 +175,6 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
         rel_height=0.5,
     )
     print(f"[detect] primary maxima: sig={sig:.3g} prom>={prom_full:.3g} width∈[{wmin},{wmax}] N={len(peaks)}")
-
-    # derivative-based shoulder seeds (optional)
-    deriv_idx = np.array([], dtype=int)
-    if use_derivatives:
-        deriv_idx, dinfo = _derivative_shoulder_seeds(q_win, y_det, dq, w_guess_pts, min_dist_pts, peaks)
-        if deriv_idx.size:
-            print(f"[deriv] kept {dinfo['n_kept']}/{dinfo['n_cand']} derivative seeds "
-                  f"(wlen={dinfo['wlen']} sig1={dinfo['sig1']:.3g} sig2={dinfo['sig2']:.3g})")
-            # merge seeds
-            peaks = np.concatenate([peaks.astype(int), deriv_idx.astype(int)])
-            widths = np.asarray(props.get("widths", np.full(0, w_guess_pts)), float)
-            promin = np.asarray(props.get("prominences", np.full(0, max(1.0, 2.5 * sig))), float)
-
-            new_w = np.full(deriv_idx.size, w_guess_pts, dtype=float)
-
-            def _local_prom(i, L=int(round(2.0 * w_guess_pts))):
-                lo = max(0, i - L); hi = min(len(y_det), i + L + 1)
-                baseline = np.min(y_det[lo:hi]) if hi > lo else 0.0
-                return max(0.0, float(y_det[i] - baseline))
-
-            new_p = np.array([_local_prom(i) for i in deriv_idx], dtype=float)
-            new_p[new_p <= 0] = max(1.0, 2.5 * sig)
-
-            if widths.size:
-                widths = np.concatenate([widths, new_w])
-                promin = np.concatenate([promin, new_p])
-            else:
-                widths = new_w
-                promin = new_p
-
-            order = np.argsort(q_win[peaks])
-            peaks = peaks[order]
-            props = {"widths": widths[order], "prominences": promin[order]}
-        else:
-            print("[deriv] no derivative-based seeds added.")
-
-    # Optionally augment once from residuals
-    if augment and len(peaks) > 0:
-        peaks_try, props_try = _augment_once_residual(
-            q_win, y_det, peaks, props, dq, add_frac=0.40, min_sep_sigma=0.8
-        )
-        if len(peaks_try) > len(peaks):
-            peaks, props = peaks_try, props_try
-            print(f"[detect] after residual augment: {len(peaks)} @ {q_win[peaks]}")
 
     # --- Fit (linear BG only) ---
     result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
@@ -362,9 +220,6 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1, augment=False, use_der
     ax.plot(q_win, y_win, "--", label="Data")
     ax.plot(q_win, bg_detect, "-", label="BG (detect, linear)")
     ax.plot(q_win[peaks], y_det[peaks], "x", label="Detected peaks")
-    if use_derivatives and deriv_idx.size:
-        ax.plot(q_win[deriv_idx], y_det[deriv_idx], "^", ms=7, label="Derivative seeds")
-    ax.plot(q_dense, best_fit_dense, "-", label="Total fit (dense)")
     for name in sorted(k for k in comps_dense if k.startswith("g")):
         ax.plot(q_dense, comps_dense[name], ":", alpha=0.85, label=name)
     if "bg_" in comps_dense:
@@ -431,11 +286,8 @@ def _parse_args():
     p.add_argument("frame_number", type=int)
     p.add_argument("peak_pos", type=float)
     p.add_argument("--window", type=float, default=0.1, help="Half-window in q.")
-    p.add_argument("--augment", action="store_true", help="Enable one-pass residual augmentation.")
-    p.add_argument("--no-deriv", action="store_true", help="Disable derivative-based shoulder seeding.")
     return p.parse_args()
 
 if __name__ == "__main__":
     args = _parse_args()
-    peak_fit(args.h5, args.frame_number, args.peak_pos, args.window,
-             augment=args.augment, use_derivatives=(not args.no_deriv))
+    peak_fit(args.h5, args.frame_number, args.peak_pos, args.window)
