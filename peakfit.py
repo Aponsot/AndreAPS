@@ -169,7 +169,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
         raise ValueError("Fit window too small or outside q-range.")
 
     # Figure (2 rows x 3 columns; right column is wider by width_ratios)
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10), gridspec_kw={"width_ratios": [1, 1, 2]})
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10))
     fig.suptitle(f"Peak Fit for Frame {frame_number}", fontsize=16)
 
     # --- Detection (background-sub only, STRICT LINEAR) ---
@@ -204,33 +204,6 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     print(f"[METRICS] R2={m['r2']:.6f}  adjR2={m['adj_r2']:.6f}  redχ²={m['red_chisq']:.3g}  "
           f"AIC={m['aic']:.2f}  BIC={m['bic']:.2f}  RMSE={m['rmse']:.3g}  max|res|={m['max_abs']:.3g}")
 
-    # --- If R² still low, try a tiny residual add & refit once ---
-    TARGET = 0.98
-    if m['r2'] < TARGET and len(peaks) > 0:
-        yhat = result.model.eval(params=result.params, x=q_win)
-        resid_bg = (y_win - bg_detect) - (yhat - bg_detect)
-        sigR = _robust_sigma(resid_bg)
-        cand, cprops = signal.find_peaks(
-            resid_bg, prominence=2.5 * sigR, width=1,
-            distance=int(max(1, round(0.6 * w_guess_pts)))
-        )
-        keep = []
-        for j, pidx in enumerate(cand):
-            if len(peaks) and np.min(np.abs(q_win[peaks] - q_win[pidx])) < (0.6 * w_guess_pts * dq):
-                continue
-            keep.append(j)
-        if keep:
-            peaks = np.concatenate([np.asarray(peaks, int), cand[keep].astype(int)])
-            widths = np.concatenate([np.asarray(props.get("widths", np.full_like(peaks, 3.0))),
-                                     cprops["widths"][keep]])
-            promin = np.concatenate([np.asarray(props.get("prominences", np.ones_like(peaks))),
-                                     cprops["prominences"][keep]])
-            order = np.argsort(q_win[peaks]); peaks = peaks[order]
-            props = {"widths": widths[order], "prominences": promin[order]}
-            result, comps = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
-            m = fit_metrics(result, q_win, y_win, weights=_poisson_weights(y_win))
-            print(f"[refit] R2→{m['r2']:.6f}")
-
     # Dense plotting
     q_dense = np.linspace(q_win.min(), q_win.max(), len(q_win) * 5)
     best_fit_dense = result.model.eval(params=result.params, x=q_dense)
@@ -240,7 +213,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     ax = axes[0, 2]
     ax.plot(q_win, y_win, "--", label="Data")
     ax.plot(q_win, bg_detect, "-", label="BG (detect, linear)")
-    ax.plot(q_dense, best_fit_dense, "-", linewidth=2.4, alpha=0.95, label="Total fit", zorder=6)  # ADDED
+    ax.plot(q_dense, best_fit_dense, "-", linewidth=2.4, alpha=0.95, label="Total fit", zorder=6)  
 
     if len(peaks) > 0:
         ax.plot(q_win[peaks], y_det[peaks], "x", label="Detected peaks")
@@ -248,8 +221,6 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     for name in sorted(k for k in comps_dense if k.startswith("g")):
         ax.plot(q_dense, comps_dense[name], ":", alpha=0.85, label=name)
 
-    if "bg_" in comps_dense:
-        ax.plot(q_dense, comps_dense["bg_"], "-", label="BG (fit, linear)")
 
     ax.set_title("Full Azimuthal Integration")
     ax.set_xlabel("q"); ax.set_ylabel("Intensity")
@@ -259,26 +230,6 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     by_label = dict(zip(labels, handles))
     ax.legend(by_label.values(), by_label.keys(), loc="upper right")
 
-    # --- Left 2x2: Cake previews (simple) ---
-    if cake is not None:
-        slices = [0, 10, 19, 28]
-        sigma_smooth_detect = max(3, min(12, int(0.03 * len(q_win))))  # for preview only
-        for i, cs in enumerate(slices):
-            r, c = divmod(i, 2)
-            y_c = cake[frame_number, cs, :][mask]
-            bg_c = gaussian_filter1d(y_c, sigma=sigma_smooth_detect)
-            ysub = y_c - bg_c
-            pk_c, _ = signal.find_peaks(ysub, prominence=prom_full, width=(wmin, wmax), distance=min_dist_pts)
-            axes[r, c].plot(q_win, y_c, "--", label="Cake data")
-            axes[r, c].plot(q_win, bg_c, "-", label="BG (detect)")
-            if len(pk_c) > 0:
-                axes[r, c].plot(q_win[pk_c], ysub[pk_c], "x", label="Peaks")
-            axes[r, c].set_title(f"Cake slice {cs}")
-            axes[r, c].set_xlabel("q"); axes[r, c].set_ylabel("Intensity")
-            axes[r, c].legend(loc="upper right", fontsize=8)
-    else:
-        for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)]:
-            axes[r, c].axis("off"); axes[r, c].text(0.5, 0.5, "No cake_int", ha="center", va="center")
 
     # --- Bottom-right: Table with metrics + peak centers ---
     table_ax = axes[1, 2]
@@ -304,7 +255,7 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
                            cellLoc="center",
                            loc="center")
     table.auto_set_font_size(False)
-    table.set_fontsize(8)
+    table.set_fontsize(12)
     table.scale(1.2, 1.25)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -322,3 +273,4 @@ def _parse_args():
 if __name__ == "__main__":
     args = _parse_args()
     peak_fit(args.h5, args.frame_number, args.peak_pos, args.window)
+
