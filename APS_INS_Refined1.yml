@@ -1,0 +1,32 @@
+beam:
+  energy: 61.332
+  vector:
+    azimuth: 90.0
+    polar_angle: 90.0
+detectors:
+  detector_1:
+    buffer: null
+    detector_type: planar
+    pixels:
+      columns: 1475
+      rows: 1679
+      size:
+      - 0.172
+      - 0.172
+    saturation_level: 14000.0
+    transform:
+      tilt:
+      - -0.0100620290668311
+      - 0.013419768289356194
+      - 6.75166322290052e-05
+      translation:
+      - 1.35608824
+      - -1.9144389
+      - -685.4197752
+id: instrument
+oscillation_stage:
+  chi: 0.0
+  translation:
+  - 0.0
+  - 0.0
+  - 0.0
