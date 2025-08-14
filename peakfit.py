@@ -184,20 +184,20 @@ def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
 
     # thresholds for detection
     sig = _robust_sigma(y_det)
-    K = 3.6
+    K = 1.5
     prom_full = max(1.0, K * sig)
 
-    w_guess_pts = 3.0
+    w_guess_pts = 6.0
     wmin = max(1, int(0.6 * w_guess_pts))
     wmax = int(20 * w_guess_pts)
-    min_dist_pts = int(max(1, round(0.6 * w_guess_pts)))
+    min_dist_pts = 1
 
     peaks, props = signal.find_peaks(
         y_det,
         prominence=prom_full,
         width=(wmin, wmax),
         distance=min_dist_pts,
-        rel_height=0.5,
+        rel_height=0.2,
     )
 
     # --- Fit (linear BG only) ---
