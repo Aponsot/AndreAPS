@@ -1,30 +1,29 @@
-import numpy as np
-import matplotlib.pyplot as plt
+import argparse 
 import argparse
+import numpy as np
 import h5py
+import matplotlib.pyplot as plt
 
-def plot_integration_results(h5_file):
-    
-    # Load data from HDF5 file
-    with h5py.file(h5_file, "r") as f:
-        int_val = f["intensity_stack"][:]
-        tth = f["tth"][:]
-        q = f["q_values"][:] 
 
+def graph(h5):
+    with h5py.File(h5, "r") as f:
+        q = f["q"][:]                       
+        int_val = f["int"][:]
+        
         plt.figure(figsize=(10, 6))
-        plt.imshow(int_val, aspect='auto', cmap='jet', extent=(tth.min(), tth.max(), 0, int_val.shape[0]))
+        plt.imshow(int_val, aspect='auto', extent=[q.min(), q.max(), 0, int_val[:,]],
+                   origin='lower', cmap='jet')
         plt.colorbar(label='Intensity')
-        plt.xlabel('q (1/Å)')
-        plt.ylabel('Frame Index') 
+        plt.xlabel('q (1/Å)', fontsize = 20)
+        plt.ylabel('Frame Index', fontsize = 20)
         plt.show()
 
-
+def _parse_args():
+    p = argparse.ArgumentParser(
+        description="Time Resolved plot"
+    )
+    p.add_argument("h5", type=str)
+    p.add_argument("frame_number", type=int)
 if __name__ == "__main__":
-    # Command-line argument parsing
-    parser = argparse.ArgumentParser(description="Plot polar integration results from HDF5 file.")
-    parser.add_argument("h5_file", type=str, help="Path to the h5 file.")
-    
-
-    args = parser.parse_args() 
-
-    plot_integration_results(args.h5_file)
+    args = _parse_args()
+    graph(args.h5)
