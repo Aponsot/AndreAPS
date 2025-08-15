@@ -266,7 +266,7 @@ def fit_peaks(h5_path, frame, center, plot=True):
         "noise": noise,
         "aic": result.aic,
     }
-import tqdm
+from tqdm import tqdm
 # ---------- add this block to the end of your file (no changes above) ----------
 def peak_map_for_all_frames(h5_path, center, marker_size=14):
     """
