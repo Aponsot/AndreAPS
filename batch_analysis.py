@@ -4,7 +4,7 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
-
+from matplotlib.colors import Normalize
 # ========================== TUNABLES ==========================
 WINDOW = 0.15            # fit window width in x-units (q or 2θ)
 SMOOTH_WIN = 15   # moving-average window (odd int)
@@ -257,6 +257,8 @@ def fit_peaks(h5_path, frame, center, plot=True):
             colLabels=cols, loc="center"
         )
         table.auto_set_font_size(False); table.set_fontsize(12); table.scale(1, 1.25)
+        ax.set_xlim(center - half, center + half)
+        ax.margins(x=0)
         plt.tight_layout(); plt.show()
 
     return {
@@ -284,21 +286,9 @@ def _fit_one(args):
         return frame, []
 
 def peak_map_for_all_frames_parallel(h5_path, center, marker_size=10):
-    """
-    Parallel version: runs fit_peaks() across frames with a progress bar.
-    x = q (1/Å), y = frame index, color = fitted peak height (a.u.).
-    """
-    import os
-    import h5py
-    import numpy as np
-    import matplotlib.pyplot as plt
+    
     from tqdm import tqdm
 
-    # Avoid BLAS oversubscription inside workers (helps a lot on multi-core)
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-
-    # how many frames?
     with h5py.File(h5_path, "r") as f:
         nframes = f["int"].shape[0]
 
@@ -331,7 +321,8 @@ def peak_map_for_all_frames_parallel(h5_path, center, marker_size=10):
     })
     plt.figure(figsize=(9, 5))
     sc = plt.scatter(ys, xs, c=cs, s=marker_size, cmap="plasma")
-    cbar = plt.colorbar(sc); cbar.set_label("Peak height (a.u.)")
+    norm = Normalize(vmin=0.0, vmax=70, clip=True)
+    cbar = plt.colorbar(sc , norm=norm); cbar.set_label("Peak height (a.u.)")
     plt.ylabel("q (1/Å)")
     plt.xlabel("Frame")
     plt.tight_layout()
