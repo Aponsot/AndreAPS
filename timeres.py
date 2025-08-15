@@ -14,7 +14,7 @@ def graph(h5):
                              
         int_val = f["int"][:]
         frames = int_val.shape[0]
-        q = (4*np.pi/ wavelength) * np.sin(np.deg2rad(int_val[1]/2.0))
+        int_val[1] = (4*np.pi/ wavelength) * np.sin(np.deg2rad(int_val[1]/2.0))
         plt.figure(figsize=(10, 6))
         plt.imshow(int_val, aspect='auto', extent=[2, 7, 0, frames],
                    origin='lower', cmap='jet')
