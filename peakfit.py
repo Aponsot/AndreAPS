@@ -144,13 +144,14 @@ def fit_peaks_in_window(h5_path, frame, center, window=0.1, plot=True):
         ax.set_xlabel("q (1/A)")
         ax.set_ylabel("Intensity")
         ax.set_title(
-            f"Frame {frame}"  
+            f"Frame {frame} "
+            f"|R²={r2:.4f} "
         )
         ax.legend(loc="best")
         ax.grid(alpha=0.3)
 
         ax_tbl.axis("off")
-        col_labels = ["Peak #", "Center", "Height", "FWHM", "Amplitude"]
+        col_labels = ["Peak #", "Center", "Height", "FWHM", "Amplitude","r2 value"]
         cell_text = [[
             f"{r[0]}",
             f"{r[1]:.6g}",
