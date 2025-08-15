@@ -348,5 +348,7 @@ def main():
 
     
     peak_map_for_all_frames_parallel(args.h5, args.center)
-    
+if __name__ == "__main__":
+    main()
+  
 
