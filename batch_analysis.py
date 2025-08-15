@@ -6,20 +6,21 @@ import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
 
 # ========================== TUNABLES ==========================
-WINDOW = 0.1            # fit window width in x-units (q or 2θ)
-SMOOTH_WIN = 8        # moving-average window (odd int)
+WINDOW = 0.15            # fit window width in x-units (q or 2θ)
+SMOOTH_WIN = 9       # moving-average window (odd int)
 MIN_SEP_PTS = 2      # min pts between derivative maxima / curvature seeds
-MIN_HEIGHT_SIGMA = 1.8  # keep peaks with height >= N * noise (MAD)
+MIN_HEIGHT_SIGMA = 10  # keep peaks with height >= N * noise (MAD)
 MAX_SIGMA_FRAC = 0.22   # cap σ as fraction of WINDOW to avoid 1 huge Gaussian
 RESIDUAL_ADD_ITERS = 1  # try adding up to N peaks from positive residual
 RESIDUAL_SNR = 1.8      # residual bump must exceed N * residual noise
 AIC_IMPROVE = 6.0       # require this much AIC drop to keep an added peak
 
 # --- post-fit merge rules to avoid tiny extra peaks next to a main one ---
-MERGE_MIN_SEP_FRAC = 1 # if centers closer than this * avg FWHM, consider merge
-MERGE_HEIGHT_FRAC = 0.4   # merge if smaller peak height < this * larger height
-MERGE_AIC_TOL = 200  # allow slight AIC increase when simplifying the model
+MERGE_MIN_SEP_FRAC = 5   # if centers closer than this * avg FWHM, consider merge
+MERGE_HEIGHT_FRAC = 0.58   # merge if smaller peak height < this * larger height
+MERGE_AIC_TOL = 100 # allow slight AIC increase when simplifying the model
 # ===============================================================
+
 
 
 # ------------------------ helpers ------------------------ #
@@ -271,40 +272,59 @@ def fit_peaks(h5_path, frame, center, plot=True):
         "aic": result.aic,
     }
 from tqdm import tqdm
-# ---------- add this block to the end of your file (no changes above) ----------
-def peak_map_for_all_frames(h5_path, center, marker_size=14):
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def _fit_one(args):
+    """Worker for parallel execution: returns (frame, [(q_center, height), ...])."""
+    h5_path, frame, center = args
+    try:
+        out = fit_peaks(h5_path, frame, center, plot=False)
+        peaks = [(r[1], r[2]) for r in out.get("rows", [])]  # (q, height)
+        return frame, peaks
+    except Exception:
+        return frame, []
+
+def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14, workers=None):
     """
-    Run fit_peaks() on every frame and plot a point for each fitted peak.
+    Parallel version: runs fit_peaks() across frames with a progress bar.
     x = q (1/Å), y = frame index, color = fitted peak height (a.u.).
     """
+    import os
     import h5py
     import numpy as np
     import matplotlib.pyplot as plt
+    from tqdm import tqdm
+
+    # Avoid BLAS oversubscription inside workers (helps a lot on multi-core)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
 
     # how many frames?
     with h5py.File(h5_path, "r") as f:
         nframes = f["int"].shape[0]
 
-    xs, ys, cs = [], [], []  # centers, frame indices, heights (color)
+    xs, ys, cs = [], [], []
 
-    for frame in tqdm(range(nframes), desc="Building peak map", unit="frame"):
+    if workers is None:
         try:
-            out = fit_peaks(h5_path, frame, center, plot=False)
+            workers = max(1, os.cpu_count() - 1)
         except Exception:
-            # skip frames that fail to fit
-            continue
+            workers = 2
 
-        # out['rows'] = [ [index, center, height, fwhm, amplitude], ... ]
-        for r in out.get("rows", []):
-            xs.append(r[1])        # center (q)
-            ys.append(frame)       # frame index
-            cs.append(r[2])        # height (intensity above background)
+    frames = range(nframes)
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_fit_one, (h5_path, fr, center)) for fr in frames]
+        for fut in tqdm(as_completed(futures), total=nframes,
+                        desc="Building peak map (parallel)", unit="frame"):
+            frame, peaks = fut.result()
+            for q, height in peaks:
+                xs.append(q); ys.append(frame); cs.append(height)
 
-    if len(xs) == 0:
+    if not xs:
         print("No peaks found across frames in the specified window.")
         return
 
-    # --- plot the peak-location map ---
+    # --- same publication style as your sequential plot ---
     plt.rcParams.update({
         "figure.dpi": 160,
         "savefig.dpi": 300,
@@ -316,8 +336,7 @@ def peak_map_for_all_frames(h5_path, center, marker_size=14):
     })
     plt.figure(figsize=(9, 5))
     sc = plt.scatter(xs, ys, c=cs, s=marker_size, cmap="viridis")
-    cbar = plt.colorbar(sc)
-    cbar.set_label("Peak height (a.u.)")
+    cbar = plt.colorbar(sc); cbar.set_label("Peak height (a.u.)")
     plt.xlabel("q (1/Å)")
     plt.ylabel("Frame")
     plt.tight_layout()
@@ -329,11 +348,11 @@ def main():
     ap = argparse.ArgumentParser(description="Peak fitting (derivative+curvature seeds, residual growth, merge pruning).")
     ap.add_argument("h5", help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("center", type=float, help="Center of the 0.1-wide window")
+    ap.add_argument("--parallel", action="store_true", help="Process frames in parallel for the peak map")
+    ap.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: CPU-1)")
     args = ap.parse_args()
-    peak_map_for_all_frames(args.h5, args.center)
 
-if __name__ == "__main__":
-    main()
-
-
-
+    if args.parallel:
+        peak_map_for_all_frames_parallel(args.h5, args.center, workers=args.workers)
+    else:
+        peak_map_for_all_frames_parallel(args.h5, args.center)
