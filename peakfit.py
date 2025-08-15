@@ -253,13 +253,10 @@ def main():
     ap.add_argument("frame", type=int, help="Frame index")
     ap.add_argument("center", type=float, help="Center of the 0.1-wide window")
     ap.add_argument("--window", type=float, default=0.1, help="Window width (default 0.1)")
-    ap.add_argument("--min-sep-pts", type=int, default=3, help="Min separation between maxima (samples)")
     args = ap.parse_args()
 
     out = fit_peaks_derivative(
-        h5_path=args.h5, frame=args.frame, center=args.center, window=args.window,
-        smooth_win=args.smooth_win, min_sep_pts=args.min_sep_pts,
-        min_height_sigma=args.min_height_sigma
+        h5_path=args.h5, frame=args.frame, center=args.center, window=args.window,    
     )
 
     print(f"\nFrame {out['frame']} window: {out['window'][0]:.6f}..{out['window'][1]:.6f}")
