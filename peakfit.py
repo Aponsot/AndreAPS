@@ -52,17 +52,28 @@ def fit_peaks_in_window(h5_path, frame, center, window=0.1, plot=True):
     if xw.size < 5:
         raise ValueError("Too few finite points in the window after masking.")
 
-    dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else window
-
-    # ---- peak finding (adaptive, shoulder/faint-friendly) ----
-    noise = robust_sigma(yw)
+    # Assume xw, yw are your windowed arrays; noise & baseline are robust estimates
+    noise = 1.4826 * np.median(np.abs(yw - np.median(yw))) + 1e-12
     baseline = np.median(yw)
+
+# Estimate sampling and an expected FWHM if you have a rough guess.
+# If not, this still works with conservative defaults.
+    dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else 1.0
+# expected_fwhm ~ typical peak width you see; pick something small if unknown
+    expected_fwhm = 3 * dx                     # example: ~3 samples wide
+    expected_fwhm_pts = max(3, int(round(expected_fwhm / max(dx, 1e-12))))
+
+# Peak finding tuned for overlaps / shoulders
     peaks, props = find_peaks(
         yw,
-        prominence=0.8 * noise,
-        height=baseline + 0.5 * noise,
-        width=(1, None),  # allow very narrow up to very wide
-    )
+        distance=1,                            # allow very close peaks (or use None)
+        prominence=(0.5 * noise, None),        # catch shoulders; raise if too many falses
+        height=baseline + 0.3 * noise,         # gentle floor above baseline
+        width=(1, None),                       # allow narrow; no hard max unless needed
+        wlen=int(3 * expected_fwhm_pts),       # local prominence window; prevents overshadowing
+        plateau_size=(1, None),                # accept tiny flat tops
+)
+
 
     # Fallback to a single-peak guess at the window center if none found
     if len(peaks) == 0:
