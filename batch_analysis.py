@@ -331,7 +331,7 @@ def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14):
         "ytick.labelsize": 16,
     })
     plt.figure(figsize=(9, 5))
-    sc = plt.scatter(xs, ys, c=cs, s=marker_size, cmap="viridis")
+    sc = plt.scatter(ys, xs, c=cs, s=marker_size, cmap="plasma")
     cbar = plt.colorbar(sc); cbar.set_label("Peak height (a.u.)")
     plt.xlabel("q (1/Å)")
     plt.ylabel("Frame")
