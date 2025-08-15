@@ -246,11 +246,10 @@ def main():
     ap.add_argument("--residual-add-iters", type=int, default=2)
     ap.add_argument("--residual-snr", type=float, default=1.5)
     ap.add_argument("--aic-improve", type=float, default=4.0)
-    ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
 
     out = fit_peaks_curvature_residual(
-        args.h5, args.frame, args.center, window=args.window, plot=not args.no-plot,
+        args.h5, args.frame, args.center, window=args.window,
         smooth_win=args.smooth_win, min_sep_pts=args.min_sep_pts, min_height_sigma=args.min_height_sigma,
         max_sigma_frac=args.max_sigma_frac, residual_add_iters=args.residual_add_iters,
         residual_snr=args.residual_snr, aic_improve=args.aic_improve
