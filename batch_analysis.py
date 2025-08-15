@@ -332,8 +332,8 @@ def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14):
     plt.figure(figsize=(9, 5))
     sc = plt.scatter(ys, xs, c=cs, s=marker_size, cmap="plasma")
     cbar = plt.colorbar(sc); cbar.set_label("Peak height (a.u.)")
-    plt.xlabel("q (1/Å)")
-    plt.ylabel("Frame")
+    plt.ylabel("q (1/Å)")
+    plt.xlabel("Frame")
     plt.tight_layout()
     plt.show()
 
@@ -350,5 +350,6 @@ def main():
 if __name__ == "__main__":
     main()
   
+
 
 
