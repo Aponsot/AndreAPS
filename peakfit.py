@@ -16,9 +16,9 @@ RESIDUAL_SNR = 1.8      # residual bump must exceed N * residual noise
 AIC_IMPROVE = 6.0       # require this much AIC drop to keep an added peak
 
 # --- post-fit merge rules to avoid tiny extra peaks next to a main one ---
-MERGE_MIN_SEP_FRAC = 0.3   # if centers closer than this * avg FWHM, consider merge
-MERGE_HEIGHT_FRAC = 0.5    # merge if smaller peak height < this * larger height
-MERGE_AIC_TOL = 10        # allow slight AIC increase when simplifying the model
+MERGE_MIN_SEP_FRAC = .8  # if centers closer than this * avg FWHM, consider merge
+MERGE_HEIGHT_FRAC = 0.7   # merge if smaller peak height < this * larger height
+MERGE_AIC_TOL = 100     # allow slight AIC increase when simplifying the model
 # ===============================================================
 
 
