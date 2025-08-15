@@ -284,7 +284,7 @@ def _fit_one(args):
     except Exception:
         return frame, []
 
-def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14, workers=None):
+def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14):
     """
     Parallel version: runs fit_peaks() across frames with a progress bar.
     x = q (1/Å), y = frame index, color = fitted peak height (a.u.).
@@ -344,7 +344,6 @@ def main():
     ap = argparse.ArgumentParser(description="Peak fitting (derivative+curvature seeds, residual growth, merge pruning).")
     ap.add_argument("h5", help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("center", type=float, help="Center of the 0.1-wide window")
-    ap.add_argument("--parallel", action="store_true", help="Process frames in parallel for the peak map")
     args = ap.parse_args()
 
     
