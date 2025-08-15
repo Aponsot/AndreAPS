@@ -11,11 +11,13 @@ def graph(h5):
         int_val = f["int"][:]
         frames = int_val.shape[0]
         plt.figure(figsize=(10, 6))
-        plt.imshow(int_val, aspect='auto', extent=[q.min(), q.max(), 0, frames],
+        plt.imshow(int_val, aspect='auto', extent=[2, 7, 0, frames],
                    origin='lower', cmap='jet')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)', fontsize = 20)
         plt.ylabel('Frame Index', fontsize = 20)
+        plt.xticks(fontsize = 14)
+        plt.yticks(fontsize = 14)
         plt.show()
 
 
