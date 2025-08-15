@@ -21,7 +21,7 @@ MERGE_HEIGHT_FRAC = 0.58   # merge if smaller peak height < this * larger height
 MERGE_AIC_TOL = 100 # allow slight AIC increase when simplifying the model
 # ===============================================================
 
-PHASE_Q_LINES = [(2.85, "γ (111)"), (3.10, "γ′ (200)")]
+PHASE_Q_LINES = [(3.01, "Cu (111)"), (3.024, "γ (111)"), (2.988, "Cr2Nb (311)")]
 
 # ------------------------ helpers ------------------------ #
 def robust_sigma(y):
