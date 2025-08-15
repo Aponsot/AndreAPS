@@ -301,6 +301,15 @@ def peak_map_for_all_frames(h5_path, center, marker_size=14):
         return
 
     # --- plot the peak-location map ---
+    plt.rcParams.update({
+        "figure.dpi": 160,
+        "savefig.dpi": 300,
+        "font.size": 20,
+        "axes.labelsize": 20,
+        "axes.titlesize": 20,
+        "xtick.labelsize": 16,
+        "ytick.labelsize": 16,
+    })
     plt.figure(figsize=(9, 5))
     sc = plt.scatter(xs, ys, c=cs, s=marker_size, cmap="viridis")
     cbar = plt.colorbar(sc)
