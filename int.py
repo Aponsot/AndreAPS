@@ -148,6 +148,15 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
      
     # Plot time-resolved data if the plot flag is set
     if plot:
+        plt.rcParams.update({
+            "figure.dpi": 140,
+            "savefig.dpi": 300,
+            "font.size": 14,
+            "axes.labelsize": 16,
+            "axes.titlesize": 18,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+        })
         plt.figure(figsize=(10, 6))
         plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
                    origin='lower', cmap='jet')
@@ -166,3 +175,4 @@ if __name__ == "__main__":
     
     # Run the integration workflow
     integrate_em(args.Tiff_fold, args.instr_file, plot=args.plot)
+
