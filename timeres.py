@@ -9,9 +9,9 @@ def graph(h5):
     with h5py.File(h5, "r") as f:
         q = f["q"][:]                       
         int_val = f["int"][:]
-        
+        frames = int_val.shape[0]
         plt.figure(figsize=(10, 6))
-        plt.imshow(int_val, aspect='auto', extent=[q.min(), q.max(), 0, int_val[:,]],
+        plt.imshow(int_val, aspect='auto', extent=[q.min(), q.max(), 0, frames],
                    origin='lower', cmap='jet')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)', fontsize = 20)
