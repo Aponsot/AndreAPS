@@ -18,12 +18,14 @@ def graph(h5):
         plt.ylabel('Frame Index', fontsize = 20)
         plt.show()
 
-def _parse_args():
+
+if __name__ == "__main__":
+    # Command-line argument parsing
+    
     p = argparse.ArgumentParser(
         description="Time Resolved plot"
     )
     p.add_argument("h5", type=str)
-    p.add_argument("frame_number", type=int)
-if __name__ == "__main__":
-    args = _parse_args()
-    graph(args.h5)
+    args = p.parse_args()
+    h5 = args.h5
+    graph(h5)
