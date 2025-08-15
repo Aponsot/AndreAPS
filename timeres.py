@@ -13,7 +13,7 @@ def graph(h5):
         plt.figure(figsize=(10, 6))
         plt.imshow(int_val, aspect='auto', extent=[2, 7, 0, frames],
                    origin='lower', cmap='jet')
-        plt.colorbar(label='Intensity')
+        plt.colorbar(label='Intensity',fontsize =14)
         plt.xlabel('q (1/Å)', fontsize = 20)
         plt.ylabel('Frame Index', fontsize = 20)
         plt.xticks(fontsize = 14)
