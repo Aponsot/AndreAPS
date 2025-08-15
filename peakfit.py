@@ -141,7 +141,7 @@ def fit_peaks_in_window(h5_path, frame, center, window=0.1, plot=True):
                 ax.plot(xw, comps[key], ls=":", label=f"Peak {i}")
                 ax.axvline(rows[i][1], color="k", alpha=0.2)
 
-        ax.set_xlabel("q or 2θ")
+        ax.set_xlabel("q (1/A)")
         ax.set_ylabel("Intensity")
         ax.set_title(
             f"Frame {frame}"  
