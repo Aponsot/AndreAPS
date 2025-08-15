@@ -305,11 +305,7 @@ def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14, workers=No
 
     xs, ys, cs = [], [], []
 
-    if workers is None:
-        try:
-            workers = max(1, os.cpu_count() - 1)
-        except Exception:
-            workers = 2
+    workers = 4
 
     frames = range(nframes)
     with ProcessPoolExecutor(max_workers=workers) as ex:
@@ -349,10 +345,9 @@ def main():
     ap.add_argument("h5", help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("center", type=float, help="Center of the 0.1-wide window")
     ap.add_argument("--parallel", action="store_true", help="Process frames in parallel for the peak map")
-    ap.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: CPU-1)")
     args = ap.parse_args()
 
     if args.parallel:
-        peak_map_for_all_frames_parallel(args.h5, args.center, workers=args.workers)
+        peak_map_for_all_frames_parallel(args.h5, args.center)
     else:
         peak_map_for_all_frames_parallel(args.h5, args.center)
