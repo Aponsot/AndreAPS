@@ -305,10 +305,10 @@ def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14):
 
     xs, ys, cs = [], [], []
 
-    workers = 4
+   
 
     frames = range(nframes)
-    with ProcessPoolExecutor(max_workers=workers) as ex:
+    with ProcessPoolExecutor() as ex:
         futures = [ex.submit(_fit_one, (h5_path, fr, center)) for fr in frames]
         for fut in tqdm(as_completed(futures), total=nframes,
                         desc="Building peak map (parallel)", unit="frame"):
