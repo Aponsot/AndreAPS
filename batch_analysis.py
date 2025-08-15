@@ -7,8 +7,8 @@ from lmfit.models import GaussianModel, LinearModel
 
 # ========================== TUNABLES ==========================
 WINDOW = 0.15            # fit window width in x-units (q or 2θ)
-SMOOTH_WIN = 9       # moving-average window (odd int)
-MIN_SEP_PTS = 2      # min pts between derivative maxima / curvature seeds
+SMOOTH_WIN = 15   # moving-average window (odd int)
+MIN_SEP_PTS = 8     # min pts between derivative maxima / curvature seeds
 MIN_HEIGHT_SIGMA = 10  # keep peaks with height >= N * noise (MAD)
 MAX_SIGMA_FRAC = 0.22   # cap σ as fraction of WINDOW to avoid 1 huge Gaussian
 RESIDUAL_ADD_ITERS = 1  # try adding up to N peaks from positive residual
@@ -16,11 +16,10 @@ RESIDUAL_SNR = 1.8      # residual bump must exceed N * residual noise
 AIC_IMPROVE = 6.0       # require this much AIC drop to keep an added peak
 
 # --- post-fit merge rules to avoid tiny extra peaks next to a main one ---
-MERGE_MIN_SEP_FRAC = 5   # if centers closer than this * avg FWHM, consider merge
-MERGE_HEIGHT_FRAC = 0.58   # merge if smaller peak height < this * larger height
-MERGE_AIC_TOL = 100 # allow slight AIC increase when simplifying the model
+MERGE_MIN_SEP_FRAC = 3  # if centers closer than this * avg FWHM, consider merge
+MERGE_HEIGHT_FRAC = 0.7   # merge if smaller peak height < this * larger height
+MERGE_AIC_TOL = 150 # allow slight AIC increase when simplifying the model
 # ===============================================================
-
 
 
 # ------------------------ helpers ------------------------ #
