@@ -5,6 +5,23 @@ import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
 
+# ========================== TUNABLES ==========================
+WINDOW = 0.1            # fit window width in x-units (q or 2θ)
+SMOOTH_WIN = 7          # moving-average window (odd int)
+MIN_SEP_PTS = 3         # min pts between derivative maxima / curvature seeds
+MIN_HEIGHT_SIGMA = 1.8  # keep peaks with height >= N * noise (MAD)
+MAX_SIGMA_FRAC = 0.22   # cap σ as fraction of WINDOW to avoid 1 huge Gaussian
+RESIDUAL_ADD_ITERS = 1  # try adding up to N peaks from positive residual
+RESIDUAL_SNR = 1.8      # residual bump must exceed N * residual noise
+AIC_IMPROVE = 6.0       # require this much AIC drop to keep an added peak
+
+# --- post-fit merge rules to avoid tiny extra peaks next to a main one ---
+MERGE_MIN_SEP_FRAC = 0.40   # if centers closer than this * avg FWHM, consider merge
+MERGE_HEIGHT_FRAC = 0.35    # merge if smaller peak height < this * larger height
+MERGE_AIC_TOL = 2.0         # allow slight AIC increase when simplifying the model
+# ===============================================================
+
+
 # ------------------------ helpers ------------------------ #
 def robust_sigma(y):
     y = np.asarray(y, float)
@@ -33,13 +50,11 @@ def derivative_maxima(x, y, smooth_win=7, min_sep_pts=3):
     dx = float(np.mean(np.diff(x))) if len(x) > 1 else 1.0
     dy = np.gradient(ys, dx)
     d2y = np.gradient(dy, dx)
-    # + to - zero-crossings
     sgn = np.sign(dy)
     cand = np.where((sgn[:-1] > 0) & (sgn[1:] <= 0))[0] + 1
     cand = cand[d2y[cand] < 0]
     if cand.size == 0:
         return cand
-    # NMS by height
     order = np.argsort(ys[cand])[::-1]
     kept = []; taken = np.zeros(len(ys), dtype=bool)
     for idx in cand[order]:
@@ -50,25 +65,18 @@ def derivative_maxima(x, y, smooth_win=7, min_sep_pts=3):
     return np.array(kept, int)
 
 def curvature_minima(x, y, smooth_win=7, min_sep_pts=3, kappa=1.0):
-    """
-    Seed centers from minima of the second derivative (most negative curvature).
-    kappa is a threshold in units of robust_sigma(d2y).
-    """
     ys = smooth_ma(y, smooth_win)
     dx = float(np.mean(np.diff(x))) if len(x) > 1 else 1.0
     d1 = np.gradient(ys, dx)
     d2 = np.gradient(d1, dx)
-    # local minima in d2
     m = (d2[1:-1] < d2[:-2]) & (d2[1:-1] < d2[2:])
     idx = np.where(m)[0] + 1
     if idx.size == 0:
         return idx
-    # keep only “sufficiently negative” curvature
     s2 = robust_sigma(d2)
     idx = idx[d2[idx] < -kappa * s2]
     if idx.size == 0:
         return idx
-    # NMS by |d2| magnitude
     order = np.argsort(d2[idx])  # most negative first
     kept = []; taken = np.zeros(len(d2), dtype=bool)
     for i in idx[order]:
@@ -82,19 +90,18 @@ def build_model_from_centers(xw, yw, centers, min_sigma, max_sigma, baseline):
     bkg = LinearModel(prefix="bkg_")
     model = bkg
     params = bkg.make_params(slope=0.0, intercept=baseline)
-    # add one Gaussian per center
+
     for i, cx in enumerate(centers):
         gi = GaussianModel(prefix=f"g{i}_")
         model += gi
-        # initial sigma from half-height crossings around nearest data point
+
         p = np.argmin(np.abs(xw - cx))
-        # simple half-height-based width estimate
         ypk = yw[p]; h = max(ypk - baseline, 1e-12); yhalf = baseline + 0.5*h
         li = p;  ri = p
         while li > 0 and yw[li] > yhalf: li -= 1
         while ri < len(yw)-1 and yw[ri] > yhalf: ri += 1
         fwhm0 = max((ri - li), 3) * np.mean(np.diff(xw)) if len(xw) > 1 else max_sigma
-        sigma0 = np.clip(fwhm_to_sigma(fwhm0), min_sigma, max_sigma)
+        sigma0 = float(np.clip(fwhm_to_sigma(fwhm0), min_sigma, max_sigma))
 
         height0 = max(ypk - baseline, robust_sigma(yw))
         amp0 = height0 * sigma0 * np.sqrt(2*np.pi)
@@ -103,17 +110,30 @@ def build_model_from_centers(xw, yw, centers, min_sigma, max_sigma, baseline):
         params[f"g{i}_center"].set(min=xw[0], max=xw[-1], value=cx)
         params[f"g{i}_sigma"].set(min=min_sigma, max=max_sigma, value=sigma0)
         params[f"g{i}_amplitude"].set(min=0.0, value=amp0)
+
     return model, params
 
+def collect_stats(result):
+    """Return list of dicts [{index, center, height, fwhm, amplitude}]"""
+    out = []
+    i = 0
+    while True:
+        c = f"g{i}_center"
+        s = f"g{i}_sigma"
+        a = f"g{i}_amplitude"
+        if c not in result.params: break
+        ctr = result.params[c].value
+        sig = result.params[s].value
+        amp = result.params[a].value
+        hgt = amp / (sig * np.sqrt(2*np.pi)) if sig > 0 else 0.0
+        fwhm = 2*np.sqrt(2*np.log(2)) * sig
+        out.append({"index": i, "center": ctr, "height": hgt, "fwhm": fwhm, "amplitude": amp})
+        i += 1
+    return out
+
+
 # ------------------------ core ------------------------ #
-def fit_peaks_curvature_residual(
-    h5_path, frame, center, window=0.1, plot=True,
-    smooth_win=7, min_sep_pts=3, min_height_sigma=1.5,
-    max_sigma_frac=0.22,           # cap σ to avoid one super-wide peak
-    residual_add_iters=2,          # try adding up to N extra peaks
-    residual_snr=1.5,              # require residual peak > N*noise
-    aic_improve=4.0                # keep new peak only if AIC drops by this
-):
+def fit_peaks(h5_path, frame, center, plot=True):
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
         I = f["int"][:]
@@ -121,7 +141,7 @@ def fit_peaks_curvature_residual(
     yfull = np.asarray(I[frame], float)
     x = np.asarray(x, float)
 
-    half = window/2.0
+    half = WINDOW/2.0
     m = (x >= center-half) & (x <= center+half)
     xw, yw = x[m], yfull[m]
     mfin = np.isfinite(xw) & np.isfinite(yw)
@@ -129,65 +149,77 @@ def fit_peaks_curvature_residual(
     if xw.size < 5:
         raise ValueError("Too few points in window.")
 
-    dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else window
+    dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
     baseline = np.median(yw)
     noise = robust_sigma(yw)
 
     # ---- seed centers: derivative maxima + curvature minima ----
-    pk = derivative_maxima(xw, yw, smooth_win=smooth_win, min_sep_pts=min_sep_pts)
-    cm = curvature_minima(xw, yw, smooth_win=smooth_win, min_sep_pts=min_sep_pts, kappa=1.0)
-
+    pk = derivative_maxima(xw, yw, smooth_win=SMOOTH_WIN, min_sep_pts=MIN_SEP_PTS)
+    cm = curvature_minima(xw, yw, smooth_win=SMOOTH_WIN, min_sep_pts=MIN_SEP_PTS, kappa=1.0)
     seeds = np.unique(np.r_[pk, cm]).tolist()
     if not seeds:
-        seeds = [np.abs(xw - center).argmin()]  # fallback single seed
-    centers = [float(xw[i]) for i in seeds]
-    centers.sort()
+        seeds = [np.abs(xw - center).argmin()]
+    centers = [float(xw[i]) for i in seeds]; centers.sort()
 
     # ---- bounds to discourage a single huge σ ----
     min_sigma = max(dx/3.0, 1e-6)
-    max_sigma = max_sigma_frac * window
+    max_sigma = MAX_SIGMA_FRAC * WINDOW
 
     # ---- initial fit ----
     model, params = build_model_from_centers(xw, yw, centers, min_sigma, max_sigma, baseline)
     result = model.fit(yw, params, x=xw)
     best_aic = result.aic
 
-    # ---- iteratively add peaks from positive residual if justified ----
-    for _ in range(residual_add_iters):
+    # ---- residual-based addition with AIC guard ----
+    for _ in range(RESIDUAL_ADD_ITERS):
         res = yw - result.best_fit
         rnoise = robust_sigma(res)
         i_new = int(np.argmax(res))
-        if res[i_new] < residual_snr * rnoise:
-            break  # no strong leftover bump
-
-        # add a new center at residual max and refit; keep only if AIC improves
-        centers_plus = centers + [float(xw[i_new])]
-        centers_plus.sort()
+        if res[i_new] < RESIDUAL_SNR * rnoise:
+            break
+        centers_plus = sorted(centers + [float(xw[i_new])])
         model2, params2 = build_model_from_centers(xw, yw, centers_plus, min_sigma, max_sigma, baseline)
         result2 = model2.fit(yw, params2, x=xw)
-        if result2.aic < best_aic - aic_improve:
-            result = result2
-            best_aic = result2.aic
-            centers = centers_plus
+        if result2.aic < best_aic - AIC_IMPROVE:
+            result = result2; best_aic = result2.aic; centers = centers_plus
         else:
             break
 
-    # ---- collect kept peaks (prominence-like filtering) ----
+    # ---- post-fit merge of tiny, too-close neighbors ----
+    changed = True
+    while changed:
+        changed = False
+        stats = collect_stats(result)
+        if len(stats) < 2: break
+        stats_sorted = sorted(stats, key=lambda s: s["center"])
+        for i in range(len(stats_sorted)-1):
+            a, b = stats_sorted[i], stats_sorted[i+1]
+            d = abs(b["center"] - a["center"])
+            fwhm_avg = 0.5 * (a["fwhm"] + b["fwhm"])
+            # if very close AND one is much smaller -> drop the smaller and refit
+            if d < MERGE_MIN_SEP_FRAC * max(fwhm_avg, 1e-12):
+                small, big = (a, b) if a["height"] <= b["height"] else (b, a)
+                if small["height"] < MERGE_HEIGHT_FRAC * max(big["height"], 1e-12):
+                    keep_centers = [s["center"] for s in stats if s["index"] != small["index"]]
+                    model3, params3 = build_model_from_centers(xw, yw, keep_centers, min_sigma, max_sigma, baseline)
+                    result3 = model3.fit(yw, params3, x=xw)
+                    # accept merge if AIC not substantially worse
+                    if result3.aic <= result.aic + MERGE_AIC_TOL:
+                        result = result3; centers = keep_centers; changed = True
+                        break
+
+    # ---- collect kept peaks with noise threshold ----
     rows = []
-    for i in range(len(centers)):
-        amp = result.params[f"g{i}_amplitude"].value
-        ctr = result.params[f"g{i}_center"].value
-        sig = result.params[f"g{i}_sigma"].value
-        hgt = amp / (sig * np.sqrt(2*np.pi))
-        fwhm = 2*np.sqrt(2*np.log(2)) * sig
-        if hgt >= (min_height_sigma * noise):
-            rows.append([i, ctr, hgt, fwhm, amp])
+    stats = collect_stats(result)
+    for s in stats:
+        if s["height"] >= (MIN_HEIGHT_SIGMA * noise):
+            rows.append([s["index"], s["center"], s["height"], s["fwhm"], s["amplitude"]])
 
     bkg_slope = result.params["bkg_slope"].value
     bkg_intercept = result.params["bkg_intercept"].value
     r2 = compute_r2(yw, result.best_fit)
 
-    # ---- plot (same style you liked) ----
+    # ---- plotting ----
     if plot:
         plt.rcParams.update({
             "figure.dpi": 160, "savefig.dpi": 300,
@@ -201,16 +233,17 @@ def fit_peaks_curvature_residual(
         comps = result.eval_components(x=xw)
         if "bkg_" in comps:
             ax.plot(xw, comps["bkg_"], ls="--", label="Background")
-        for i in range(len(centers)):
+        # components
+        i = 0
+        while f"g{i}_" in "".join(result.params.keys()):
             key = f"g{i}_"
-            if key in comps:
-                ax.plot(xw, comps[key], ls=":", label=f"Peak {i}")
-                ax.axvline(result.params[f"g{i}_center"].value, alpha=0.25)
-        ax.set_xlabel("q or 2θ"); ax.set_ylabel("Intensity")
-        ax.set_title(
-            f"Frame {frame} | window [{center-half:.5f}, {center+half:.5f}] | "
-            f"R²={r2:.4f} | bkg: y={bkg_slope:.3g}·x+{bkg_intercept:.3g} | AIC={best_aic:.1f}"
-        )
+            if key + "center" in result.params:
+                if key in comps: ax.plot(xw, comps[key], ls=":")
+                ax.axvline(result.params[key+"center"].value, alpha=0.25)
+            i += 1
+        ax.set_xlabel("q (1/Å)")
+        ax.set_ylabel("Intensity")
+        ax.set_title(f"Frame {frame} | R²={r2:.4f}")
         ax.legend(loc="best"); ax.grid(alpha=0.3)
 
         ax_tbl.axis("off")
@@ -231,35 +264,18 @@ def fit_peaks_curvature_residual(
         "result": result,
         "x": xw, "y": yw, "yfit": result.best_fit,
         "noise": noise,
-        "aic": best_aic,
+        "aic": result.aic,
     }
 
-# ------------------------ CLI ------------------------ #
+
+# ------------------------ CLI (minimal) ------------------------ #
 def main():
-    ap = argparse.ArgumentParser(description="Curvature + residual peak seeding with Gaussian(s) + linear background.")
-    ap.add_argument("h5"); ap.add_argument("frame", type=int); ap.add_argument("center", type=float)
-    ap.add_argument("--window", type=float, default=0.1)
-    ap.add_argument("--smooth-win", type=int, default=7)
-    ap.add_argument("--min-sep-pts", type=int, default=3)
-    ap.add_argument("--min-height-sigma", type=float, default=1.5)
-    ap.add_argument("--max-sigma-frac", type=float, default=0.22)
-    ap.add_argument("--residual-add-iters", type=int, default=2)
-    ap.add_argument("--residual-snr", type=float, default=1.5)
-    ap.add_argument("--aic-improve", type=float, default=4.0)
+    ap = argparse.ArgumentParser(description="Peak fitting (derivative+curvature seeds, residual growth, merge pruning).")
+    ap.add_argument("h5", help="HDF5 with 'q' (or 'tth') and 'int'")
+    ap.add_argument("frame", type=int, help="Frame index")
+    ap.add_argument("center", type=float, help="Center of the 0.1-wide window")
     args = ap.parse_args()
-
-    out = fit_peaks_curvature_residual(
-        args.h5, args.frame, args.center, window=args.window,
-        smooth_win=args.smooth_win, min_sep_pts=args.min_sep_pts, min_height_sigma=args.min_height_sigma,
-        max_sigma_frac=args.max_sigma_frac, residual_add_iters=args.residual_add_iters,
-        residual_snr=args.residual_snr, aic_improve=args.aic_improve
-    )
-
-    print(f"\nFrame {out['frame']}  window: {out['window'][0]:.6f}..{out['window'][1]:.6f}")
-    print(f"Background: slope={out['background']['slope']:.6g}, intercept={out['background']['intercept']:.6g}")
-    print(f"Noise: {out['noise']:.6g}  R^2: {out['r2']:.6g}  AIC: {out['aic']:.2f}")
-    for r in out["rows"]:
-        print(f"Peak {r[0]}: center={r[1]:.6g}, height={r[2]:.6g}, FWHM={r[3]:.6g}, amplitude={r[4]:.6g}")
+    fit_peaks(args.h5, args.frame, args.center, plot=True)
 
 if __name__ == "__main__":
     main()
