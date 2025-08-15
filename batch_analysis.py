@@ -7,8 +7,8 @@ from lmfit.models import GaussianModel, LinearModel
 
 # ========================== TUNABLES ==========================
 WINDOW = 0.15            # fit window width in x-units (q or 2θ)
-SMOOTH_WIN = 15   # moving-average window (odd int)
-MIN_SEP_PTS = 8     # min pts between derivative maxima / curvature seeds
+SMOOTH_WIN = 9       # moving-average window (odd int)
+MIN_SEP_PTS = 2      # min pts between derivative maxima / curvature seeds
 MIN_HEIGHT_SIGMA = 10  # keep peaks with height >= N * noise (MAD)
 MAX_SIGMA_FRAC = 0.22   # cap σ as fraction of WINDOW to avoid 1 huge Gaussian
 RESIDUAL_ADD_ITERS = 1  # try adding up to N peaks from positive residual
@@ -16,11 +16,12 @@ RESIDUAL_SNR = 1.8      # residual bump must exceed N * residual noise
 AIC_IMPROVE = 6.0       # require this much AIC drop to keep an added peak
 
 # --- post-fit merge rules to avoid tiny extra peaks next to a main one ---
-MERGE_MIN_SEP_FRAC = 3  # if centers closer than this * avg FWHM, consider merge
-MERGE_HEIGHT_FRAC = 0.7   # merge if smaller peak height < this * larger height
-MERGE_AIC_TOL = 150 # allow slight AIC increase when simplifying the model
+MERGE_MIN_SEP_FRAC = 5   # if centers closer than this * avg FWHM, consider merge
+MERGE_HEIGHT_FRAC = 0.58   # merge if smaller peak height < this * larger height
+MERGE_AIC_TOL = 100 # allow slight AIC increase when simplifying the model
 # ===============================================================
 
+PHASE_Q_LINES = [(2.85, "γ (111)"), (3.10, "γ′ (200)")]
 
 # ------------------------ helpers ------------------------ #
 def robust_sigma(y):
@@ -85,6 +86,48 @@ def curvature_minima(x, y, smooth_win=7, min_sep_pts=3, kappa=1.0):
             taken[max(0, i-min_sep_pts): i+min_sep_pts+1] = True
     kept.sort()
     return np.array(kept, int)
+def _parse_hkl(hkl_str):
+    """
+    Parse '111', '200', '(2 2 0)', '2,2,0', etc. -> (h,k,l) ints.
+    """
+    s = (hkl_str or "").strip().replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+    s = s.replace(",", " ").replace("/", " ").replace("-", " -")
+    parts = [p for p in s.split() if p]
+    if len(parts) == 1 and parts[0].isdigit() and len(parts[0]) == 3:
+        h, k, l = [int(ch) for ch in parts[0]]
+    else:
+        nums = [int(p) for p in parts]
+        if len(nums) != 3:
+            raise ValueError(f"Cannot parse hkl from '{hkl_str}'")
+        h, k, l = nums
+    return (h, k, l)
+
+def _make_q_a_transforms(hkl):
+    """
+    Return two callables: q->a and a->q for cubic lattices:
+      a = (2π/q)*sqrt(h^2+k^2+l^2)
+    """
+    import numpy as _np
+    h, k, l = hkl
+    g = _np.sqrt(h*h + k*k + l*l)
+    two_pi_g = 2.0 * _np.pi * g
+
+    def q_to_a(q):
+        q = _np.asarray(q, float)
+        return two_pi_g / _np.clip(q, 1e-12, None)
+    def a_to_q(a):
+        a = _np.asarray(a, float)
+        return two_pi_g / _np.clip(a, 1e-12, None)
+
+    return q_to_a, a_to_q
+def _draw_phase_guides_on_peakmap(ax, nframes):
+    # vertical q-lines
+    for qval, label in PHASE_Q_LINES:
+        ax.axvline(qval, ls="--", lw=1.2, alpha=0.6)
+        ax.text(qval, nframes + max(5, 0.02*nframes), label,
+                rotation=90, va="bottom", ha="center", fontsize=12)
+    # horizontal frame-lines
+    
 
 def build_model_from_centers(xw, yw, centers, min_sigma, max_sigma, baseline):
     bkg = LinearModel(prefix="bkg_")
@@ -283,28 +326,23 @@ def _fit_one(args):
     except Exception:
         return frame, []
 
-def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14):
+from tqdm import tqdm
+
+def peak_map_for_all_frames(h5_path, center, marker_size=14, hkl_str=111):
     """
-    Parallel version: runs fit_peaks() across frames with a progress bar.
+    Run fit_peaks() on every frame and plot a point for each fitted peak.
     x = q (1/Å), y = frame index, color = fitted peak height (a.u.).
+    Optional: top x-axis as lattice parameter a (Å) for --hkl.
     """
-    import os
     import h5py
     import numpy as np
     import matplotlib.pyplot as plt
-    from tqdm import tqdm
-
-    # Avoid BLAS oversubscription inside workers (helps a lot on multi-core)
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
 
     # how many frames?
     with h5py.File(h5_path, "r") as f:
         nframes = f["int"].shape[0]
 
-    xs, ys, cs = [], [], []
-
-   
+    xs, ys, cs = [], [], []  # centers, frame indices, heights (color)
 
     frames = range(nframes)
     with ProcessPoolExecutor() as ex:
@@ -319,24 +357,34 @@ def peak_map_for_all_frames_parallel(h5_path, center, marker_size=14):
         print("No peaks found across frames in the specified window.")
         return
 
-    # --- same publication style as your sequential plot ---
+    # plotting style consistent with your figures
     plt.rcParams.update({
-        "figure.dpi": 160,
-        "savefig.dpi": 300,
-        "font.size": 20,
-        "axes.labelsize": 20,
-        "axes.titlesize": 20,
-        "xtick.labelsize": 16,
-        "ytick.labelsize": 16,
+        "figure.dpi": 160, "savefig.dpi": 300,
+        "font.size": 20, "axes.labelsize": 20, "axes.titlesize": 20,
+        "xtick.labelsize": 16, "ytick.labelsize": 16,
     })
-    plt.figure(figsize=(9, 5))
-    sc = plt.scatter(ys, xs, c=cs, s=marker_size, cmap="plasma")
-    cbar = plt.colorbar(sc); cbar.set_label("Peak height (a.u.)")
-    plt.ylabel("q (1/Å)")
-    plt.xlabel("Frame")
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    sc = ax.scatter(xs, ys, c=cs, s=marker_size, cmap="viridis")
+    cbar = plt.colorbar(sc, ax=ax); cbar.set_label("Peak height (a.u.)")
+    ax.set_xlabel("q (1/Å)")
+    ax.set_ylabel("Frame")
+
+    # Add optional top axis converting q <-> a for cubic (hkl)
+    if hkl_str is not None:
+        try:
+            hkl = _parse_hkl(hkl_str)
+            q_to_a, a_to_q = _make_q_a_transforms(hkl)
+            sec = ax.secondary_xaxis('top', functions=(q_to_a, a_to_q))
+            sec.set_xlabel(f"a (Å) for ({hkl[0]}{hkl[1]}{hkl[2]})")
+        except Exception as e:
+            print(f"[warn] Could not add lattice-parameter axis for --hkl '{hkl_str}': {e}")
+
+    # Phase guide lines (vertical q markers + optional horizontal separators)
+    _draw_phase_guides_on_peakmap(ax, nframes)
+
     plt.tight_layout()
     plt.show()
-
 
 # ------------------------ CLI (minimal) ------------------------ #
 def main():
@@ -346,10 +394,8 @@ def main():
     args = ap.parse_args()
 
     
-    peak_map_for_all_frames_parallel(args.h5, args.center)
+    peak_map_for_all_frames(args.h5, args.center)
 if __name__ == "__main__":
     main()
   
-
-
 
