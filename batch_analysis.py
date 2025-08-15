@@ -136,10 +136,9 @@ def collect_stats(result):
 def fit_peaks(h5_path, frame, center, plot=True):
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
-        I = f["int"][:]
-
-    yfull = np.asarray(I[frame], float)
+        yfull = f["int"][frame, :]      # only the needed row
     x = np.asarray(x, float)
+    yfull = np.asarray(yfull, float)
 
     half = WINDOW/2.0
     m = (x >= center-half) & (x <= center+half)
@@ -167,7 +166,12 @@ def fit_peaks(h5_path, frame, center, plot=True):
 
     # ---- initial fit ----
     model, params = build_model_from_centers(xw, yw, centers, min_sigma, max_sigma, baseline)
-    result = model.fit(yw, params, x=xw)
+    result = model.fit(
+    yw, params, x=xw,
+    calc_covar=False,
+    method="least_squares",
+    max_nfev=600
+)
     best_aic = result.aic
 
     # ---- residual-based addition with AIC guard ----
