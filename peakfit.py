@@ -144,8 +144,7 @@ def fit_peaks_in_window(h5_path, frame, center, window=0.1, plot=True):
         ax.set_xlabel("q or 2θ")
         ax.set_ylabel("Intensity")
         ax.set_title(
-            f"Frame {frame}  |  window [{center - half:.5f}, {center + half:.5f}]  "
-            f"|  R²={r2:.4f}  |  bkg: y={bkg_slope:.3g}·x+{bkg_intercept:.3g}"
+            f"Frame {frame}"  
         )
         ax.legend(loc="best")
         ax.grid(alpha=0.3)
