@@ -83,7 +83,7 @@ def initial_width_pts(y, peak_idx, baseline, frac=0.5):
 # ---------------------------- core ---------------------------- #
 def fit_peaks_derivative(
     h5_path, frame, center, window=0.1, plot=True,
-    smooth_win=7, min_sep_pts=3, min_height_sigma=1.5
+    smooth_win=5, min_sep_pts=3, min_height_sigma=1.5
 ):
     """
     Derivative-based peak finding (no scipy.find_peaks):
