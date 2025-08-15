@@ -347,7 +347,7 @@ def main():
     ap.add_argument("--parallel", action="store_true", help="Process frames in parallel for the peak map")
     args = ap.parse_args()
 
-    if args.parallel:
-        peak_map_for_all_frames_parallel(args.h5, args.center)
-    else:
-        peak_map_for_all_frames_parallel(args.h5, args.center)
+    
+    peak_map_for_all_frames_parallel(args.h5, args.center)
+    
+
