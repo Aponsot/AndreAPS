@@ -3,279 +3,213 @@ import argparse
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
-import scipy.signal as signal
-from lmfit.models import PolynomialModel, GaussianModel
+from scipy.signal import find_peaks, peak_widths
+from lmfit.models import GaussianModel, LinearModel
 
-# --- publication plotting defaults ---
-def set_pub_style(scale=1.1):
-    base = 14 * scale
-    plt.rcParams.update({
-        "figure.dpi": 160,
-        "savefig.dpi": 300,         # crisp in work docs
-        "font.size": base,
-        "axes.titlesize": base * 1.3,
-        "axes.labelsize": base * 1.15,
-        "xtick.labelsize": base,
-        "ytick.labelsize": base,
-        "legend.fontsize": base * 0.95,
-        "lines.linewidth": 1.8,
-        "lines.markersize": 6,
-        "figure.autolayout": True,  # reduce clipping
-        "axes.grid": True,
-        "grid.linestyle": "--",
-        "grid.linewidth": 0.6,
-        "grid.alpha": 0.35,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "legend.frameon": False,
-    })
 
-set_pub_style(1.1)
+# ---------- helpers (minimal) ----------
+def robust_sigma(y):
+    y = np.asarray(y, float)
+    med = np.median(y)
+    return 1.4826 * np.median(np.abs(y - med)) + 1e-12
 
-# ----------------------------- helpers ----------------------------- #
-def _sigma_from_fwhm(fwhm_pts: float, dq: float) -> float:
-    """FWHM -> sigma in x-units via FWHM = 2.355*sigma."""
-    return (fwhm_pts * dq) / 2.355
+def fwhm_to_sigma(fwhm):
+    return fwhm / 2.354820045  # 2*sqrt(2*ln2)
 
-def fit_metrics(result, x, y, weights=None):
-    yhat = result.model.eval(params=result.params, x=x)
-    resid = y - yhat
-    n = len(y)
-    k = sum(1 for p in result.params.values() if p.vary)  # free params
+def compute_r2(y, yfit):
+    y = np.asarray(y, float)
+    yfit = np.asarray(yfit, float)
+    ss_res = np.sum((y - yfit) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2) + 1e-16
+    return 1.0 - ss_res / ss_tot
 
-    if weights is not None:
-        w = np.asarray(weights, float)
-        sse = float(np.sum((w * resid) ** 2))
-        ybar = float(np.sum((w ** 2) * y) / np.sum(w ** 2))
-        sst = float(np.sum((w * (y - ybar)) ** 2))
-    else:
-        sse = float(np.sum(resid ** 2))
-        ybar = float(np.mean(y))
-        sst = float(np.sum((y - ybar) ** 2))
 
-    r2 = 1.0 - sse / max(sst, 1e-18)
-    adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / max(n - k - 1, 1)
-    red_chisq = sse / max(n - k, 1)
-    aic = result.aic
-    bic = result.bic
-    rmse = np.sqrt(sse / n)
-    max_abs = float(np.max(np.abs(resid)))
-
-    return dict(r2=r2, adj_r2=adj_r2, red_chisq=red_chisq, aic=aic, bic=bic,
-                rmse=rmse, max_abs=max_abs, n=n, k=k)
-
-def _poisson_weights(y):
-    return 1.0 / np.sqrt(np.clip(y, 1.0, None))
-
-def _robust_sigma(x):
-    med = np.median(x)
-    return 1.4826 * np.median(np.abs(x - med))
-
-# --- strict linear background for detection (sigma-clipped LSQ) ---
-def _linear_bg_strict(q, y, frac_keep=0.60, clip_sigma=2.5, max_iter=10):
-    q = np.asarray(q, float); y = np.asarray(y, float); n = y.size
-    if n < 3:
-        a = float(np.median(y)); b = 0.0
-        return a + b*q, dict(a=a, b=b, kept=n, iters=0)
-    mask = np.ones(n, bool); a = float(np.median(y)); b = 0.0
-    for it in range(max_iter):
-        X = np.vstack([np.ones(mask.sum()), q[mask]]).T
-        beta, *_ = np.linalg.lstsq(X, y[mask], rcond=None)
-        a, b = float(beta[0]), float(beta[1])
-        bg = a + b*q
-        resid = y - bg
-        rsel = resid[mask]
-        sig = 1.4826 * np.median(np.abs(rsel - np.median(rsel))) if rsel.size else 0.0
-        if sig == 0.0:
-            break
-        below = y <= (bg + clip_sigma*sig)
-        idx = np.where(below)[0]
-        if idx.size < 5:
-            break
-        order = np.argsort(resid[idx])
-        k = max(5, int(frac_keep * idx.size))
-        newmask = np.zeros(n, bool); newmask[idx[order[:k]]] = True
-        if newmask.sum()==mask.sum() and np.all(newmask==mask):
-            break
-        mask = newmask
-    return a + b*q, dict(a=a, b=b, kept=mask.sum(), iters=it+1)
-
-def fit_multi_peaks(q, y, peaks_idx, props, bg_degree=1):
+# ---------- core ----------
+def fit_peaks_in_window(h5_path, frame, center, window=0.1, plot=True):
     """
-    Linear background + sum of Gaussians.
-    Centers tied to global qshift+qscale with small per-peak wiggle.
+    Fits all peaks found by scipy.signal.find_peaks within ±window/2 around 'center'
+    using a sum of GaussianModel(s) + LinearModel background.
+
+    Expects:
+      f['q'][:] -> x-axis (preferred; falls back to 'tth' if missing)
+      f['int'][:] -> intensity stack, shape (nframes, nx)
     """
-    dq = float(np.diff(q).mean())
-
-    # Background (strictly linear if bg_degree=1)
-    composite = PolynomialModel(degree=bg_degree, prefix="bg_")
-    params = composite.make_params()
-    params["bg_c0"].set(value=float(np.median(y)), min=0.0)
-    if bg_degree >= 1:
-        params["bg_c1"].set(value=0.0)
-
-    # global transforms (harmless if no peaks)
-    params.add("qshift", value=0.0, min=-5e-3, max=5e-3)
-    params.add("qscale", value=1.0, min=0.999, max=1.001)
-
-    # Add Gaussians if any peaks
-    if len(peaks_idx) > 0:
-        fwhm_pts = np.asarray(props.get("widths", np.full_like(peaks_idx, 3.0, dtype=float)), float)
-        prominences = np.asarray(props.get("prominences", np.ones_like(peaks_idx, dtype=float)), float)
-
-        for i, pidx in enumerate(peaks_idx):
-            center0 = float(q[pidx])
-            sigma0 = max(_sigma_from_fwhm(float(fwhm_pts[i]), dq), 1e-6)
-
-            g = GaussianModel(prefix=f"g{i}_")
-            composite += g
-
-            height0 = float(prominences[i])
-            amp0 = max(height0 * sigma0 * np.sqrt(2 * np.pi), 1e-9)  # area
-
-            params.update(g.make_params(center=center0, sigma=sigma0, amplitude=amp0))
-            # tie: center = qscale*base + qshift + tiny per-peak wiggle
-            params.add(f"g{i}_c0", value=center0, vary=False)
-
-            # wiggle ~3 samples or ~0.0018 (whichever larger)
-            dq_samp = max(3 * dq, 0.0018)
-            params.add(f"g{i}_dcenter", value=0.0, min=-dq_samp, max=dq_samp)
-            params[f"g{i}_center"].set(expr=f"qscale*(g{i}_c0) + qshift + g{i}_dcenter")
-
-            # width/amplitude bounds
-            params[f"g{i}_sigma"].set(min=0.25 * sigma0, max=4.0 * sigma0)
-            params[f"g{i}_amplitude"].set(min=0.2 * abs(amp0), max=10 * abs(amp0))
-
-    # Fit
-    w = _poisson_weights(y)
-    result = composite.fit(
-        y, params, x=q, weights=w,
-        method="least_squares", fit_kws={"loss": "soft_l1", "f_scale": 1.0}
-    )
-    comps = result.model.eval_components(params=result.params, x=q)
-    return result, comps
-
-# ----------------------------- main ----------------------------- #
-def peak_fit(h5_path, frame_number, peak_pos, window=0.1):
     with h5py.File(h5_path, "r") as f:
-        q = f["q"][:]                       # (q,)
-        # read only the needed frame, not the whole dataset
-        y_full = f["int"][frame_number, :]  # (q,)
+        if "q" in f:
+            x = f["q"][:]
+        I = f["int"][:]
+    yfull = np.asarray(I[frame], float)
+    x = np.asarray(x, float)
 
-    # Window
-    q_min, q_max = peak_pos - window, peak_pos + window
-    mask = (q >= q_min) & (q <= q_max)
-    q_win = q[mask]
-    y_win = y_full[mask]
-    if q_win.size < 5:
-        raise ValueError("Fit window too small or outside q-range.")
+    half = window / 2.0
+    mask = (x >= center - half) & (x <= center + half)
+    xw = x[mask]
+    yw = yfull[mask]
 
-    # Figure: top = azimuthal curve; bottom = table
-    fig, (ax, table_ax) = plt.subplots(
-        2, 1, figsize=(12, 9),
-        gridspec_kw={"height_ratios": [3.0, 1.2]}
-    )
-    fig.suptitle(f"Peak Fit for Frame {frame_number}", fontsize=16)
+    # Remove non-finite points in window
+    mfin = np.isfinite(xw) & np.isfinite(yw)
+    xw, yw = xw[mfin], yw[mfin]
+    if xw.size < 5:
+        raise ValueError("Too few finite points in the window after masking.")
 
-    # --- Detection (background-sub only, STRICT LINEAR) ---
-    dq = float(np.diff(q_win).mean())
-    bg_detect, _ = _linear_bg_strict(q_win, y_win)
-    y_det = y_win - bg_detect
+    dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else window
 
-    # thresholds for detection
-    sig = _robust_sigma(y_det)
-    K = 1.5
-    prom_full = max(1.0, K * sig)
-
-    w_guess_pts = 6.0
-    wmin = max(1, int(0.6 * w_guess_pts))
-    wmax = int(20 * w_guess_pts)
-    min_dist_pts = 1
-
-    peaks, props = signal.find_peaks(
-        y_det,
-        prominence=prom_full,
-        width=(wmin, wmax),
-        distance=min_dist_pts,
-        rel_height=0.2,
+    # ---- peak finding (adaptive, shoulder/faint-friendly) ----
+    noise = robust_sigma(yw)
+    baseline = np.median(yw)
+    peaks, props = find_peaks(
+        yw,
+        prominence=0.8 * noise,
+        height=baseline + 0.5 * noise,
+        width=(1, None),  # allow very narrow up to very wide
     )
 
-    # --- Fit (linear BG only) ---
-    result, _ = fit_multi_peaks(q_win, y_win, peaks, props, bg_degree=1)
-    w = _poisson_weights(y_win)
-    m = fit_metrics(result, q_win, y_win, weights=w)
+    # Fallback to a single-peak guess at the window center if none found
+    if len(peaks) == 0:
+        peaks = np.array([np.argmin(np.abs(xw - center))])
+        fwhm_pts = np.array([max(3, int(0.1 * len(xw)))])
+    else:
+        wcalc = peak_widths(yw, peaks, rel_height=0.5)
+        fwhm_pts = wcalc[0]  # in sample points
 
-    # Dense evaluation for smooth curves
-    q_dense = np.linspace(q_win.min(), q_win.max(), max(len(q_win) * 5, 400))
-    best_fit_dense = result.model.eval(params=result.params, x=q_dense)
-    comps_dense = result.model.eval_components(params=result.params, x=q_dense)
+    # ---- build model: linear bkg + sum of gaussians (one per detected peak) ----
+    bkg = LinearModel(prefix="bkg_")
+    model = bkg
+    params = bkg.make_params(slope=0.0, intercept=baseline)
 
-    # --- TOP: Full Azimuthal Integration with peaks + fit ---
-    ax.plot(q_win, y_win, "-", label="Data", zorder=2)
-    # fitted background (not the detection BG)
-    if "bg_" in comps_dense:
-        ax.plot(q_dense, comps_dense["bg_"], "--", linewidth=1.6, alpha=0.9, label="Fitted BG", zorder=3)
-    ax.plot(q_dense, best_fit_dense, "-", linewidth=2.4, alpha=0.95, label="Total fit", zorder=4)
+    min_sigma = max(dx / 3.0, 1e-6)
+    max_sigma = max(window / 3.0, min_sigma * 2.0)
 
-    # peak markers at true data level
-    if len(peaks) > 0:
-        ax.plot(q_win[peaks], y_win[peaks], "x", label="Detected peaks", zorder=5)
+    for i, pidx in enumerate(peaks):
+        gi = GaussianModel(prefix=f"g{i}_")
+        model += gi
 
-    # individual Gaussians
-    for name in sorted(k for k in comps_dense if k.startswith("g")):
-        ax.plot(q_dense, comps_dense[name], ":", alpha=0.85, label=name, zorder=3)
+        x0 = float(xw[pidx])
+        fwhm0 = (fwhm_pts[i] * dx) if i < len(fwhm_pts) else (window / 10.0)
+        sigma0 = max(fwhm_to_sigma(max(fwhm0, dx)), min_sigma)
 
-    ax.set_title("Full Azimuthal Integration")
-    ax.set_xlabel("q")
-    ax.set_ylabel("Intensity")
+        height0 = max(float(yw[pidx] - baseline), noise)
+        amp0 = height0 * sigma0 * np.sqrt(2.0 * np.pi)
 
-    # de-duplicate legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), loc="upper right", ncol=2)
+        params.update(gi.make_params(center=x0, sigma=sigma0, amplitude=amp0))
+        params[f"g{i}_center"].set(min=center - half, max=center + half, value=x0)
+        params[f"g{i}_sigma"].set(min=min_sigma, max=max_sigma, value=sigma0)
+        params[f"g{i}_amplitude"].set(min=0.0, value=amp0)
 
-    # --- BOTTOM: Table with metrics + peak centers ---
-    table_ax.axis("off")
-    table_data = [
-        ["R²", f"{m['r2']:.6f}"],
-        ["Adj R²", f"{m['adj_r2']:.6f}"],
-        ["Reduced χ²", f"{m['red_chisq']:.3g}"],
-        ["AIC", f"{m['aic']:.2f}"],
-        ["BIC", f"{m['bic']:.2f}"],
-        ["RMSE", f"{m['rmse']:.3g}"],
-        ["Max |res|", f"{m['max_abs']:.3g}"],
-        ["# Peaks", f"{len(peaks)}"],
-        ["", ""],  # spacer
-    ]
+    result = model.fit(yw, params, x=xw)
+    yfit = result.best_fit
+    r2 = compute_r2(yw, yfit)
+
+    # ---- collect per-peak stats ----
+    rows = []
     for i in range(len(peaks)):
-        c = result.params.get(f"g{i}_center")
-        if c is not None:
-            table_data.append([f"Peak {i} center", f"{c.value:.6f}"])
+        amp = result.params[f"g{i}_amplitude"].value
+        ctr = result.params[f"g{i}_center"].value
+        sig = result.params[f"g{i}_sigma"].value
+        hgt = amp / (sig * np.sqrt(2.0 * np.pi))
+        fwhm = 2.0 * np.sqrt(2.0 * np.log(2.0)) * sig
+        rows.append([i, ctr, hgt, fwhm, amp])
 
-    table = table_ax.table(
-        cellText=table_data,
-        colLabels=["Metric / Peak", "Value"],
-        cellLoc="center",
-        loc="center"
+    bkg_slope = result.params["bkg_slope"].value
+    bkg_intercept = result.params["bkg_intercept"].value
+
+    # ---- optional plot with stats table below ----
+    if plot:
+        plt.rcParams.update({
+            "figure.dpi": 140,
+            "savefig.dpi": 300,
+            "font.size": 14,
+            "axes.labelsize": 16,
+            "axes.titlesize": 18,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+        })
+
+        fig, (ax, ax_tbl) = plt.subplots(
+            2, 1, figsize=(9, 6),
+            gridspec_kw={"height_ratios": [3, 1]}
+        )
+
+        ax.plot(xw, yw, lw=1.8, label="Data")
+        ax.plot(xw, yfit, lw=2.2, label="Fit")
+        comps = result.eval_components(x=xw)
+        if "bkg_" in comps:
+            ax.plot(xw, comps["bkg_"], ls="--", label="Background")
+        for i in range(len(peaks)):
+            key = f"g{i}_"
+            if key in comps:
+                ax.plot(xw, comps[key], ls=":", label=f"Peak {i}")
+                ax.axvline(rows[i][1], color="k", alpha=0.2)
+
+        ax.set_xlabel("q or 2θ")
+        ax.set_ylabel("Intensity")
+        ax.set_title(
+            f"Frame {frame}  |  window [{center - half:.5f}, {center + half:.5f}]  "
+            f"|  R²={r2:.4f}  |  bkg: y={bkg_slope:.3g}·x+{bkg_intercept:.3g}"
+        )
+        ax.legend(loc="best")
+        ax.grid(alpha=0.3)
+
+        ax_tbl.axis("off")
+        col_labels = ["Peak #", "Center", "Height", "FWHM", "Amplitude"]
+        cell_text = [[
+            f"{r[0]}",
+            f"{r[1]:.6g}",
+            f"{r[2]:.6g}",
+            f"{r[3]:.6g}",
+            f"{r[4]:.6g}",
+        ] for r in rows] if rows else [["—"] * len(col_labels)]
+
+        table = ax_tbl.table(
+            cellText=cell_text,
+            colLabels=col_labels,
+            loc="center"
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(12)
+        table.scale(1, 1.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "frame": frame,
+        "window": (center - half, center + half),
+        "background": {"slope": bkg_slope, "intercept": bkg_intercept},
+        "r2": r2,
+        "rows": rows,           # [ [idx, center, height, fwhm, amplitude], ... ]
+        "result": result,       # full lmfit result if you want the report
+        "x": xw,
+        "y": yw,
+        "yfit": yfit,
+    }
+
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser(description="Fit all peaks in a 0.1-wide window with Gaussian(s)+linear background.")
+    ap.add_argument("h5", help="Path to HDF5 file with 'q' (or 'tth') and 'int'")
+    ap.add_argument("frame", type=int, help="Frame index to fit")
+    ap.add_argument("center", type=float, help="Center of the window")
+    ap.add_argument("--window", type=float, default=0.1, help="Window width (default 0.1)")
+    
+    args = ap.parse_args()
+
+    out = fit_peaks_in_window(
+        h5_path=args.h5,
+        frame=args.frame,
+        center=args.center,
+        window=args.window,
     )
-    table.auto_set_font_size(False)
-    table.set_fontsize(12)
-    table.scale(1.2, 1.25)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.show()
-
-# ----------------------------- CLI ----------------------------- #
-def _parse_args():
-    p = argparse.ArgumentParser(
-        description="Full-azimuth peak detection + Gaussian fitting (linear background) with a summary table."
-    )
-    p.add_argument("h5", type=str)
-    p.add_argument("frame_number", type=int)
-    p.add_argument("peak_pos", type=float)
-    p.add_argument("--window", type=float, default=0.1, help="Half-window in q.")
-    return p.parse_args()
+    print(f"\nFrame {out['frame']}  window: {out['window'][0]:.6f}..{out['window'][1]:.6f}")
+    print(f"Background: slope={out['background']['slope']:.6g}, intercept={out['background']['intercept']:.6g}")
+    print(f"R^2: {out['r2']:.6g}")
+    if out["rows"]:
+        for r in out["rows"]:
+            print(f"Peak {r[0]}: center={r[1]:.6g}, height={r[2]:.6g}, FWHM={r[3]:.6g}, amplitude={r[4]:.6g}")
+    else:
+        print("No peaks found (fallback single-peak guess may have been used).")
 
 if __name__ == "__main__":
-    args = _parse_args()
-    peak_fit(args.h5, args.frame_number, args.peak_pos, args.window)
+    main()
