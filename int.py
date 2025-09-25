@@ -144,7 +144,8 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
             h5_file.create_dataset("cake_eta_ranges", data=np.array(cake_slices))  # shape: (n_cakes, 2)
     print(f"Polar integration completed. Results saved to {output_file}")
 
-   
+    # Calculate time axis in seconds (each frame is 4 ms)
+    time_axis = np.arange(nframes) * 4 / 1000.0
      
     # Plot time-resolved data if the plot flag is set
     if plot:
@@ -158,11 +159,11 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
             "ytick.labelsize": 12,
         })
         plt.figure(figsize=(10, 6))
-        plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, nframes],
-                   origin='lower', cmap='jet')
+        plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, time_axis],
+                   origin='lower', cmap='plasma')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)', fontsize = 16)
-        plt.ylabel('Frame Index', fontsize = 16)
+        plt.ylabel('Time (sec)', fontsize = 16)
         plt.title(f"Time-Resolved Data: {experiment_name}")
         plt.show()
 if __name__ == "__main__":
@@ -175,4 +176,3 @@ if __name__ == "__main__":
     
     # Run the integration workflow
     integrate_em(args.Tiff_fold, args.instr_file, plot=args.plot)
-
