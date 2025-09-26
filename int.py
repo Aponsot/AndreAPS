@@ -159,7 +159,7 @@ def integrate_em(Tiff_fold, instr_file, plot=False):
             "ytick.labelsize": 12,
         })
         plt.figure(figsize=(10, 6))
-        plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, time_axis],
+        plt.imshow(intensity_stack, aspect='auto', extent=[q_values.min(), q_values.max(), 0, time_axis.max()],
                    origin='lower', cmap='plasma')
         plt.colorbar(label='Intensity')
         plt.xlabel('q (1/Å)', fontsize = 16)
@@ -176,3 +176,4 @@ if __name__ == "__main__":
     
     # Run the integration workflow
     integrate_em(args.Tiff_fold, args.instr_file, plot=args.plot)
+
