@@ -2,6 +2,7 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 import argparse
+from matplotlib.lines import Line2D
 
 def phase_overlay(input_file, frame_indices):
     with h5py.File(input_file, 'r') as f:
@@ -22,31 +23,46 @@ def phase_overlay(input_file, frame_indices):
     frame_indices = sorted(frame_indices)
 
     plt.figure(figsize=(10, 6))
-    for idx in frame_indices:
+    offset = 0
+    offset_step = np.max(intensity_stack) * 0.15  # 15% of max intensity
+
+    frame_lines = []
+    for i, idx in enumerate(frame_indices):
         if 0 <= idx < intensity_stack.shape[0]:
-            plt.plot(q_values, intensity_stack[idx], label=f'Frame {idx}')
+            line, = plt.plot(q_values, intensity_stack[idx] + offset, label=f'Frame {idx}')
+            frame_lines.append(line)
+            offset += offset_step
         else:
             print(f"Frame {idx} is out of range.")
 
-    # Overlay phase lines
+    # Overlay phase lines and collect proxy artists for legend
+    phase_lines = []
     for peaks, label, color in peak_data:
         for q in peaks:
             plt.axvline(q, color=color, linestyle='--', alpha=0.7)
-        plt.text(peaks[0], plt.ylim()[1]*0.95, label, color=color, fontsize=12, rotation=90, va='top')
+        # Only add one proxy per phase
+        phase_lines.append(Line2D([0], [0], color=color, linestyle='--', label=label))
+
     plt.rcParams.update({
-            "figure.dpi": 140,
-            "savefig.dpi": 300,
-            "font.size": 14,
-            "axes.labelsize": 16,
-            "axes.titlesize": 18,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
-        })
+        "figure.dpi": 140,
+        "savefig.dpi": 300,
+        "font.size": 14,
+        "axes.labelsize": 16,
+        "axes.titlesize": 18,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+    })
     plt.xlabel('q')
-    plt.ylabel('Intensity')
-    plt.legend()
+    plt.ylabel('Intensity (offset)')
     plt.title('Intensity vs q with Phase Overlay')
     plt.tight_layout()
+
+    # First legend: frames
+    leg1 = plt.legend(handles=frame_lines, loc='upper right', title='Frames')
+    plt.gca().add_artist(leg1)
+    # Second legend: phases
+    plt.legend(handles=phase_lines, loc='upper left', title='Phases')
+
     plt.show()
 
 if __name__ == "__main__":
