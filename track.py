@@ -1,69 +1,106 @@
+#!/usr/bin/env python3
 import argparse
-import h5py
 import numpy as np
-from scipy.optimize import curve_fit
+import h5py
 import matplotlib.pyplot as plt
+from lmfit.models import GaussianModel, LinearModel
 
-# Gaussian peak function
-def gaussian(x, amp, cen, wid, offset):
-    return amp * np.exp(-(x - cen)**2 / (2 * wid**2)) + offset
+WINDOW = 0.20  # fit window width in x-units (q or 2θ)
 
-# Argument parser for HDF5 file paths
-parser = argparse.ArgumentParser(description="Process HDF5 files for peak analysis.")
-parser.add_argument('h5_files', nargs='+', help='Paths to HDF5 files')
-args = parser.parse_args()
+def robust_sigma(y):
+    y = np.asarray(y, float)
+    med = np.median(y)
+    return 1.4826 * np.median(np.abs(y - med)) + 1e-12
 
-peak_centers_all = []
+def fwhm_to_sigma(fwhm):
+    return fwhm / 2.354820045
 
-center_guess = 4.94  # Known peak location
-num_frames_to_process = 200
-num_frames_for_avg = 20
-
-peak_deviations = []
-final_avg_centers = []
-
-# Collect peak centers for all datasets
-for h5_path in args.h5_files:
+def fit_single_peak(h5_path, frame, center, plot=True):
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
-        y_all = f["int"][:num_frames_to_process, :]
+        I = f["int"][:]
+    yfull = np.asarray(I[frame], float)
+    x = np.asarray(x, float)
 
-        peak_centers = []
-        for frame_idx in range(num_frames_to_process):
-            y = y_all[frame_idx, :]
-            mask = (x > center_guess - 0.1) & (x < center_guess + 0.02)
-            x_fit = x[mask]
-            y_fit = y[mask]
-            p0 = [y_fit.max(), center_guess, 0.1, y_fit.min()]
-            try:
-                popt, _ = curve_fit(gaussian, x_fit, y_fit, p0=p0)
-                peak_centers.append(popt[1])
-            except Exception:
-                peak_centers.append(np.nan)
+    half = WINDOW / 2.0
+    m = (x >= center - half) & (x <= center + half)
+    xw, yw = x[m], yfull[m]
+    mfin = np.isfinite(xw) & np.isfinite(yw)
+    xw, yw = xw[mfin], yw[mfin]
+    if xw.size < 5:
+        raise ValueError("Too few points in window.")
 
-        peak_centers_all.append(np.array(peak_centers))
+    baseline = np.median(yw)
+    noise = robust_sigma(yw)
+    dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
+    min_sigma = max(dx / 3.0, 1e-6)
+    max_sigma = 0.22 * WINDOW
 
-# Compute global average for first 20 frames across all datasets
-initial_centers = np.array([centers[:num_frames_for_avg] for centers in peak_centers_all])
-global_avg_center = np.nanmean(initial_centers)
+    # Initial guesses
+    peak_idx = np.abs(xw - center).argmin()
+    height0 = max(yw[peak_idx] - baseline, noise)
+    sigma0 = fwhm_to_sigma(WINDOW / 4)
+    amp0 = height0 * sigma0 * np.sqrt(2 * np.pi)
 
-# Compute deviations and final averages
-for centers in peak_centers_all:
-    deviation = centers - global_avg_center
-    peak_deviations.append(deviation)
-    final_avg_centers.append(np.nanmean(centers[num_frames_for_avg:]))
+    # Model: linear background + single Gaussian
+    bkg = LinearModel(prefix="bkg_")
+    gauss = GaussianModel(prefix="g_")
+    model = bkg + gauss
+    params = model.make_params(
+        bkg_slope=0.0,
+        bkg_intercept=baseline,
+        g_center=float(xw[peak_idx]),
+        g_sigma=sigma0,
+        g_amplitude=amp0,
+    )
+    params["g_center"].set(min=xw[0], max=xw[-1])
+    params["g_sigma"].set(min=min_sigma, max=max_sigma)
+    params["g_amplitude"].set(min=0.0)
 
-# Plot deviations for each dataset, with final average as last point
-plt.figure(figsize=(10, 6))
-for i, deviation in enumerate(peak_deviations):
-    frames = np.arange(len(deviation))
-    plt.plot(frames, deviation, label=f'beam_{i}')
-    plt.scatter(len(deviation), final_avg_centers[i] - global_avg_center, color=plt.gca().lines[-1].get_color(), marker='x')
+    result = model.fit(yw, params, x=xw)
 
-plt.axhline(0, color='gray', linestyle='--', linewidth=1)
-plt.xlabel('Frame')
-plt.ylabel('Peak Center Deviation')
-plt.title('Peak Center Deviation from Global Initial Average at 50um')
-plt.legend()
-plt.tight_layout()
-plt.show()
+    # Extract fit results
+    center_fit = result.params["g_center"].value
+    sigma_fit = result.params["g_sigma"].value
+    amp_fit = result.params["g_amplitude"].value
+    height_fit = amp_fit / (sigma_fit * np.sqrt(2 * np.pi)) if sigma_fit > 0 else 0.0
+    fwhm_fit = 2 * np.sqrt(2 * np.log(2)) * sigma_fit
+
+    if plot:
+        plt.figure(figsize=(8, 4))
+        plt.plot(xw, yw, 'b.', label="Data")
+        plt.plot(xw, result.best_fit, 'r-', label="Fit")
+        plt.axvline(center_fit, color='k', ls='--', alpha=0.5, label="Peak Center")
+        plt.xlabel("q (1/Å)")
+        plt.ylabel("Intensity")
+        plt.title(f"Frame {frame} | Center={center_fit:.5f} | FWHM={fwhm_fit:.5f}")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "center": center_fit,
+        "height": height_fit,
+        "fwhm": fwhm_fit,
+        "amplitude": amp_fit,
+        "background": {
+            "slope": result.params["bkg_slope"].value,
+            "intercept": result.params["bkg_intercept"].value,
+        },
+        "noise": noise,
+        "result": result,
+        "x": xw,
+        "y": yw,
+        "yfit": result.best_fit,
+    }
+
+def main():
+    ap = argparse.ArgumentParser(description="Fit a single Gaussian peak with linear background.")
+    ap.add_argument("h5", help="HDF5 with 'q' (or 'tth') and 'int'")
+    ap.add_argument("frame", type=int, help="Frame index")
+    ap.add_argument("center", type=float, help="Initial guess for peak center")
+    args = ap.parse_args()
+    fit_single_peak(args.h5, args.frame, args.center, plot=True)
+
+if __name__ == "__main__":
+    main()
