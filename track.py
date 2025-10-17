@@ -1,32 +1,32 @@
+import argparse
 import h5py
 import numpy as np
 from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
 
 # Gaussian peak function
 def gaussian(x, amp, cen, wid, offset):
     return amp * np.exp(-(x - cen)**2 / (2 * wid**2)) + offset
 
-# List of input files
-beam_files = [
-    '/Data/h5/oct25/',
-]
+# Argument parser for HDF5 file paths
+parser = argparse.ArgumentParser(description="Process HDF5 files for peak analysis.")
+parser.add_argument('h5_files', nargs='+', help='Paths to HDF5 files')
+args = parser.parse_args()
 
 peak_centers_all = []
 
 center_guess = 4.94  # Known peak location
-frame = 0           # Use frame 0, change as needed
-
-num_frames_to_process = 200  # Cap on number of frames to process per file
-num_frames_for_avg = 20      # Number of initial frames to use for average peak location
+num_frames_to_process = 200
+num_frames_for_avg = 20
 
 peak_deviations = []
 final_avg_centers = []
 
 # Collect peak centers for all datasets
-for h5_path in beam_files:
+for h5_path in args.h5_files:
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
-        y_all = f["int"][:num_frames_to_process, :]  # shape: (frames, x)
+        y_all = f["int"][:num_frames_to_process, :]
 
         peak_centers = []
         for frame_idx in range(num_frames_to_process):
@@ -54,13 +54,10 @@ for centers in peak_centers_all:
     final_avg_centers.append(np.nanmean(centers[num_frames_for_avg:]))
 
 # Plot deviations for each dataset, with final average as last point
-import matplotlib.pyplot as plt
-
 plt.figure(figsize=(10, 6))
 for i, deviation in enumerate(peak_deviations):
     frames = np.arange(len(deviation))
     plt.plot(frames, deviation, label=f'beam_{i}')
-    # Add final average as last point
     plt.scatter(len(deviation), final_avg_centers[i] - global_avg_center, color=plt.gca().lines[-1].get_color(), marker='x')
 
 plt.axhline(0, color='gray', linestyle='--', linewidth=1)
