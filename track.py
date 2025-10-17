@@ -8,12 +8,12 @@ def gaussian(x, amp, cen, wid, offset):
 
 # List of input files
 beam_files = [
-    '/Data/ponsot/h5/oct25/',
+    '/Data/h5/oct25/',
 ]
 
 peak_centers_all = []
 
-center_guess = 4.9  # Known peak location
+center_guess = 4.94  # Known peak location
 frame = 0           # Use frame 0, change as needed
 
 num_frames_to_process = 200  # Cap on number of frames to process per file
@@ -31,7 +31,7 @@ for h5_path in beam_files:
         peak_centers = []
         for frame_idx in range(num_frames_to_process):
             y = y_all[frame_idx, :]
-            mask = (x > center_guess - 0.5) & (x < center_guess + 0.5)
+            mask = (x > center_guess - 0.1) & (x < center_guess + 0.02)
             x_fit = x[mask]
             y_fit = y[mask]
             p0 = [y_fit.max(), center_guess, 0.1, y_fit.min()]
