@@ -33,7 +33,7 @@ def fit_single_peak(h5_path, frame, center):
     baseline = np.median(yw)
     noise = robust_sigma(yw)
     dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
-    min_sigma = max(dx / 50.0, 1e-6)
+    min_sigma = max(dx / 30.0, 1e-12)
     max_sigma = 5.0 * WINDOW  
 
     peak_idx = np.abs(xw - center).argmin()
