@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 6 datasets.")
-    ap.add_argument("--h5", nargs=6, required=True, help="6 HDF5 files with 'q' (or 'tth') and 'int'")
+    ap.add_argument("--h5", nargs=7, required=True, help="6 HDF5 files with 'q' (or 'tth') and 'int'")
     args = ap.parse_args()
     h5_files = args.h5
 
