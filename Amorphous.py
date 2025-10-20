@@ -18,7 +18,7 @@ def main():
     for fname in h5_files:
         with h5py.File(fname, 'r') as f:
             data = f["int"][:]
-            frame_intensity = np.mean(data, axis=tuple(range(1, data.ndim)))
+            frame_intensity = np.sum(data, axis=tuple(range(1, data.ndim)))
             baseline = np.mean(frame_intensity[:20])
             norm_intensity = (frame_intensity / baseline) * 100
             all_norm_intensities.append(norm_intensity)
