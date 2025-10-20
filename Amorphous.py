@@ -12,12 +12,16 @@ def main():
 
     plt.figure(figsize=(10, 6))
 
+    # Store each dataset's normalized intensity separately
+    all_norm_intensities = []
+
     for fname in h5_files:
         with h5py.File(fname, 'r') as f:
             data = f['/signal'][()]
             frame_intensity = np.mean(data, axis=tuple(range(1, data.ndim)))
             baseline = np.mean(frame_intensity[:20])
             norm_intensity = (frame_intensity / baseline) * 100
+            all_norm_intensities.append(norm_intensity)
             plt.plot(norm_intensity, label=fname)
 
     plt.xlabel('Frame')
