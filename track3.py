@@ -5,7 +5,7 @@ import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
 
-WINDOW = 0.25  # fit window width in x-units (q or 2θ)
+WINDOW = 0.50  # fit window width in x-units (q or 2θ)
 
 def robust_sigma(y):
     y = np.asarray(y, float)
@@ -33,7 +33,7 @@ def fit_single_peak(h5_path, frame, center):
     baseline = np.median(yw)
     noise = robust_sigma(yw)
     dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
-    min_sigma = max(dx / 50.0, 1e-16)
+    min_sigma = max(dx / 50.0, 1e-6)
     max_sigma = 5.0 * WINDOW  
 
     peak_idx = np.abs(xw - center).argmin()
@@ -68,15 +68,12 @@ def process_dataset(h5_path, initial_guess):
     centers = []
     failed_frames = []
 
-    # Get average center from first 10 frames
+    # Get average center from first 10 frames using initial_guess only
     first10_centers = []
-    # Estimate average center from first 10 frames
-    prev_center = initial_guess
     for frame in range(min(20, nframes)):
         try:
-            c = fit_single_peak(h5_path, frame, prev_center)
+            c = fit_single_peak(h5_path, frame, initial_guess)
             first10_centers.append(c)
-            prev_center = c  # Use fitted center as next initial guess
         except Exception:
             pass
     if not first10_centers:
@@ -84,17 +81,14 @@ def process_dataset(h5_path, initial_guess):
     else:
         avg_center = np.mean(first10_centers)
 
-    # Track differential movement, updating initial guess each time
-    prev_center = avg_center
+    # Track differential movement using a single guess (avg_center) for all frames
     for frame in range(nframes):
         try:
-            c = fit_single_peak(h5_path, frame, prev_center)
+            c = fit_single_peak(h5_path, frame, avg_center)
             centers.append(c)
-            prev_center = c  # Use fitted center as next initial guess
         except Exception:
             centers.append(np.nan)
             failed_frames.append(frame)
-            # Do not update prev_center if fit failed
 
     centers = np.array(centers)
     diff_centers = centers - avg_center
@@ -104,7 +98,6 @@ def process_dataset(h5_path, initial_guess):
         if window < 2:
             return data
         kernel = np.ones(window) / window
-        # Use 'same' mode to keep output length
         return np.convolve(data, kernel, mode='same')
 
     diff_centers = smooth(diff_centers, window=3)
