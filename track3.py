@@ -10,7 +10,7 @@ WINDOW = 0.50  # fit window width in x-units (q or 2θ)
 def robust_sigma(y):
     y = np.asarray(y, float)
     med = np.median(y)
-    return 15 * np.median(np.abs(y - med)) + 1e-12
+    return 20 * np.median(np.abs(y - med)) + 1e-12
 
 def fwhm_to_sigma(fwhm):
     return fwhm / 2.354820045
@@ -34,7 +34,7 @@ def fit_single_peak(h5_path, frame, center):
     noise = robust_sigma(yw)
     dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
     min_sigma = max(dx / 50.0, 1e-6)
-    max_sigma = 5.0 * WINDOW  
+    max_sigma = 10.0 * WINDOW  
 
     peak_idx = np.abs(xw - center).argmin()
     height0 = max(yw[peak_idx] - baseline, noise)
