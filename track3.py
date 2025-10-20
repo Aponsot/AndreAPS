@@ -106,12 +106,12 @@ def process_dataset(h5_path, initial_guess):
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 6 datasets.")
-    ap.add_argument("--h5", nargs=6, required=True, help="6 HDF5 files with 'q' (or 'tth') and 'int'")
-    ap.add_argument("--center", nargs=6, type=float, required=True, help="Initial guess for peak center for each dataset")
+    ap.add_argument("--h5", nargs=7, required=True, help="6 HDF5 files with 'q' (or 'tth') and 'int'")
+    ap.add_argument("--center", nargs=7, type=float, required=True, help="Initial guess for peak center for each dataset")
     args = ap.parse_args()
 
     plt.figure(figsize=(12, 6))
-    for i in range(6):
+    for i in range(7):
         diff_centers, failed_frames, nframes = process_dataset(args.h5[i], args.center[i])
         frames = np.arange(nframes)
         plt.plot( diff_centers,frames, label=f"Beam Index {i}")
