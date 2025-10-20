@@ -27,6 +27,7 @@ def main():
     plt.xlabel('Frame')
     plt.ylabel('Normalized Signal Intensity (%)')
     plt.title('Signal Intensity Over Experiment')
+    plt.xlim(0,1000)
     plt.legend([f"Beam Index {i}" for i in range(len(h5_files))])
     plt.tight_layout()
     plt.show()
