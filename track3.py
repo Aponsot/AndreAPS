@@ -114,7 +114,7 @@ def main():
     for i in range(7):
         diff_centers, failed_frames, nframes = process_dataset(args.h5[i], args.center[i])
         frames = np.arange(nframes)
-        plt.plot( diff_centers,frames, label=f"Beam Index {i}")
+        plt.plot( frames,diff_centers, label=f"Beam Index {i}")
         if failed_frames:
             print(f"Warning: Peak fitting failed for frames in dataset {i}: {failed_frames}")
 
