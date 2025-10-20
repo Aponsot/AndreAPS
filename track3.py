@@ -104,8 +104,8 @@ def process_dataset(h5_path, initial_guess):
     return diff_centers, failed_frames, nframes
 
 def main():
-    ap = argparse.ArgumentParser(description="Track peak movement for 6 datasets.")
-    ap.add_argument("--h5", nargs=7, required=True, help="6 HDF5 files with 'q' (or 'tth') and 'int'")
+    ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets.")
+    ap.add_argument("--h5", nargs=7, required=True, help="7 HDF5 files with 'q' (or 'tth') and 'int'")
     ap.add_argument("--center", nargs=7, type=float, required=True, help="Initial guess for peak center for each dataset")
     args = ap.parse_args()
 
@@ -118,6 +118,7 @@ def main():
             print(f"Warning: Peak fitting failed for frames in dataset {i}: {failed_frames}")
 
     plt.xlabel("Frame")
+    plt.xlim(0,1000)
     plt.ylabel("Peak Center Differential (q or 2θ)")
     plt.title("Differential Peak Center Movement Over Frames (6 Datasets)")
     plt.grid(True)
