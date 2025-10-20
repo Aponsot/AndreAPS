@@ -10,7 +10,7 @@ WINDOW = 0.50  # fit window width in x-units (q or 2θ)
 def robust_sigma(y):
     y = np.asarray(y, float)
     med = np.median(y)
-    return 20 * np.median(np.abs(y - med)) + 1e-12
+    return 15 * np.median(np.abs(y - med)) + 1e-12
 
 def fwhm_to_sigma(fwhm):
     return fwhm / 2.354820045
@@ -34,7 +34,7 @@ def fit_single_peak(h5_path, frame, center):
     noise = robust_sigma(yw)
     dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
     min_sigma = max(dx / 50.0, 1e-6)
-    max_sigma = 10.0 * WINDOW  
+    max_sigma = 5.0 * WINDOW  
 
     peak_idx = np.abs(xw - center).argmin()
     height0 = max(yw[peak_idx] - baseline, noise)
@@ -70,10 +70,13 @@ def process_dataset(h5_path, initial_guess):
 
     # Get average center from first 10 frames
     first10_centers = []
+    # Estimate average center from first 10 frames
+    prev_center = initial_guess
     for frame in range(min(20, nframes)):
         try:
-            c = fit_single_peak(h5_path, frame, initial_guess)
+            c = fit_single_peak(h5_path, frame, prev_center)
             first10_centers.append(c)
+            prev_center = c  # Use fitted center as next initial guess
         except Exception:
             pass
     if not first10_centers:
@@ -81,14 +84,17 @@ def process_dataset(h5_path, initial_guess):
     else:
         avg_center = np.mean(first10_centers)
 
-    # Track differential movement
+    # Track differential movement, updating initial guess each time
+    prev_center = avg_center
     for frame in range(nframes):
         try:
-            c = fit_single_peak(h5_path, frame, avg_center)
+            c = fit_single_peak(h5_path, frame, prev_center)
             centers.append(c)
+            prev_center = c  # Use fitted center as next initial guess
         except Exception:
             centers.append(np.nan)
             failed_frames.append(frame)
+            # Do not update prev_center if fit failed
 
     centers = np.array(centers)
     diff_centers = centers - avg_center
