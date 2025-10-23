@@ -142,14 +142,5 @@ def main():
     print("\nMax absolute peak movement per dataset:")
     for lab, mm in zip(labels, max_moves):
         print(f"  {lab}: {mm:.6g}")
-
-    plt.figure(figsize=(8, 4.5))
-    x = np.arange(len(max_moves))
-    plt.bar(x, max_moves)
-    plt.xticks(x, labels)
-    plt.ylabel("Max |Δcenter| (q or 2θ)")
-    plt.title("Max Peak Movement per Dataset")
-    plt.tight_layout()
-    plt.show()
 if __name__ == "__main__":
     main()
