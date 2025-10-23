@@ -68,7 +68,7 @@ def process_dataset(h5_path, initial_guess):
     centers = []
     failed_frames = []
 
-    # Get average center from first 10 frames using initial_guess only
+    # seed average center
     first10_centers = []
     for frame in range(min(20, nframes)):
         try:
@@ -76,12 +76,9 @@ def process_dataset(h5_path, initial_guess):
             first10_centers.append(c)
         except Exception:
             pass
-    if not first10_centers:
-        avg_center = initial_guess
-    else:
-        avg_center = np.mean(first10_centers)
+    avg_center = np.mean(first10_centers) if first10_centers else initial_guess
 
-    # Track differential movement using a single guess (avg_center) for all frames
+    # track all frames (no smoothing)
     for frame in range(nframes):
         try:
             c = fit_single_peak(h5_path, frame, avg_center)
@@ -90,9 +87,10 @@ def process_dataset(h5_path, initial_guess):
             centers.append(np.nan)
             failed_frames.append(frame)
 
-    centers = np.array(centers)
+    centers = np.asarray(centers, dtype=float)
     diff_centers = centers - avg_center
 
+    return diff_centers, failed_frames, nframes
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets.")
