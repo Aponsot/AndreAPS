@@ -111,30 +111,56 @@ def main():
 
      # --- same publication style as your sequential plot ---
     plt.rcParams.update({
-        "figure.dpi": 160,
-        "savefig.dpi": 300,
-        "font.size": 20,
-        "axes.labelsize": 20,
-        "axes.titlesize": 20,
-        "xtick.labelsize": 16,
-        "ytick.labelsize": 16,
+         "figure.figsize": (6.5, 4.8),   # similar aspect
+    "figure.dpi": 160,
+    "savefig.dpi": 300,             # publication export
+    "font.size": 12,                # base font
+    "axes.titlesize": 12,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "axes.linewidth": 1.0,          # frame thickness
+    "axes.grid": False,             # no grid in the sample
+    "legend.frameon": False,        # legend without box
+    "legend.fontsize": 12,
     })
-    plt.figure(figsize=(12, 6))
+    max_moves = []
+    labels = []
+
     for i in range(7):
         diff_centers, failed_frames, nframes = process_dataset(args.h5[i], args.center[i])
+
+        # NEW: record max abs movement for this dataset
+        max_move = float(np.nanmax(np.abs(diff_centers)))
+        max_moves.append(max_move)
+        labels.append(f"Beam Index {i}")
+
         frames = np.arange(nframes)
-        plt.plot( frames,diff_centers, label=f"Beam Index {i}")
+        plt.plot(frames, diff_centers, label=f"Beam Index {i}")
         if failed_frames:
             print(f"Warning: Peak fitting failed for frames in dataset {i}: {failed_frames}")
 
     plt.xlabel("Frame")
-    plt.xlim(50,200)
+    plt.xlim(50, 200)
     plt.ylabel("Peak Center Differential (q or 2θ)")
-    plt.title("Differential Peak Center Movement Over Frames (6 Datasets)")
+    plt.title("Differential Peak Center Movement Over Frames (7 Datasets)")
     plt.grid(True)
-    plt.legend(fontsize = 14)
+    plt.legend(fontsize=12)
     plt.tight_layout()
     plt.show()
 
+    # NEW: print and plot comparison of maxima
+    print("\nMax absolute peak movement per dataset:")
+    for lab, mm in zip(labels, max_moves):
+        print(f"  {lab}: {mm:.6g}")
+
+    plt.figure(figsize=(8, 4.5))
+    x = np.arange(len(max_moves))
+    plt.bar(x, max_moves)
+    plt.xticks(x, labels)
+    plt.ylabel("Max |Δcenter| (q or 2θ)")
+    plt.title("Max Peak Movement per Dataset")
+    plt.tight_layout()
+    plt.show()
 if __name__ == "__main__":
     main()
