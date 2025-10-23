@@ -109,6 +109,16 @@ def main():
     ap.add_argument("--center", nargs=7, type=float, required=True, help="Initial guess for peak center for each dataset")
     args = ap.parse_args()
 
+     # --- same publication style as your sequential plot ---
+    plt.rcParams.update({
+        "figure.dpi": 160,
+        "savefig.dpi": 300,
+        "font.size": 20,
+        "axes.labelsize": 20,
+        "axes.titlesize": 20,
+        "xtick.labelsize": 16,
+        "ytick.labelsize": 16,
+    })
     plt.figure(figsize=(12, 6))
     for i in range(7):
         diff_centers, failed_frames, nframes = process_dataset(args.h5[i], args.center[i])
