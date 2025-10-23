@@ -125,7 +125,7 @@ def main():
         labels.append(f"Beam Index {i}")
 
         frames = np.arange(nframes)
-        plt.scatter(frames, diff_centers, label=f"Beam Index {i}")
+        plt.scatter(frames, diff_centers, label=f"Beam Index {i}",s=8)
         if failed_frames:
             print(f"Warning: Peak fitting failed for frames in dataset {i}: {failed_frames}")
 
