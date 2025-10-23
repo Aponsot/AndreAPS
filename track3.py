@@ -93,15 +93,6 @@ def process_dataset(h5_path, initial_guess):
     centers = np.array(centers)
     diff_centers = centers - avg_center
 
-    
-    def smooth(data, window=5):
-        if window < 2:
-            return data
-        kernel = np.ones(window) / window
-        return np.convolve(data, kernel, mode='same')
-
-    diff_centers = smooth(diff_centers, window=3)
-    return diff_centers, failed_frames, nframes
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets.")
