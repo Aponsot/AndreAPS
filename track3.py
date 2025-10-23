@@ -5,7 +5,7 @@ import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
 
-WINDOW = 0.50  # fit window width in x-units (q or 2θ)
+WINDOW = 0.30  # fit window width in x-units (q or 2θ)
 
 def robust_sigma(y):
     y = np.asarray(y, float)
