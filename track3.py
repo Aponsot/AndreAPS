@@ -93,8 +93,8 @@ def process_dataset(h5_path, initial_guess):
     centers = np.array(centers)
     diff_centers = centers - avg_center
 
-    # Apply weak smoothing (moving average with window size 3)
-    def smooth(data, window=3):
+    
+    def smooth(data, window=5):
         if window < 2:
             return data
         kernel = np.ones(window) / window
@@ -118,7 +118,7 @@ def main():
             print(f"Warning: Peak fitting failed for frames in dataset {i}: {failed_frames}")
 
     plt.xlabel("Frame")
-    plt.xlim(0,1000)
+    plt.xlim(50,200)
     plt.ylabel("Peak Center Differential (q or 2θ)")
     plt.title("Differential Peak Center Movement Over Frames (6 Datasets)")
     plt.grid(True)
