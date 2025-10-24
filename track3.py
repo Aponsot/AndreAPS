@@ -131,7 +131,7 @@ def main():
 
     plt.xlabel("Frame")
     plt.xlim(50, 200)
-    plt.ylabel("Peak Center Differential (q or 2θ)")
+    plt.ylabel("Peak Center Differential (q (1/Å))")
     plt.title("Differential Peak Center Movement Over Frames (7 Datasets)")
     plt.grid(True)
     plt.legend(fontsize=12)
