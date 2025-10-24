@@ -70,7 +70,7 @@ def process_dataset(h5_path, initial_guess):
 
     # seed average center
     first10_centers = []
-    for frame in range(min(20, nframes)):
+    for frame in range(min(45, nframes)):
         try:
             c = fit_single_peak(h5_path, frame, initial_guess)
             first10_centers.append(c)
@@ -123,16 +123,16 @@ def main():
         max_move = float(np.nanmax(np.abs(diff_centers)))
         max_moves.append(max_move)
         labels.append(f"Beam Index {i}")
-
+        markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
         frames = np.arange(nframes)
-        plt.scatter(frames, diff_centers, label=f"Beam Index {i}",s=12)
+        plt.scatter(frames, diff_centers, label=f"Beam Index {i}",s=12,alpha=0.7,marker=markers[i % len(markers)])
         if failed_frames:
             print(f"Warning: Peak fitting failed for frames in dataset {i}: {failed_frames}")
 
     plt.xlabel("Frame")
     plt.xlim(50, 200)
-    plt.ylabel("Peak Center Differential (q (1/Å))")
-    plt.title("Differential Peak Center Movement Over Frames (7 Datasets)")
+    plt.ylim(0,-.14)
+    plt.ylabel("Peak Center Differential q Movment (1/Å) ")
     plt.grid(True)
     plt.legend(fontsize=12)
     plt.tight_layout()
