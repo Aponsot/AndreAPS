@@ -310,6 +310,10 @@ def main():
     max_moves = []
     labels = []
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
+    
+    dataset_iter = range(7)
+    if use_tqdm and tqdm is not None:
+        dataset_iter = tqdm(dataset_iter, desc="Datasets", leave=True)
 
     for i in range(7):
         diff_centers, failed_frames, nframes = process_dataset(args.h5[i], args.center[i])
