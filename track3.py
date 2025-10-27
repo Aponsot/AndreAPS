@@ -205,10 +205,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
                    outlier_sigma=OUTLIER_SIGMA, nframes_limit=MAX_FRAMES):
     """
     Track peak across up to nframes_limit frames with adaptive constraints.
-    Skips frames with jumps exceeding skip_jump_threshold.
-    Applies outlier removal at the end.
-    NO smoothing or interpolation - preserve raw solidification dynamics.
-    Returns diff_centers, failed_frames, skipped_frames, nframes.
+    Returns diff_centers, fwhms, failed_frames, skipped_frames, nframes.
     """
     # Load data once
     with h5py.File(h5_path, "r") as f:
@@ -229,6 +226,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
         print(f"{desc}: seed MAD={seed_mad:.5f}, using max_jump={max_jump:.4f} (processing {nframes} frames)")
 
     centers = np.full(nframes, np.nan)
+    fwhms = np.full(nframes, np.nan)  # Track FWHM
     failed_frames = []
     skipped_frames = []
     center_prev = baseline_center
@@ -243,6 +241,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
     for frame in iterator:
         res = fit_single_peak(x, I, frame, center_prev, window=window)
         c = res["center"]
+        fwhm = res["fwhm"]  # Extract FWHM
         ok = res["ok"]
 
         # Check total movement from baseline (hard cap)
@@ -251,6 +250,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
             if total_movement > max_total_movement:
                 skipped_frames.append(frame)
                 centers[frame] = np.nan
+                fwhms[frame] = np.nan
                 if show_progress and len(skipped_frames) <= 10:
                     print(f"{desc}: Skipping frame {frame}, total movement={total_movement:.5f} > {max_total_movement:.5f}")
                 continue
@@ -263,6 +263,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
             if jump > skip_jump_threshold:
                 skipped_frames.append(frame)
                 centers[frame] = np.nan
+                fwhms[frame] = np.nan
                 if show_progress and len(skipped_frames) <= 10:
                     print(f"{desc}: Skipping frame {frame}, jump={jump:.5f} > {skip_jump_threshold:.5f}")
                 continue
@@ -276,13 +277,14 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
                 
                 # Accept expanded window fit if it's better
                 if jump2 <= 1.5 * max_jump:
-                    c, ok = c2, res2["ok"]
+                    c, fwhm, ok = c2, res2["fwhm"], res2["ok"]
                 # Otherwise only reject if jump is REALLY extreme (>3x limit)
                 elif jump > 3 * max_jump:
                     c = center_prev
                     ok = False
 
         centers[frame] = c
+        fwhms[frame] = fwhm  # Store FWHM
         center_prev = c if np.isfinite(c) else center_prev
         consec_fail = 0 if ok else consec_fail + 1
         
@@ -297,11 +299,15 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
     baseline = np.nanmedian(early) if np.any(np.isfinite(early)) else baseline_center
     diff_centers = centers - baseline
 
-    # Apply outlier filter
+    # Apply outlier filter to centers
     diff_centers, n_outliers = filter_outliers(diff_centers, threshold_sigma=outlier_sigma, 
                                                desc=desc, show_progress=show_progress)
+    
+    # Apply same outlier mask to FWHM
+    outlier_mask = ~np.isfinite(diff_centers) & np.isfinite(fwhms)
+    fwhms[outlier_mask] = np.nan
 
-    return diff_centers, failed_frames, skipped_frames, nframes
+    return diff_centers, fwhms, failed_frames, skipped_frames, nframes
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets.")
@@ -331,6 +337,10 @@ def main():
 
     max_moves = []
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
+    
+    # Create two figures
+    fig1, ax1 = plt.subplots(figsize=(6.5, 4.8))
+    fig2, ax2 = plt.subplots(figsize=(6.5, 4.8))
 
     dataset_iter = range(7)
     if show_progress and tqdm is not None:
@@ -338,19 +348,22 @@ def main():
 
     for i in dataset_iter:
         desc = f"DS{i}"
-        diff_centers, failed_frames, skipped_frames, nframes = process_dataset(
+        diff_centers, fwhms, failed_frames, skipped_frames, nframes = process_dataset(
             args.h5[i], args.center[i], desc, show_progress, args.skip_jump,
             args.max_movement, args.outlier_sigma
         )
         
         frames = np.arange(nframes)
         
-        # Only plot non-skipped frames
+        # Plot 1: Peak position differential
         valid_mask = np.isfinite(diff_centers)
-        plt.scatter(frames[valid_mask], diff_centers[valid_mask], 
+        ax1.scatter(frames[valid_mask], diff_centers[valid_mask], 
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
-        plt.xlim(0, 200) 
-        plt.ylim(-0.2, 0.025)
+        
+        # Plot 2: FWHM
+        valid_fwhm = np.isfinite(fwhms)
+        ax2.scatter(frames[valid_fwhm], fwhms[valid_fwhm],
+                   label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
         
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
@@ -361,11 +374,23 @@ def main():
             if skipped_frames:
                 print(f"Dataset {i}: {len(skipped_frames)} frames skipped due to jumps > {args.skip_jump}")
 
-    plt.xlabel("Frame")
-    plt.ylabel("Peak Center Differential q Movement (1/Å)")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
+    # Configure Plot 1: Position
+    ax1.set_xlim(0, 200)
+    ax1.set_ylim(-0.2, 0.025)
+    ax1.set_xlabel("Frame")
+    ax1.set_ylabel("Peak Center Differential q Movement (1/Å)")
+    ax1.grid(True)
+    ax1.legend()
+    fig1.tight_layout()
+    
+    # Configure Plot 2: FWHM
+    ax2.set_xlim(0, 200)
+    ax2.set_xlabel("Frame")
+    ax2.set_ylabel("FWHM (1/Å)")
+    ax2.grid(True)
+    ax2.legend()
+    fig2.tight_layout()
+    
     plt.show()
 
     print("\nMax absolute peak movement per dataset:")
