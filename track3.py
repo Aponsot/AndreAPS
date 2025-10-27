@@ -15,6 +15,7 @@ except ImportError:
 WINDOW = 0.30
 MAX_JUMP = 0.08           # default max jump
 MAX_JUMP_STRICT = 0.05    # stricter limit for noisy datasets
+FRAME_SKIP_JUMP = 0.08    # jump threshold to skip entire frame
 CENTER_TOL = 0.04
 SEED_FRAMES = 30
 MIN_POINTS = 5
@@ -152,11 +153,12 @@ def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, s
     # Return baseline and variance metric (MAD)
     return baseline, mad
 
-def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
+def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, skip_jump_threshold=FRAME_SKIP_JUMP):
     """
     Track peak across all frames with adaptive constraints.
+    Skips frames with jumps exceeding skip_jump_threshold.
     NO smoothing or interpolation - preserve raw solidification dynamics.
-    Returns diff_centers, failed_frames, nframes.
+    Returns diff_centers, failed_frames, skipped_frames, nframes.
     """
     # Load data once
     with h5py.File(h5_path, "r") as f:
@@ -177,6 +179,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
 
     centers = np.full(nframes, np.nan)
     failed_frames = []
+    skipped_frames = []  # NEW: track skipped frames
     center_prev = baseline_center
     window = WINDOW
     consec_fail = 0
@@ -192,8 +195,21 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
         ok = res["ok"]
 
         # Jump control with adaptive limit
+        skip_frame = False  # NEW: flag to skip frame
         if np.isfinite(c) and np.isfinite(center_prev):
             jump = abs(c - center_prev)
+            
+            # NEW: Check if jump exceeds skip threshold
+            if jump > skip_jump_threshold:
+                skip_frame = True
+                skipped_frames.append(frame)
+                # Keep previous center value
+                centers[frame] = np.nan  # Mark as skipped
+                if show_progress and len(skipped_frames) <= 10:  # Limit console spam
+                    print(f"{desc}: Skipping frame {frame}, jump={jump:.5f} > {skip_jump_threshold:.5f}")
+                continue  # Skip to next frame
+            
+            # Existing jump handling for smaller jumps
             if jump > max_jump:
                 # Retry with expanded window
                 res2 = fit_single_peak(x, I, frame, center_prev, window=min(2 * window, 2 * WINDOW))
@@ -223,13 +239,15 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
     baseline = np.nanmedian(early) if np.any(np.isfinite(early)) else baseline_center
     diff_centers = centers - baseline
 
-    return diff_centers, failed_frames, nframes
+    return diff_centers, failed_frames, skipped_frames, nframes
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets.")
     ap.add_argument("--h5", nargs=7, required=True, help="7 HDF5 files")
     ap.add_argument("--center", nargs=7, type=float, required=True, help="Initial peak centers")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars")
+    ap.add_argument("--skip-jump", type=float, default=FRAME_SKIP_JUMP, 
+                    help=f"Skip frames with jumps > this value (default: {FRAME_SKIP_JUMP})")
     args = ap.parse_args()
 
     show_progress = not args.no_progress
@@ -254,19 +272,25 @@ def main():
 
     for i in dataset_iter:
         desc = f"DS{i}"
-        diff_centers, failed_frames, nframes = process_dataset(
-            args.h5[i], args.center[i], desc, show_progress
+        diff_centers, failed_frames, skipped_frames, nframes = process_dataset(
+            args.h5[i], args.center[i], desc, show_progress, args.skip_jump
         )
         
         frames = np.arange(nframes)
-        plt.scatter(frames, diff_centers, label=f"Beam Index {i}", 
-                   s=12, alpha=0.7, marker=markers[i])
+        
+        # Only plot non-skipped frames
+        valid_mask = np.isfinite(diff_centers)
+        plt.scatter(frames[valid_mask], diff_centers[valid_mask], 
+                   label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
 
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
 
-        if failed_frames and show_progress:
-            print(f"Dataset {i}: {len(failed_frames)} low-confidence frames")
+        if show_progress:
+            if failed_frames:
+                print(f"Dataset {i}: {len(failed_frames)} low-confidence frames")
+            if skipped_frames:
+                print(f"Dataset {i}: {len(skipped_frames)} frames skipped due to jumps > {args.skip_jump}")
 
     plt.xlabel("Frame")
     plt.ylabel("Peak Center Differential q Movement (1/Å)")
