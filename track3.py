@@ -282,6 +282,8 @@ def main():
         valid_mask = np.isfinite(diff_centers)
         plt.scatter(frames[valid_mask], diff_centers[valid_mask], 
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
+        plt.xlim(0,200) 
+        
 
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
