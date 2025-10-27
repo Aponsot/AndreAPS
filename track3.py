@@ -14,15 +14,13 @@ except ImportError:
 # --- Tunables ---
 WINDOW = 0.30
 MAX_JUMP = 0.08           # default max jump
-MAX_JUMP_STRICT = 0.04    # stricter limit for noisy datasets
+MAX_JUMP_STRICT = 0.05    # stricter limit for noisy datasets
 CENTER_TOL = 0.04
 SEED_FRAMES = 30
 MIN_POINTS = 5
 SIGMA_MIN_MULT = 0.25
 SIGMA_MAX_FRAC = 1.2
 CONSEC_FAIL_EXPAND = 2
-SMOOTH_WINDOW = 5         # temporal smoothing window (odd number)
-OUTLIER_THRESHOLD = 3.0   # MAD multiplier for outlier detection
 
 # --- Helpers ---
 def robust_sigma(y):
@@ -32,21 +30,6 @@ def robust_sigma(y):
 
 def sigma_to_fwhm(sigma):
     return 2.354820045 * sigma
-
-def median_filter_1d(y, window=5):
-    """Simple median filter for 1D array."""
-    window = int(window)
-    if window % 2 == 0:
-        window += 1
-    if window < 3 or len(y) < window:
-        return y
-    half = window // 2
-    result = np.copy(y)
-    for i in range(len(y)):
-        start = max(0, i - half)
-        end = min(len(y), i + half + 1)
-        result[i] = np.nanmedian(y[start:end])
-    return result
 
 def build_window(x, yfull, center, width):
     """Extract window around center."""
@@ -171,7 +154,8 @@ def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, s
 
 def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
     """
-    Track peak across all frames with adaptive constraints and smoothing.
+    Track peak across all frames with adaptive constraints.
+    NO smoothing or interpolation - preserve raw solidification dynamics.
     Returns diff_centers, failed_frames, nframes.
     """
     # Load data once
@@ -209,14 +193,18 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
 
         # Jump control with adaptive limit
         if np.isfinite(c) and np.isfinite(center_prev):
-            if abs(c - center_prev) > max_jump:
+            jump = abs(c - center_prev)
+            if jump > max_jump:
                 # Retry with expanded window
                 res2 = fit_single_peak(x, I, frame, center_prev, window=min(2 * window, 2 * WINDOW))
                 c2 = res2["center"]
-                if np.isfinite(c2) and abs(c2 - center_prev) <= 1.5 * max_jump:
+                jump2 = abs(c2 - center_prev) if np.isfinite(c2) else np.inf
+                
+                # Accept expanded window fit if it's better
+                if jump2 <= 1.5 * max_jump:
                     c, ok = c2, res2["ok"]
-                else:
-                    # Reject large jump, keep previous center
+                # Otherwise only reject if jump is REALLY extreme (>3x limit)
+                elif jump > 3 * max_jump:
                     c = center_prev
                     ok = False
 
@@ -230,32 +218,10 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
         # Adaptive window
         window = min(2 * window, 2 * WINDOW) if consec_fail >= CONSEC_FAIL_EXPAND else WINDOW
 
-    # Apply temporal smoothing to suppress spurious jumps
-    centers_smooth = median_filter_1d(centers, window=SMOOTH_WINDOW)
-    
-    # Outlier detection and interpolation
-    diff = centers_smooth - baseline_center
-    diff_mad = 1.4826 * np.nanmedian(np.abs(diff - np.nanmedian(diff)))
-    outliers = np.abs(diff - np.nanmedian(diff)) > OUTLIER_THRESHOLD * diff_mad
-    
-    if np.any(outliers):
-        # Interpolate outliers from neighbors
-        valid = ~outliers & np.isfinite(centers_smooth)
-        if np.sum(valid) > 2:
-            valid_idx = np.where(valid)[0]
-            valid_vals = centers_smooth[valid]
-            centers_smooth[outliers] = np.interp(
-                np.where(outliers)[0], 
-                valid_idx, 
-                valid_vals
-            )
-            if show_progress:
-                print(f"{desc}: interpolated {np.sum(outliers)} outlier frames")
-
-    # Robust zeroing
-    early = centers_smooth[:min(SEED_FRAMES, nframes)]
+    # Robust zeroing (no smoothing)
+    early = centers[:min(SEED_FRAMES, nframes)]
     baseline = np.nanmedian(early) if np.any(np.isfinite(early)) else baseline_center
-    diff_centers = centers_smooth - baseline
+    diff_centers = centers - baseline
 
     return diff_centers, failed_frames, nframes
 
