@@ -15,7 +15,9 @@ except ImportError:
 WINDOW = 0.20
 MAX_JUMP = 0.08           # default max jump
 MAX_JUMP_STRICT = 0.05    # stricter limit for noisy datasets
-FRAME_SKIP_JUMP = 0.1   # jump threshold to skip entire frame
+FRAME_SKIP_JUMP = 0.1     # jump threshold to skip entire frame
+MAX_TOTAL_MOVEMENT = 0.4  # hard cap on total movement from baseline
+OUTLIER_SIGMA = 3.0       # sigma threshold for outlier removal
 CENTER_TOL = 0.04
 SEED_FRAMES = 30
 MIN_POINTS = 5
@@ -39,6 +41,50 @@ def build_window(x, yfull, center, width):
     xw, yw = x[m], yfull[m]
     mfin = np.isfinite(xw) & np.isfinite(yw)
     return xw[mfin], yw[mfin]
+
+def filter_outliers(diff_centers, threshold_sigma=3.0, desc=None, show_progress=True):
+    """
+    Remove outliers using robust statistics (MAD-based).
+    
+    Parameters:
+    -----------
+    diff_centers : array
+        Differential center positions
+    threshold_sigma : float
+        Number of sigma for outlier threshold (default: 3.0)
+    desc : str
+        Dataset description for logging
+    show_progress : bool
+        Whether to print removal info
+    
+    Returns:
+    --------
+    diff_centers_filtered : array
+        Data with outliers set to NaN
+    n_outliers : int
+        Number of outliers removed
+    """
+    valid = np.isfinite(diff_centers)
+    if not np.any(valid):
+        return diff_centers, 0
+    
+    # Robust statistics using MAD
+    med = np.nanmedian(diff_centers)
+    mad = 1.4826 * np.nanmedian(np.abs(diff_centers - med))
+    
+    # Identify outliers
+    outlier_mask = np.abs(diff_centers - med) > (threshold_sigma * mad)
+    diff_centers_filtered = diff_centers.copy()
+    diff_centers_filtered[outlier_mask] = np.nan
+    
+    n_outliers = np.sum(outlier_mask)
+    if show_progress and n_outliers > 0:
+        outlier_frames = np.where(outlier_mask)[0]
+        print(f"{desc}: Removed {n_outliers} outlier frames (>{threshold_sigma}σ from median)")
+        if n_outliers <= 5:
+            print(f"  Outlier frames: {outlier_frames.tolist()}")
+    
+    return diff_centers_filtered, n_outliers
 
 def fit_peak_single(xw, yw, seed_center, narrow=True):
     """
@@ -153,10 +199,13 @@ def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, s
     # Return baseline and variance metric (MAD)
     return baseline, mad
 
-def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, skip_jump_threshold=FRAME_SKIP_JUMP):
+def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, 
+                   skip_jump_threshold=FRAME_SKIP_JUMP, max_total_movement=MAX_TOTAL_MOVEMENT,
+                   outlier_sigma=OUTLIER_SIGMA):
     """
     Track peak across all frames with adaptive constraints.
     Skips frames with jumps exceeding skip_jump_threshold.
+    Applies outlier removal at the end.
     NO smoothing or interpolation - preserve raw solidification dynamics.
     Returns diff_centers, failed_frames, skipped_frames, nframes.
     """
@@ -179,7 +228,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, skip_
 
     centers = np.full(nframes, np.nan)
     failed_frames = []
-    skipped_frames = []  # NEW: track skipped frames
+    skipped_frames = []
     center_prev = baseline_center
     window = WINDOW
     consec_fail = 0
@@ -194,20 +243,29 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, skip_
         c = res["center"]
         ok = res["ok"]
 
+        # Check total movement from baseline (hard cap)
+        if np.isfinite(c):
+            total_movement = abs(c - baseline_center)
+            if total_movement > max_total_movement:
+                skipped_frames.append(frame)
+                centers[frame] = np.nan
+                if show_progress and len(skipped_frames) <= 10:
+                    print(f"{desc}: Skipping frame {frame}, total movement={total_movement:.5f} > {max_total_movement:.5f}")
+                continue
+
         # Jump control with adaptive limit
-        skip_frame = False  # NEW: flag to skip frame
+        skip_frame = False
         if np.isfinite(c) and np.isfinite(center_prev):
             jump = abs(c - center_prev)
             
-            # NEW: Check if jump exceeds skip threshold
+            # Check if jump exceeds skip threshold
             if jump > skip_jump_threshold:
                 skip_frame = True
                 skipped_frames.append(frame)
-                # Keep previous center value
-                centers[frame] = np.nan  # Mark as skipped
-                if show_progress and len(skipped_frames) <= 10:  # Limit console spam
+                centers[frame] = np.nan
+                if show_progress and len(skipped_frames) <= 10:
                     print(f"{desc}: Skipping frame {frame}, jump={jump:.5f} > {skip_jump_threshold:.5f}")
-                continue  # Skip to next frame
+                continue
             
             # Existing jump handling for smaller jumps
             if jump > max_jump:
@@ -239,6 +297,10 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, skip_
     baseline = np.nanmedian(early) if np.any(np.isfinite(early)) else baseline_center
     diff_centers = centers - baseline
 
+    # Apply outlier filter
+    diff_centers, n_outliers = filter_outliers(diff_centers, threshold_sigma=outlier_sigma, 
+                                               desc=desc, show_progress=show_progress)
+
     return diff_centers, failed_frames, skipped_frames, nframes
 
 def main():
@@ -248,6 +310,10 @@ def main():
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars")
     ap.add_argument("--skip-jump", type=float, default=FRAME_SKIP_JUMP, 
                     help=f"Skip frames with jumps > this value (default: {FRAME_SKIP_JUMP})")
+    ap.add_argument("--max-movement", type=float, default=MAX_TOTAL_MOVEMENT,
+                    help=f"Maximum total movement from baseline (default: {MAX_TOTAL_MOVEMENT})")
+    ap.add_argument("--outlier-sigma", type=float, default=OUTLIER_SIGMA,
+                    help=f"Sigma threshold for outlier removal (default: {OUTLIER_SIGMA})")
     args = ap.parse_args()
 
     show_progress = not args.no_progress
@@ -273,7 +339,8 @@ def main():
     for i in dataset_iter:
         desc = f"DS{i}"
         diff_centers, failed_frames, skipped_frames, nframes = process_dataset(
-            args.h5[i], args.center[i], desc, show_progress, args.skip_jump
+            args.h5[i], args.center[i], desc, show_progress, args.skip_jump,
+            args.max_movement, args.outlier_sigma
         )
         
         frames = np.arange(nframes)
@@ -282,9 +349,9 @@ def main():
         valid_mask = np.isfinite(diff_centers)
         plt.scatter(frames[valid_mask], diff_centers[valid_mask], 
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
-        plt.xlim(0,200) 
+        plt.xlim(0, 200) 
+        plt.ylim(-0.2, 0.025)
         
-
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
 
