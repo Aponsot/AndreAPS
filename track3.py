@@ -12,7 +12,7 @@ except ImportError:
     tqdm = None
 
 # --- Tunables ---
-WINDOW = 0.30
+WINDOW = 0.20
 MAX_JUMP = 0.08           # default max jump
 MAX_JUMP_STRICT = 0.05    # stricter limit for noisy datasets
 FRAME_SKIP_JUMP = 0.1   # jump threshold to skip entire frame
