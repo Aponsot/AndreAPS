@@ -12,11 +12,11 @@ except ImportError:
     tqdm = None
 
 # --- Tunables ---
-WINDOW = 0.20
+WINDOW = 0.50
 MAX_JUMP = 0.1           # default max jump
 MAX_JUMP_STRICT = 0.1   # stricter limit for noisy datasets
 FRAME_SKIP_JUMP = 0.22     # jump threshold to skip entire frame
-MAX_TOTAL_MOVEMENT = 1  # hard cap on total movement from baseline
+MAX_TOTAL_MOVEMENT = 0.4  # hard cap on total movement from baseline
 OUTLIER_SIGMA = 20     # sigma threshold for outlier removal
 CENTER_TOL = 0.04
 SEED_FRAMES = 30
@@ -350,7 +350,7 @@ def main():
         plt.scatter(frames[valid_mask], diff_centers[valid_mask], 
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
         plt.xlim(0, 200) 
-        plt.ylim(-0.4, 0.4)
+        plt.ylim(-0.2, 0.025)
         
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
