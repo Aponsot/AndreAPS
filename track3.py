@@ -1,8 +1,15 @@
 import argparse
+import sys
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
+
+# Optional progress bar
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 # --- Tunables for leniency during solidification ---
 WINDOW = 0.30             # default fit window width (q or 2θ units)
@@ -173,7 +180,6 @@ def choose_best_fit(xw, yw, seeds):
 
 def fallback_center(xw, yw, seed_center):
     """Fallback center: lean towards the suggested location if data are too weak."""
-    # Use small smoothing, but bias to seed_center if the signal is very weak
     w = max(3, int(len(yw) * 0.05) | 1)
     ysm = moving_average(yw, w) if len(yw) >= 3 else yw
     y0 = ysm - np.median(ysm)
@@ -182,7 +188,7 @@ def fallback_center(xw, yw, seed_center):
         return float(seed_center)
     centroid = float(np.sum(xw * y0) / np.sum(y0))
     # Blend centroid with seed to keep it near suggested location
-    alpha = 0.7  # weight towards seed_center when weak
+    alpha = 0.7
     return float(alpha * seed_center + (1 - alpha) * centroid)
 
 def fit_single_peak_data(x, I, frame, center_guess, window=WINDOW):
@@ -218,32 +224,53 @@ def fit_single_peak_data(x, I, frame, center_guess, window=WINDOW):
 
     return {"center": center_fit, "fwhm": fwhm_fit, "amplitude": amplitude_fit, "ok": ok}
 
-def robust_initial_center_data(x, I, initial_guess, nframes=SEED_FRAMES):
+def robust_initial_center_data(x, I, initial_guess, nframes=SEED_FRAMES, progress_desc=None, use_tqdm=True):
     """
     Determine robust baseline center using the first nframes with outlier rejection.
+    Shows a small progress indicator during seeding.
     """
     navail = min(nframes, I.shape[0])
     centers = []
-    for frame in range(navail):
-        res = fit_single_peak_data(x, I, frame, initial_guess)
-        centers.append(res["center"])  # always has a value
+
+    # Progress for seeding
+    iterator = range(navail)
+    if use_tqdm and tqdm is not None:
+        iterator = tqdm(iterator, desc=f"{progress_desc}: seeding", leave=False)
+        for frame in iterator:
+            res = fit_single_peak_data(x, I, frame, initial_guess)
+            centers.append(res["center"])
+    else:
+        next_pct = 0.0
+        for frame in iterator:
+            res = fit_single_peak_data(x, I, frame, initial_guess)
+            centers.append(res["center"])
+            # Lightweight percentage prints
+            pct = (frame + 1) / navail if navail > 0 else 1.0
+            if pct >= next_pct:
+                print(f"{progress_desc}: seeding {int(pct * 100)}%", end="\r", file=sys.stdout, flush=True)
+                next_pct += 0.2  # update every 20%
+        if navail > 0:
+            print(f"{progress_desc}: seeding 100%".ljust(40), file=sys.stdout)
+
     centers = np.array(centers, float)
     med = np.nanmedian(centers)
     mad = 1.4826 * np.nanmedian(np.abs(centers - med))
     good = np.abs(centers - med) <= (3 * mad if mad > 0 else np.inf)
     return float(np.nanmedian(centers[good])) if np.any(good) else float(med)
 
-def process_dataset(h5_path, initial_guess):
+def process_dataset(h5_path, initial_guess, progress_desc=None, use_tqdm=True):
     """
     Track peak center across all frames with sequential re-centering and robust zeroing.
     Returns diff_centers, failed_frames, nframes.
+    Shows per-frame progress.
     """
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
         I = f["int"][:]
     nframes = I.shape[0]
 
-    baseline_center = robust_initial_center_data(x, I, initial_guess, SEED_FRAMES)
+    baseline_center = robust_initial_center_data(x, I, initial_guess, SEED_FRAMES,
+                                                progress_desc=progress_desc, use_tqdm=use_tqdm)
 
     centers = np.full(nframes, np.nan, dtype=float)
     failed_frames = []
@@ -251,7 +278,15 @@ def process_dataset(h5_path, initial_guess):
     window = WINDOW
     consec_fail = 0
 
-    for frame in range(nframes):
+    # Progress for frame tracking
+    iterator = range(nframes)
+    if use_tqdm and tqdm is not None:
+        iterator = tqdm(iterator, desc=f"{progress_desc}: tracking", leave=False)
+
+    if not (use_tqdm and tqdm is not None):
+        next_pct = 0.0
+
+    for frame in iterator:
         res = fit_single_peak_data(x, I, frame, center_prev, window=window)
         c = res["center"]
         ok = res["ok"]
@@ -278,6 +313,15 @@ def process_dataset(h5_path, initial_guess):
         else:
             window = WINDOW
 
+        # Lightweight percentage prints if tqdm is unavailable
+        if not (use_tqdm and tqdm is not None):
+            pct = (frame + 1) / nframes if nframes > 0 else 1.0
+            if pct >= next_pct:
+                print(f"{progress_desc}: tracking {int(pct * 100)}%", end="\r", file=sys.stdout, flush=True)
+                next_pct += 0.1  # update every 10%
+    if not (use_tqdm and tqdm is not None):
+        print(f"{progress_desc}: tracking 100%".ljust(40), file=sys.stdout)
+
     # Robust zeroing against early frames
     early = centers[:min(SEED_FRAMES, nframes)]
     baseline = np.nanmedian(early) if np.any(np.isfinite(early)) else baseline_center
@@ -289,7 +333,10 @@ def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets (Gaussian + linear baseline, lenient).")
     ap.add_argument("--h5", nargs=7, required=True, help="7 HDF5 files with 'q' (or 'tth') and 'int'")
     ap.add_argument("--center", nargs=7, type=float, required=True, help="Initial guess for peak center for each dataset")
+    ap.add_argument("--no-progress", action="store_true", help="Disable progress bars/prints")
     args = ap.parse_args()
+
+    use_tqdm = not args.no_progress
 
     # Plot style
     plt.rcParams.update({
@@ -310,13 +357,17 @@ def main():
     max_moves = []
     labels = []
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
-    
+
+    # Optional overall dataset progress
     dataset_iter = range(7)
     if use_tqdm and tqdm is not None:
         dataset_iter = tqdm(dataset_iter, desc="Datasets", leave=True)
 
-    for i in range(7):
-        diff_centers, failed_frames, nframes = process_dataset(args.h5[i], args.center[i])
+    for i in dataset_iter:
+        label = f"Dataset {i}"
+        diff_centers, failed_frames, nframes = process_dataset(
+            args.h5[i], args.center[i], progress_desc=label, use_tqdm=use_tqdm
+        )
         frames = np.arange(nframes)
         plt.scatter(frames, diff_centers, label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i % len(markers)])
 
