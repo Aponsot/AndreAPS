@@ -17,13 +17,14 @@ MAX_JUMP = 0.1           # default max jump
 MAX_JUMP_STRICT = 0.1   # stricter limit for noisy datasets
 FRAME_SKIP_JUMP = 0.22     # jump threshold to skip entire frame
 MAX_TOTAL_MOVEMENT = 0.4  # hard cap on total movement from baseline
-OUTLIER_SIGMA = 15      # sigma threshold for outlier removal
+OUTLIER_SIGMA = 20     # sigma threshold for outlier removal
 CENTER_TOL = 0.04
 SEED_FRAMES = 30
 MIN_POINTS = 5
 SIGMA_MIN_MULT = 0.25
 SIGMA_MAX_FRAC = 1.2
 CONSEC_FAIL_EXPAND = 2
+MAX_FRAMES = 200
 
 # --- Helpers ---
 def robust_sigma(y):
@@ -201,9 +202,9 @@ def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, s
 
 def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, 
                    skip_jump_threshold=FRAME_SKIP_JUMP, max_total_movement=MAX_TOTAL_MOVEMENT,
-                   outlier_sigma=OUTLIER_SIGMA):
+                   outlier_sigma=OUTLIER_SIGMA, nframes_limit=MAX_FRAMES):
     """
-    Track peak across all frames with adaptive constraints.
+    Track peak across up to nframes_limit frames with adaptive constraints.
     Skips frames with jumps exceeding skip_jump_threshold.
     Applies outlier removal at the end.
     NO smoothing or interpolation - preserve raw solidification dynamics.
@@ -212,19 +213,20 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
     # Load data once
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
-        I = f["int"][:]
-    
-    nframes = I.shape[0]
-    
+        I_full = f["int"][:]
+
+    # Limit to first nframes_limit frames
+    nframes = min(I_full.shape[0], nframes_limit)
+    I = I_full[:nframes]
+
     # Get baseline center and assess dataset noise
     baseline_center, seed_mad = robust_initial_center(x, I, initial_guess, SEED_FRAMES, desc, show_progress)
     
     # Adaptive jump limit: tighten for noisy datasets
-    # If seed MAD is high (>0.01), use stricter jump limit
     max_jump = MAX_JUMP_STRICT if seed_mad > 0.01 else MAX_JUMP
     
     if show_progress:
-        print(f"{desc}: seed MAD={seed_mad:.5f}, using max_jump={max_jump:.4f}")
+        print(f"{desc}: seed MAD={seed_mad:.5f}, using max_jump={max_jump:.4f} (processing {nframes} frames)")
 
     centers = np.full(nframes, np.nan)
     failed_frames = []
@@ -233,7 +235,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
     window = WINDOW
     consec_fail = 0
 
-    # Track all frames
+    # Track limited frames
     iterator = range(nframes)
     if show_progress and tqdm is not None:
         iterator = tqdm(iterator, desc=f"{desc}: track", leave=False)
@@ -254,13 +256,11 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
                 continue
 
         # Jump control with adaptive limit
-        skip_frame = False
         if np.isfinite(c) and np.isfinite(center_prev):
             jump = abs(c - center_prev)
             
             # Check if jump exceeds skip threshold
             if jump > skip_jump_threshold:
-                skip_frame = True
                 skipped_frames.append(frame)
                 centers[frame] = np.nan
                 if show_progress and len(skipped_frames) <= 10:
