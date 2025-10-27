@@ -15,7 +15,7 @@ except ImportError:
 WINDOW = 0.30
 MAX_JUMP = 0.08           # default max jump
 MAX_JUMP_STRICT = 0.05    # stricter limit for noisy datasets
-FRAME_SKIP_JUMP = 0.08    # jump threshold to skip entire frame
+FRAME_SKIP_JUMP = 0.1   # jump threshold to skip entire frame
 CENTER_TOL = 0.04
 SEED_FRAMES = 30
 MIN_POINTS = 5
