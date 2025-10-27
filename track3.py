@@ -13,13 +13,16 @@ except ImportError:
 
 # --- Tunables ---
 WINDOW = 0.30
-MAX_JUMP = 0.08
+MAX_JUMP = 0.08           # default max jump
+MAX_JUMP_STRICT = 0.04    # stricter limit for noisy datasets
 CENTER_TOL = 0.04
 SEED_FRAMES = 30
 MIN_POINTS = 5
 SIGMA_MIN_MULT = 0.25
 SIGMA_MAX_FRAC = 1.2
 CONSEC_FAIL_EXPAND = 2
+SMOOTH_WINDOW = 5         # temporal smoothing window (odd number)
+OUTLIER_THRESHOLD = 3.0   # MAD multiplier for outlier detection
 
 # --- Helpers ---
 def robust_sigma(y):
@@ -29,6 +32,21 @@ def robust_sigma(y):
 
 def sigma_to_fwhm(sigma):
     return 2.354820045 * sigma
+
+def median_filter_1d(y, window=5):
+    """Simple median filter for 1D array."""
+    window = int(window)
+    if window % 2 == 0:
+        window += 1
+    if window < 3 or len(y) < window:
+        return y
+    half = window // 2
+    result = np.copy(y)
+    for i in range(len(y)):
+        start = max(0, i - half)
+        end = min(len(y), i + half + 1)
+        result[i] = np.nanmedian(y[start:end])
+    return result
 
 def build_window(x, yfull, center, width):
     """Extract window around center."""
@@ -105,7 +123,6 @@ def fit_single_peak(x, I, frame, center_guess, window=WINDOW):
 
     # Single seed from smoothed peak location
     if len(yw) >= 5:
-        # Simple 5-point moving average for speed
         kernel = np.ones(5) / 5.0
         ysm = np.convolve(yw, kernel, mode='same')
     else:
@@ -131,7 +148,7 @@ def fit_single_peak(x, I, frame, center_guess, window=WINDOW):
     return {"center": center_fit, "fwhm": fwhm_fit, "amplitude": amplitude_fit, "ok": ok}
 
 def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, show_progress=True):
-    """Determine robust baseline center from early frames."""
+    """Determine robust baseline center from early frames and assess variance."""
     navail = min(nframes, I.shape[0])
     centers = []
 
@@ -147,11 +164,14 @@ def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, s
     med = np.nanmedian(centers)
     mad = 1.4826 * np.nanmedian(np.abs(centers - med))
     good = np.abs(centers - med) <= (3 * mad if mad > 0 else np.inf)
-    return np.nanmedian(centers[good]) if np.any(good) else med
+    baseline = np.nanmedian(centers[good]) if np.any(good) else med
+    
+    # Return baseline and variance metric (MAD)
+    return baseline, mad
 
 def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
     """
-    Track peak across all frames with sequential re-centering.
+    Track peak across all frames with adaptive constraints and smoothing.
     Returns diff_centers, failed_frames, nframes.
     """
     # Load data once
@@ -161,8 +181,15 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
     
     nframes = I.shape[0]
     
-    # Get baseline center
-    baseline_center = robust_initial_center(x, I, initial_guess, SEED_FRAMES, desc, show_progress)
+    # Get baseline center and assess dataset noise
+    baseline_center, seed_mad = robust_initial_center(x, I, initial_guess, SEED_FRAMES, desc, show_progress)
+    
+    # Adaptive jump limit: tighten for noisy datasets
+    # If seed MAD is high (>0.01), use stricter jump limit
+    max_jump = MAX_JUMP_STRICT if seed_mad > 0.01 else MAX_JUMP
+    
+    if show_progress:
+        print(f"{desc}: seed MAD={seed_mad:.5f}, using max_jump={max_jump:.4f}")
 
     centers = np.full(nframes, np.nan)
     failed_frames = []
@@ -180,14 +207,18 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
         c = res["center"]
         ok = res["ok"]
 
-        # Jump control
+        # Jump control with adaptive limit
         if np.isfinite(c) and np.isfinite(center_prev):
-            if abs(c - center_prev) > MAX_JUMP:
+            if abs(c - center_prev) > max_jump:
                 # Retry with expanded window
                 res2 = fit_single_peak(x, I, frame, center_prev, window=min(2 * window, 2 * WINDOW))
                 c2 = res2["center"]
-                if np.isfinite(c2) and abs(c2 - center_prev) <= 1.5 * MAX_JUMP:
+                if np.isfinite(c2) and abs(c2 - center_prev) <= 1.5 * max_jump:
                     c, ok = c2, res2["ok"]
+                else:
+                    # Reject large jump, keep previous center
+                    c = center_prev
+                    ok = False
 
         centers[frame] = c
         center_prev = c if np.isfinite(c) else center_prev
@@ -199,10 +230,32 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True):
         # Adaptive window
         window = min(2 * window, 2 * WINDOW) if consec_fail >= CONSEC_FAIL_EXPAND else WINDOW
 
+    # Apply temporal smoothing to suppress spurious jumps
+    centers_smooth = median_filter_1d(centers, window=SMOOTH_WINDOW)
+    
+    # Outlier detection and interpolation
+    diff = centers_smooth - baseline_center
+    diff_mad = 1.4826 * np.nanmedian(np.abs(diff - np.nanmedian(diff)))
+    outliers = np.abs(diff - np.nanmedian(diff)) > OUTLIER_THRESHOLD * diff_mad
+    
+    if np.any(outliers):
+        # Interpolate outliers from neighbors
+        valid = ~outliers & np.isfinite(centers_smooth)
+        if np.sum(valid) > 2:
+            valid_idx = np.where(valid)[0]
+            valid_vals = centers_smooth[valid]
+            centers_smooth[outliers] = np.interp(
+                np.where(outliers)[0], 
+                valid_idx, 
+                valid_vals
+            )
+            if show_progress:
+                print(f"{desc}: interpolated {np.sum(outliers)} outlier frames")
+
     # Robust zeroing
-    early = centers[:min(SEED_FRAMES, nframes)]
+    early = centers_smooth[:min(SEED_FRAMES, nframes)]
     baseline = np.nanmedian(early) if np.any(np.isfinite(early)) else baseline_center
-    diff_centers = centers - baseline
+    diff_centers = centers_smooth - baseline
 
     return diff_centers, failed_frames, nframes
 
