@@ -4,17 +4,18 @@ import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
 
-# --- Tunables ---
-WINDOW = 0.30            # default fit window width (q or 2θ units)
-MAX_JUMP = 0.03          # max allowed center change per frame (same units as x)
-SEED_FRAMES = 30         # number of early frames to determine baseline center
-MIN_POINTS = 8           # min points required in a window to fit
-SEED_COUNT = 5           # number of seeds around the guess for multi-start
-SEED_SPREAD = 0.4        # fraction of window half-width for seeding offsets
-HEIGHT_SNR_MIN = 3.0     # minimal height-to-noise ratio to accept a fit
-SIGMA_MIN_MULT = 0.5     # min sigma as multiple of mean dx
-SIGMA_MAX_FRAC = 0.5     # max sigma as fraction of window width
-CONSEC_FAIL_EXPAND = 2   # after this many consecutive failures, expand window once
+# --- Tunables for leniency during solidification ---
+WINDOW = 0.30             # default fit window width (q or 2θ units)
+MAX_JUMP = 0.08           # larger allowed center change per frame (same units as x)
+CENTER_TOL = 0.04         # narrow bounds around seed center for first fit attempt
+SEED_FRAMES = 30          # number of early frames to determine baseline center
+MIN_POINTS = 5            # fewer points required to fit (more lenient)
+SEED_COUNT = 5            # multi-start seeds around the guess
+SEED_SPREAD = 0.3         # fraction of window half-width for seeding offsets
+HEIGHT_SNR_MIN = 0.5      # lower minimal height-to-noise threshold (more lenient)
+SIGMA_MIN_MULT = 0.25     # min sigma as multiple of mean dx (allows narrow peaks)
+SIGMA_MAX_FRAC = 1.2      # max sigma as fraction of window width (allows thick peaks)
+CONSEC_FAIL_EXPAND = 2    # after this many consecutive poor fits, expand window once
 
 # --- Helpers ---
 def robust_sigma(y):
@@ -55,23 +56,21 @@ def initial_seeds(xw, yw, center_guess, n=SEED_COUNT, spread=SEED_SPREAD):
     seeds = np.clip(center_guess + offsets, xw[0], xw[-1])
 
     # Add a smoothed argmax as an extra candidate
-    # choose smoothing window about ~5% of points, ensure odd and >=3
     w = max(3, int(len(yw) * 0.05) | 1)  # force odd with | 1
     ysm = moving_average(yw, w) if len(yw) >= 3 else yw
     seed_argmax = xw[np.argmax(ysm)]
     seeds = np.unique(np.r_[seeds, seed_argmax])
     return seeds
 
-def fit_peak_in_window_gauss(xw, yw, seed_center):
+def _make_gauss_linear_model(xw, yw, seed_center, narrow_bounds=True):
     """
-    Fit Gaussian + linear background in a given window.
-    Returns (result, ok_flag).
+    Build and initialize Gaussian + linear background model.
+    If narrow_bounds=True, constrain center tightly around seed_center.
     """
-    # Initial linear baseline via least squares (for robust initial params)
+    # Initial linear baseline via least squares
     try:
         bkg_slope_init, bkg_intercept_init = np.polyfit(xw, yw, 1)
     except Exception:
-        # Fallback if polyfit fails
         bkg_slope_init, bkg_intercept_init = 0.0, float(np.median(yw))
 
     # Detrend for noise estimation
@@ -84,7 +83,7 @@ def fit_peak_in_window_gauss(xw, yw, seed_center):
     max_sigma = max(SIGMA_MAX_FRAC * (xw[-1] - xw[0]), min_sigma * 2.0)
 
     peak_idx = np.abs(xw - seed_center).argmin()
-    height0 = max(yw[peak_idx] - (bkg_slope_init * xw[peak_idx] + bkg_intercept_init), 3 * noise)
+    height0 = max(yw[peak_idx] - (bkg_slope_init * xw[peak_idx] + bkg_intercept_init), HEIGHT_SNR_MIN * noise)
     sigma0 = fwhm_to_sigma((xw[-1] - xw[0]) / 3.0)  # width ~ window/3
     sigma0 = np.clip(sigma0, min_sigma, max_sigma)
     amp0 = max(height0 * sigma0 * np.sqrt(2 * np.pi), noise * sigma0 * np.sqrt(2 * np.pi))
@@ -94,34 +93,65 @@ def fit_peak_in_window_gauss(xw, yw, seed_center):
     model = bkg + gauss
 
     params = model.make_params(
-        bkg_slope=bkg_slope_init,
-        bkg_intercept=bkg_intercept_init,
+        bkg_slope=float(bkg_slope_init),
+        bkg_intercept=float(bkg_intercept_init),
         g_center=float(xw[peak_idx]),
         g_sigma=float(sigma0),
         g_amplitude=float(amp0),
     )
-    params["g_center"].set(min=float(xw[0]), max=float(xw[-1]))
+
+    if narrow_bounds:
+        # Constrain center tightly near the suggested location
+        cmin = float(max(xw[0], seed_center - CENTER_TOL))
+        cmax = float(min(xw[-1], seed_center + CENTER_TOL))
+    else:
+        # Wider bounds within the window
+        cmin = float(xw[0])
+        cmax = float(xw[-1])
+
+    params["g_center"].set(min=cmin, max=cmax)
     params["g_sigma"].set(min=float(min_sigma), max=float(max_sigma))
     params["g_amplitude"].set(min=0.0)
 
+    return model, params, noise, min_sigma, max_sigma
+
+def fit_peak_in_window_gauss(xw, yw, seed_center):
+    """
+    Fit Gaussian + linear background in a given window.
+    Two-stage: try narrow bounds around the suggested center; if poor, widen bounds.
+    Returns (result, ok_flag).
+    """
+    # Stage 1: narrow bounds near seed
+    model, params, noise, min_sigma, max_sigma = _make_gauss_linear_model(xw, yw, seed_center, narrow_bounds=True)
     try:
         result = model.fit(yw, params, x=xw, nan_policy="omit")
     except Exception:
-        return None, False
+        result = None
 
-    # Validate fit: reasonable width and SNR
-    p = result.params
-    amp = p["g_amplitude"].value
-    sig = p["g_sigma"].value
-    ctr = p["g_center"].value
+    ok = False
+    if result is not None:
+        p = result.params
+        sig = p["g_sigma"].value
+        ctr = p["g_center"].value
+        # Lenient acceptance: only require finite center and sensible sigma bounds
+        if np.isfinite(ctr) and np.isfinite(sig) and (min_sigma <= sig <= max_sigma):
+            ok = True
 
-    height_fit = amp / (sig * np.sqrt(2 * np.pi)) if (sig is not None and sig > 0) else 0.0
-    if (not np.isfinite(ctr)
-        or not np.isfinite(sig)
-        or sig < min_sigma
-        or sig > max_sigma
-        or height_fit < HEIGHT_SNR_MIN * noise):
-        return result, False
+    # Stage 2: widen bounds if Stage 1 was not OK
+    if not ok:
+        model2, params2, noise2, min_sigma2, max_sigma2 = _make_gauss_linear_model(xw, yw, seed_center, narrow_bounds=False)
+        try:
+            result2 = model2.fit(yw, params2, x=xw, nan_policy="omit")
+        except Exception:
+            return None, False
+
+        p2 = result2.params
+        sig2 = p2["g_sigma"].value
+        ctr2 = p2["g_center"].value
+        if np.isfinite(ctr2) and np.isfinite(sig2) and (min_sigma2 <= sig2 <= max_sigma2):
+            return result2, True
+        else:
+            return result2, False
 
     return result, True
 
@@ -141,45 +171,50 @@ def choose_best_fit(xw, yw, seeds):
             best_ok = ok
     return best, best_ok
 
-def fallback_center(xw, yw):
-    """Fallback center using smoothed argmax and centroid above median."""
-    # Use a small moving average to denoise
+def fallback_center(xw, yw, seed_center):
+    """Fallback center: lean towards the suggested location if data are too weak."""
+    # Use small smoothing, but bias to seed_center if the signal is very weak
     w = max(3, int(len(yw) * 0.05) | 1)
     ysm = moving_average(yw, w) if len(yw) >= 3 else yw
     y0 = ysm - np.median(ysm)
     y0[y0 < 0] = 0
     if y0.sum() <= 0:
-        return xw[np.argmax(ysm)]
-    return float(np.sum(xw * y0) / np.sum(y0))
+        return float(seed_center)
+    centroid = float(np.sum(xw * y0) / np.sum(y0))
+    # Blend centroid with seed to keep it near suggested location
+    alpha = 0.7  # weight towards seed_center when weak
+    return float(alpha * seed_center + (1 - alpha) * centroid)
 
 def fit_single_peak_data(x, I, frame, center_guess, window=WINDOW):
     """
     Fit a single peak for one frame using Gaussian + linear background.
-    Returns dict with center, fwhm, amplitude, ok flag.
+    Always returns a center (with confidence flag).
     """
     yfull = np.asarray(I[frame], float)
     x = np.asarray(x, float)
 
     xw, yw = build_window(x, yfull, center_guess, window)
     if len(xw) < MIN_POINTS:
-        return {"center": np.nan, "fwhm": np.nan, "amplitude": np.nan, "ok": False}
+        # Too few points; return suggested center with low confidence
+        return {"center": float(center_guess), "fwhm": np.nan, "amplitude": np.nan, "ok": False}
 
     seeds = initial_seeds(xw, yw, center_guess)
     best, ok = choose_best_fit(xw, yw, seeds)
 
-    if best is None or not ok:
+    if best is None:
         # fallback: estimate center and re-try once
-        ctr_fb = fallback_center(xw, yw)
+        ctr_fb = fallback_center(xw, yw, center_guess)
         best, ok = fit_peak_in_window_gauss(xw, yw, ctr_fb)
 
     if best is None:
-        return {"center": np.nan, "fwhm": np.nan, "amplitude": np.nan, "ok": False}
+        # ultimate fallback: report suggested center
+        return {"center": float(center_guess), "fwhm": np.nan, "amplitude": np.nan, "ok": False}
 
     p = best.params
     center_fit = float(p["g_center"].value)
     sigma_fit = float(p["g_sigma"].value)
     amplitude_fit = float(p["g_amplitude"].value)
-    fwhm_fit = sigma_to_fwhm(sigma_fit)
+    fwhm_fit = sigma_to_fwhm(sigma_fit) if np.isfinite(sigma_fit) else np.nan
 
     return {"center": center_fit, "fwhm": fwhm_fit, "amplitude": amplitude_fit, "ok": ok}
 
@@ -191,10 +226,7 @@ def robust_initial_center_data(x, I, initial_guess, nframes=SEED_FRAMES):
     centers = []
     for frame in range(navail):
         res = fit_single_peak_data(x, I, frame, initial_guess)
-        if res["ok"]:
-            centers.append(res["center"])
-    if not centers:
-        return float(initial_guess)
+        centers.append(res["center"])  # always has a value
     centers = np.array(centers, float)
     med = np.nanmedian(centers)
     mad = 1.4826 * np.nanmedian(np.abs(centers - med))
@@ -224,35 +256,29 @@ def process_dataset(h5_path, initial_guess):
         c = res["center"]
         ok = res["ok"]
 
-        if ok and np.isfinite(c) and np.isfinite(center_prev):
+        # Lenient jump control: accept larger shifts, but keep tracking
+        if np.isfinite(c) and np.isfinite(center_prev):
             if abs(c - center_prev) > MAX_JUMP:
-                # Try expanded window and re-fit once
+                # one-time wider bounds window refit around previous center
                 res2 = fit_single_peak_data(x, I, frame, center_prev, window=min(2 * window, 2 * WINDOW))
                 c2 = res2["center"]
-                if res2["ok"] and abs(c2 - center_prev) <= 1.5 * MAX_JUMP:
-                    centers[frame] = c2
-                    center_prev = c2
-                    consec_fail = 0
-                else:
-                    centers[frame] = np.nan
-                    failed_frames.append(frame)
-                    consec_fail += 1
-            else:
-                centers[frame] = c
-                center_prev = c
-                consec_fail = 0
-        else:
-            centers[frame] = np.nan
-            failed_frames.append(frame)
-            consec_fail += 1
+                if np.isfinite(c2) and abs(c2 - center_prev) <= 1.5 * MAX_JUMP:
+                    c = c2
+                    ok = res2["ok"]
 
-        # Adapt window after consecutive failures
+        centers[frame] = c
+        center_prev = c if np.isfinite(c) else center_prev
+        consec_fail = 0 if ok else consec_fail + 1
+        if not ok:
+            failed_frames.append(frame)
+
+        # Adapt window after consecutive lower-confidence fits
         if consec_fail >= CONSEC_FAIL_EXPAND:
             window = min(2 * window, 2 * WINDOW)
         else:
             window = WINDOW
 
-    # Robust zeroing against early successful frames
+    # Robust zeroing against early frames
     early = centers[:min(SEED_FRAMES, nframes)]
     baseline = np.nanmedian(early) if np.any(np.isfinite(early)) else baseline_center
     diff_centers = centers - baseline
@@ -260,7 +286,7 @@ def process_dataset(h5_path, initial_guess):
     return diff_centers, failed_frames, nframes
 
 def main():
-    ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets (Gaussian + linear baseline).")
+    ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets (Gaussian + linear baseline, lenient).")
     ap.add_argument("--h5", nargs=7, required=True, help="7 HDF5 files with 'q' (or 'tth') and 'int'")
     ap.add_argument("--center", nargs=7, type=float, required=True, help="Initial guess for peak center for each dataset")
     args = ap.parse_args()
@@ -295,10 +321,9 @@ def main():
         labels.append(f"Beam Index {i}")
 
         if failed_frames:
-            print(f"Warning: Peak fitting failed for frames in dataset {i}: {failed_frames}")
+            print(f"Note: Lower-confidence fits in dataset {i} at frames: {failed_frames}")
 
     plt.xlabel("Frame")
-    # If you prefer inverted y-range like before, use plt.ylim(-0.14, 0.0)
     plt.ylabel("Peak Center Differential q Movement (1/Å)")
     plt.grid(True)
     plt.legend(fontsize=12)
