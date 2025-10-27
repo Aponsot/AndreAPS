@@ -13,7 +13,7 @@ except ImportError:
 
 # --- Tunables ---
 WINDOW = 0.20
-MAX_JUMP = 0.08           # default max jump
+MAX_JUMP = 0.1           # default max jump
 MAX_JUMP_STRICT = 0.1   # stricter limit for noisy datasets
 FRAME_SKIP_JUMP = 0.22     # jump threshold to skip entire frame
 MAX_TOTAL_MOVEMENT = 0.4  # hard cap on total movement from baseline
