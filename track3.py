@@ -28,7 +28,24 @@ MAX_FRAMES = 200
 h = 2 
 k = 0 
 l = 0
+# thermal expansion polynomial  (Δa/a0 = c0 + c1 T + c2 T^2 + c3 T^3)
+C0 = -0.358
+C1 = 9.472e-3
+C2 = 1.031e-6
+C3 = -2.978e-10       # all units consistent with T in kelvin
 # --- Helpers ---
+def T_from_delta(delta):
+    """
+    Solve C3*T^3 + C2*T^2 + C1*T + (C0 - delta) = 0  for T (K).
+    Returns the real root in the range 0–4000 K or np.nan if none.
+    """
+    import numpy as np
+    coeffs = [C3, C2, C1, C0 - delta]      # highest power first -> np.roots
+    roots = np.roots(coeffs)
+    # keep real roots within a reasonable range
+    real = roots[np.isreal(roots)].real
+    good = real[(real > 0) & (real < 4000)]
+    return good[0] if good.size else np.nan
 def robust_sigma(y):
     """Fast robust noise estimator."""
     med = np.median(y)
@@ -345,6 +362,7 @@ def main():
     fig1, ax1 = plt.subplots(figsize=(6.5, 4.8))
     fig2, ax2 = plt.subplots(figsize=(6.5, 4.8))
     fig3, ax3 = plt.subplots(figsize=(6.5, 4.8))
+    fig4, ax4 = plt.subplots(figsize=(6.5, 4.8))
 
     dataset_iter = range(7)
     if show_progress and tqdm is not None:
@@ -365,6 +383,17 @@ def main():
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
         a = 2*pi / diff_centers[valid_mask] * (sqrt(h**2 +k**+ l**2))# Example calculation (replace h,k,l as needed)
         
+        # Δa/a0 for this dataset
+        delta_a_over_a0 = (a - a_0)/ a_0           
+
+        T_frame = np.vectorize(T_from_delta)(delta_a_over_a0)
+
+# third panel you already made: Δa/a0
+# ---- NEW fourth panel: Temperature vs frame ----  
+        valid_T = np.isfinite(T_frame)
+        ax4.scatter(frames[valid_T], T_frame[valid_T],
+            s=12, alpha=0.7, marker=markers[i],
+            label=f"Beam {i}")
         # Plot 2: FWHM
         valid_fwhm = np.isfinite(fwhms)
         ax2.scatter(frames[valid_fwhm], fwhms[valid_fwhm],
@@ -403,6 +432,14 @@ def main():
     ax3.grid(True)
     ax3.legend()
     fig3.tight_layout()
+    
+    ax4.set_xlim(0, 200)
+    ax4.set_xlabel("Frame")
+    ax4.set_ylabel("Temperature (K)")
+    ax4.grid(True)
+    ax4.legend()
+    fig4.tight_layout()
+
     
     plt.show()
 
