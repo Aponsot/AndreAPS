@@ -4,7 +4,7 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
-
+from math import pi, sqrt
 # Optional progress bar
 try:
     from tqdm.auto import tqdm
@@ -25,7 +25,9 @@ SIGMA_MIN_MULT = 0.25
 SIGMA_MAX_FRAC = 1.2
 CONSEC_FAIL_EXPAND = 2
 MAX_FRAMES = 200
-
+h = 2 
+k = 0 
+l = 0
 # --- Helpers ---
 def robust_sigma(y):
     """Fast robust noise estimator."""
@@ -196,9 +198,9 @@ def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, s
     mad = 1.4826 * np.nanmedian(np.abs(centers - med))
     good = np.abs(centers - med) <= (3 * mad if mad > 0 else np.inf)
     baseline = np.nanmedian(centers[good]) if np.any(good) else med
-    
+    a_0 = 2*pi / baseline * (sqrt(h**2 +k**2 + l**2))
     # Return baseline and variance metric (MAD)
-    return baseline, mad
+    return baseline, mad, a_0
 
 def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, 
                    skip_jump_threshold=FRAME_SKIP_JUMP, max_total_movement=MAX_TOTAL_MOVEMENT,
@@ -217,7 +219,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
     I = I_full[:nframes]
 
     # Get baseline center and assess dataset noise
-    baseline_center, seed_mad = robust_initial_center(x, I, initial_guess, SEED_FRAMES, desc, show_progress)
+    baseline_center, seed_mad , a_0 = robust_initial_center(x, I, initial_guess, SEED_FRAMES, desc, show_progress)
     
     # Adaptive jump limit: tighten for noisy datasets
     max_jump = MAX_JUMP_STRICT if seed_mad > 0.01 else MAX_JUMP
@@ -307,7 +309,7 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
     outlier_mask = ~np.isfinite(diff_centers) & np.isfinite(fwhms)
     fwhms[outlier_mask] = np.nan
 
-    return diff_centers, fwhms, failed_frames, skipped_frames, nframes
+    return diff_centers, fwhms, failed_frames, skipped_frames, nframes, a_0
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets.")
@@ -336,11 +338,13 @@ def main():
     })
 
     max_moves = []
+
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
     
     # Create two figures
     fig1, ax1 = plt.subplots(figsize=(6.5, 4.8))
     fig2, ax2 = plt.subplots(figsize=(6.5, 4.8))
+    fig3, ax3 = plt.subplots(figsize=(6.5, 4.8))
 
     dataset_iter = range(7)
     if show_progress and tqdm is not None:
@@ -348,7 +352,7 @@ def main():
 
     for i in dataset_iter:
         desc = f"DS{i}"
-        diff_centers, fwhms, failed_frames, skipped_frames, nframes = process_dataset(
+        diff_centers, fwhms, failed_frames, skipped_frames, nframes, a_0 = process_dataset(
             args.h5[i], args.center[i], desc, show_progress, args.skip_jump,
             args.max_movement, args.outlier_sigma
         )
@@ -359,12 +363,14 @@ def main():
         valid_mask = np.isfinite(diff_centers)
         ax1.scatter(frames[valid_mask], diff_centers[valid_mask], 
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
+        a = 2*pi / diff_centers[valid_mask] * (sqrt(h**2 +k**+ l**2))# Example calculation (replace h,k,l as needed)
         
         # Plot 2: FWHM
         valid_fwhm = np.isfinite(fwhms)
         ax2.scatter(frames[valid_fwhm], fwhms[valid_fwhm],
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
-        
+        ax3.scatter(frames[valid_mask], a/a_0, label=f"Beam Index {i} (a)", s=12, alpha=0.7, marker=markers[i])
+
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
 
@@ -390,6 +396,13 @@ def main():
     ax2.grid(True)
     ax2.legend()
     fig2.tight_layout()
+
+    ax3.set_xlim(0, 200)
+    ax3.set_xlabel("Frame")
+    ax3.set_ylabel("lattice parameter a (Å) shift")
+    ax3.grid(True)
+    ax3.legend()
+    fig3.tight_layout()
     
     plt.show()
 
