@@ -28,11 +28,11 @@ MAX_FRAMES = 200
 h = 2 
 k = 0 
 l = 0
-# thermal expansion polynomial  (Δa/a0 = c0 + c1 T + c2 T^2 + c3 T^3)
-C0 = -0.358
-C1 = 9.472e-3
-C2 = 1.031e-6
-C3 = -2.978e-10       # all units consistent with T in kelvin
+# thermal expansion polynomial 
+C0 = -0.358/100
+C1 = 9.472e-3/100
+C2 = 1.031e-6/100
+C3 = -2.978e-10 /100  
 # --- Helpers ---
 def T_from_delta(delta):
     """
