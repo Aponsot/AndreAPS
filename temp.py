@@ -187,7 +187,7 @@ def main():
         q_valid = centers[valid]
         a = (2.0 * pi / q_valid) * G_norm
         delta = (a - a0) / a0  # fractional Δa/a0 (should start near ~0)
-
+        print(f"calculated a0={a0:.5f} Å for DS{i}")
         # Temperature via linear CTE
         alpha_i = alphas[i]
         T_frame = T_from_delta_linear(delta, alpha_i, args.Tref)
@@ -213,6 +213,7 @@ def main():
         if np.isfinite(dmax):
             Tmax_est = args.Tref + dmax / alpha_i
             print(f"DS{i}: With α={alpha_i:.3e} 1/K, estimated Tmax≈{Tmax_est:.1f} K")
+        
 
     # Configure axes
     ax_q.set_xlabel("Frame");   ax_q.set_ylabel("Peak center q (1/Å)"); ax_q.grid(True);   ax_q.legend()
