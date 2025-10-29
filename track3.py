@@ -330,8 +330,10 @@ def process_dataset(h5_path, initial_guess, desc=None, show_progress=True,
 
 def main():
     ap = argparse.ArgumentParser(description="Track peak movement for 7 datasets.")
-    ap.add_argument("--h5", nargs=7, required=True, help="7 HDF5 files")
-    ap.add_argument("--center", nargs=7, type=float, required=True, help="Initial peak centers")
+    ap.add_argument("--h5",     nargs='+', required=True,
+                help="HDF5 files (one per beam)")
+    ap.add_argument("--center", nargs='+', type=float, required=True,
+                help="Initial peak centres")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars")
     ap.add_argument("--skip-jump", type=float, default=FRAME_SKIP_JUMP, 
                     help=f"Skip frames with jumps > this value (default: {FRAME_SKIP_JUMP})")
@@ -381,15 +383,14 @@ def main():
         valid_mask = np.isfinite(diff_centers)
         ax1.scatter(frames[valid_mask], diff_centers[valid_mask], 
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
-        a = 2*pi / diff_centers[valid_mask] * (sqrt(h**2 +k**+ l**2))# Example calculation (replace h,k,l as needed)
-        
-        # Δa/a0 for this dataset
-        delta_a_over_a0 = (a - a_0)/ a_0           
+        G_norm = sqrt(h**2 + k**2 + l**2) 
+        q0 = (2 * pi / a_0) * G_norm
+        q_valid = q0 + diff_centers[valid_mask]
+        a = (2 * pi / q_valid) * G_norm
+        delta_a_over_a0 = (a - a_0) / a_0
 
+# Temperature per frame
         T_frame = np.vectorize(T_from_delta)(delta_a_over_a0)
-
-# third panel you already made: Δa/a0
-# ---- NEW fourth panel: Temperature vs frame ----  
         valid_T = np.isfinite(T_frame)
         ax4.scatter(frames[valid_T], T_frame[valid_T],
             s=12, alpha=0.7, marker=markers[i],
@@ -399,10 +400,6 @@ def main():
         ax2.scatter(frames[valid_fwhm], fwhms[valid_fwhm],
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
         ax3.scatter(frames[valid_mask], a/a_0, label=f"Beam Index {i} (a)", s=12, alpha=0.7, marker=markers[i])
-        valid_T = np.isfinite(T_frame)
-        ax4.scatter(frames[valid_T], T_frame[valid_T],
-            s=12, alpha=0.7, marker=markers[i],
-            label=f"Beam {i}")
 
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
@@ -430,12 +427,14 @@ def main():
     ax2.legend()
     fig2.tight_layout()
 
+    ax3.set_xlim(0,200)
     ax3.set_xlabel("Frame")
     ax3.set_ylabel("lattice parameter a (Å) shift")
     ax3.grid(True)
     ax3.legend()
     fig3.tight_layout()
     
+    ax4.set_xlim(0, 200)
     ax4.set_xlabel("Frame")
     ax4.set_ylabel("Temperature (K)")
     ax4.grid(True)
