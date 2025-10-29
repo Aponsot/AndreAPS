@@ -22,7 +22,7 @@ h, k, l = 2, 0, 0
 # Thermal expansion polynomial (fractional units)
 # Δa/a0 = C0 + C1*T + C2*T^2 + C3*T^3
 C0 = -0.358 / 100.0
-C1 =  9.472e-3 / 100.0
+C1 =  9.472e-4 / 100.0
 C2 =  1.031e-6 / 100.0
 C3 = -2.978e-10 / 100.0
 
