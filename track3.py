@@ -433,7 +433,6 @@ def main():
     ax3.legend()
     fig3.tight_layout()
     
-    ax4.set_xlim(0, 200)
     ax4.set_xlabel("Frame")
     ax4.set_ylabel("Temperature (K)")
     ax4.grid(True)
