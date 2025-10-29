@@ -426,7 +426,6 @@ def main():
     ax2.legend()
     fig2.tight_layout()
 
-    ax3.set_xlim(0, 200)
     ax3.set_xlabel("Frame")
     ax3.set_ylabel("lattice parameter a (Å) shift")
     ax3.grid(True)
