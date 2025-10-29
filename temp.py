@@ -25,9 +25,42 @@ C0 = -0.358
 C1 = 9.472e-3 
 C2 = 1.031e-6
 C3 = -2.978e-10
-
+T_REF=300.0 # Anchor temperature in Kelvin
 # Anchor (reference) temperature in Kelvin
-T_REF = 300.0
+def f_poly(T):
+    return C0 + C1*T + C2*T**2 + C3*T**3  # fractional Δa/a0
+
+def r_T(T):
+    return 1.0 + f_poly(T)               # lattice ratio vs implicit reference
+
+def T_from_delta_poly_lookup(delta_array, T_ref=T_REF, Tmin=1.0, Tmax=3000.0, npts=6000):
+    """
+    Robust inversion via monotonic lookup:
+    Solve r(T) = (1 + delta) * r(T_ref) by interpolating T(r).
+    Returns array of temperatures in K (np.nan if target out of range).
+    """
+    # Build grid
+    Tgrid = np.linspace(Tmin, Tmax, npts)
+    rgrid = r_T(Tgrid)
+    r_ref = r_T(T_ref)
+
+    # Ensure monotonicity for interpolation
+    if not np.all(np.diff(rgrid) > 0):
+        idx = np.argsort(rgrid)
+        rgrid_sorted = rgrid[idx]
+        Tgrid_sorted = Tgrid[idx]
+    else:
+        rgrid_sorted = rgrid
+        Tgrid_sorted = Tgrid
+
+    target = (1.0 + np.asarray(delta_array)) * r_ref
+    Tmin_r, Tmax_r = rgrid_sorted[0], rgrid_sorted[-1]
+
+    T_out = np.full_like(target, np.nan, dtype=float)
+    m = (target >= Tmin_r) & (target <= Tmax_r)
+    # Interpolate T for valid targets
+    T_out[m] = np.interp(target[m], rgrid_sorted, Tgrid_sorted)
+    return T_out
 
 # --- Helpers ---
 def robust_sigma(y):
@@ -202,13 +235,12 @@ def main():
         G_norm = sqrt(h**2 + k**2 + l**2)
         q_valid = centers[valid]
         a = (2.0 * pi / q_valid) * G_norm
-        delta = (a - a0) / a0  # fractional Δa/a0
+        delta = (a - a0) / a0  # fractional Δa/a0 (should start near ~0)
 
-        # Temperature from polynomial (anchored to T_REF)
-        T_frame_K = np.array([T_from_delta_poly_anchored(d, T_REF) for d in delta])
+# Temperature from polynomial via lookup (anchored to T_REF)
+        T_frame_K = T_from_delta_poly_lookup(delta, T_ref=T_REF)
         T_frame_C = T_frame_K - 273.15
         valid_T = np.isfinite(T_frame_C)
-
         # Plots
         v_fwhm = np.isfinite(fwhms)
         ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
