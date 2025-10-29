@@ -21,47 +21,51 @@ h, k, l = 2, 0, 0
 
 # Thermal expansion polynomial (fractional units)
 # Δa/a0 = C0 + C1*T + C2*T^2 + C3*T^3
-C0 = -0.358 /100
-C1 = 9.472e-3 /100
-C2 = 1.031e-6/100
-C3 = -2.978e-10/100
-T_REF=300.0 # Anchor temperature in Kelvin
-# Anchor (reference) temperature in Kelvin
-def f_poly(T):
-    return C0 + C1*T + C2*T**2 + C3*T**3  # fractional Δa/a0
+C0 = -0.358 / 100.0
+C1 =  9.472e-3 / 100.0
+C2 =  1.031e-6 / 100.0
+C3 = -2.978e-10 / 100.0
 
-def r_T(T):
-    return 1.0 + f_poly(T)               # lattice ratio vs implicit reference
+# Reference temperature (Kelvin) for anchoring (set to your baseline)
+T_REF_K = 300.0
 
-def T_from_delta_poly_lookup(delta_array, T_ref=T_REF, Tmin=1.0, Tmax=3000.0, npts=6000):
+def f_poly_C(Tc):
+    """Raw polynomial (fractional) with Tc in °C."""
+    return C0 + C1*Tc + C2*(Tc**2) + C3*(Tc**3)
+
+def f_rel_K(T_K, Tref_K=T_REF_K):
+    """Fractional expansion relative to Kelvin reference."""
+    Tc     = T_K     - 273.15
+    Tc_ref = Tref_K  - 273.15
+    return f_poly_C(Tc) - f_poly_C(Tc_ref)
+
+def r_T_K(T_K, Tref_K=T_REF_K):
+    """Lattice ratio r(T) = 1 + f_rel(T). r(Tref)=1 by construction."""
+    return 1.0 + f_rel_K(T_K, Tref_K)
+
+def T_from_delta_poly_lookup_K(delta_array, Tref_K=T_REF_K, Tmin_K=250.0, Tmax_K=3000.0, npts=7501):
     """
-    Robust inversion via monotonic lookup:
-    Solve r(T) = (1 + delta) * r(T_ref) by interpolating T(r).
-    Returns array of temperatures in K (np.nan if target out of range).
+    Robust inversion in Kelvin:
+    Solve r(T_K) = (1 + delta), since r(Tref_K)=1.
+    Returns temperatures in Kelvin (NaN if target out of range).
     """
-    # Build grid
-    Tgrid = np.linspace(Tmin, Tmax, npts)
-    rgrid = r_T(Tgrid)
-    r_ref = r_T(T_ref)
+    Tgrid = np.linspace(Tmin_K, Tmax_K, npts)
+    rgrid = r_T_K(Tgrid, Tref_K)
 
-    # Ensure monotonicity for interpolation
+    # enforce monotonic for interp
     if not np.all(np.diff(rgrid) > 0):
         idx = np.argsort(rgrid)
-        rgrid_sorted = rgrid[idx]
-        Tgrid_sorted = Tgrid[idx]
+        r_sorted = rgrid[idx]
+        T_sorted = Tgrid[idx]
     else:
-        rgrid_sorted = rgrid
-        Tgrid_sorted = Tgrid
+        r_sorted = rgrid
+        T_sorted = Tgrid
 
-    target = (1.0 + np.asarray(delta_array)) * r_ref
-    Tmin_r, Tmax_r = rgrid_sorted[0], rgrid_sorted[-1]
-
+    target = 1.0 + np.asarray(delta_array, dtype=float)
     T_out = np.full_like(target, np.nan, dtype=float)
-    m = (target >= Tmin_r) & (target <= Tmax_r)
-    # Interpolate T for valid targets
-    T_out[m] = np.interp(target[m], rgrid_sorted, Tgrid_sorted)
+    m = (target >= r_sorted[0]) & (target <= r_sorted[-1])
+    T_out[m] = np.interp(target[m], r_sorted, T_sorted)
     return T_out
-
 # --- Helpers ---
 def robust_sigma(y):
     med = np.median(y)
@@ -181,7 +185,7 @@ def r_T(T):
     # lattice ratio r(T) = 1 + f(T)
     return 1.0 + f_poly(T)
 
-def T_from_delta_poly_anchored(delta, T_ref=T_REF):
+def T_from_delta_poly_anchored(delta, T_ref=T_REF_K):
     """
     Anchored inversion: r(T) = (1 + delta) * r(T_ref)
     Solve C3*T^3 + C2*T^2 + C1*T + (1 + C0 - target) = 0,
@@ -238,18 +242,17 @@ def main():
         delta = (a - a0) / a0  # fractional Δa/a0 (should start near ~0)
 
 # Temperature from polynomial via lookup (anchored to T_REF)
-        T_frame_K = T_from_delta_poly_lookup(delta, T_ref=T_REF)
+        T_frame_K = T_from_delta_poly_lookup_K(delta, Tref_K=T_REF_K)
         T_frame_C = T_frame_K - 273.15
         valid_T = np.isfinite(T_frame_C)
-        # Plots
+
+        ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.7,
+             marker=markers[i % len(markers)], label=f"DS{i}")
         v_fwhm = np.isfinite(fwhms)
         ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
                         marker=markers[i % len(markers)], label=f"DS{i}")
         ax_ratio.scatter(frames[valid], a / a0, s=12, alpha=0.7,
                          marker=markers[i % len(markers)], label=f"DS{i}")
-        ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.7,
-                     marker=markers[i % len(markers)], label=f"DS{i}")
-
         # Sanity prints
         dmin, dmax = float(np.nanmin(delta)), float(np.nanmax(delta))
         valid_idx = np.where(valid)[0]
@@ -264,7 +267,7 @@ def main():
         if np.any(valid_T):
             Tmin_C = float(np.nanmin(T_frame_C[valid_T]))
             Tmax_C = float(np.nanmax(T_frame_C[valid_T]))
-            print(f"DS{i}: Temperature (°C) range {Tmin_C:.1f} .. {Tmax_C:.1f} (anchored at {T_REF:.1f} K)")
+            print(f"DS{i}: Temperature (°C) range {Tmin_C:.1f} .. {Tmax_C:.1f} (anchored at {T_REF_K - 273.15:.1f} °C)")
 
     # Configure axes
     ax_q.set_xlabel("Frame");   ax_q.set_ylabel("Peak center q (1/Å)"); ax_q.grid(True);   ax_q.legend()
