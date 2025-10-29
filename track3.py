@@ -25,27 +25,9 @@ SIGMA_MIN_MULT = 0.25
 SIGMA_MAX_FRAC = 1.2
 CONSEC_FAIL_EXPAND = 2
 MAX_FRAMES = 200
-h = 2 
-k = 0 
-l = 0
-# thermal expansion polynomial 
-C0 = -0.358/100
-C1 = 9.472e-3/100
-C2 = 1.031e-6/100
-C3 = -2.978e-10 /100  
+
 # --- Helpers ---
-def T_from_delta(delta):
-    """
-    Solve C3*T^3 + C2*T^2 + C1*T + (C0 - delta) = 0  for T (K).
-    Returns the real root in the range 0–4000 K or np.nan if none.
-    """
-    import numpy as np
-    coeffs = [C3, C2, C1, C0 - delta]      # highest power first -> np.roots
-    roots = np.roots(coeffs)
-    # keep real roots within a reasonable range
-    real = roots[np.isreal(roots)].real
-    good = real[(real > 0) & (real < 4000)]
-    return good[0] if good.size else np.nan
+
 def robust_sigma(y):
     """Fast robust noise estimator."""
     med = np.median(y)
@@ -215,9 +197,8 @@ def robust_initial_center(x, I, initial_guess, nframes=SEED_FRAMES, desc=None, s
     mad = 1.4826 * np.nanmedian(np.abs(centers - med))
     good = np.abs(centers - med) <= (3 * mad if mad > 0 else np.inf)
     baseline = np.nanmedian(centers[good]) if np.any(good) else med
-    a_0 = 2*pi / baseline * (sqrt(h**2 +k**2 + l**2))
     # Return baseline and variance metric (MAD)
-    return baseline, mad, a_0
+    return baseline, mad
 
 def process_dataset(h5_path, initial_guess, desc=None, show_progress=True, 
                    skip_jump_threshold=FRAME_SKIP_JUMP, max_total_movement=MAX_TOTAL_MOVEMENT,
@@ -383,23 +364,11 @@ def main():
         valid_mask = np.isfinite(diff_centers)
         ax1.scatter(frames[valid_mask], diff_centers[valid_mask], 
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
-        G_norm = sqrt(h**2 + k**2 + l**2) 
-        q0 = (2 * pi / a_0) * G_norm
-        q_valid = q0 + diff_centers[valid_mask]
-        a = (2 * pi / q_valid) * G_norm
-        delta_a_over_a0 = (a - a_0) / a_0
 
-# Temperature per frame
-        T_frame = np.vectorize(T_from_delta)(delta_a_over_a0)
-        valid_T = np.isfinite(T_frame)
-        ax4.scatter(frames[valid_T], T_frame[valid_T],
-            s=12, alpha=0.7, marker=markers[i],
-            label=f"Beam {i}")
         # Plot 2: FWHM
         valid_fwhm = np.isfinite(fwhms)
         ax2.scatter(frames[valid_fwhm], fwhms[valid_fwhm],
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
-        ax3.scatter(frames[valid_mask], a/a_0, label=f"Beam Index {i} (a)", s=12, alpha=0.7, marker=markers[i])
 
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
@@ -426,20 +395,6 @@ def main():
     ax2.grid(True)
     ax2.legend()
     fig2.tight_layout()
-
-    ax3.set_xlim(0,200)
-    ax3.set_xlabel("Frame")
-    ax3.set_ylabel("lattice parameter a (Å) shift")
-    ax3.grid(True)
-    ax3.legend()
-    fig3.tight_layout()
-    
-    ax4.set_xlim(0, 200)
-    ax4.set_xlabel("Frame")
-    ax4.set_ylabel("Temperature (K)")
-    ax4.grid(True)
-    ax4.legend()
-    fig4.tight_layout()
 
     
     plt.show()
