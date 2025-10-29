@@ -399,6 +399,10 @@ def main():
         ax2.scatter(frames[valid_fwhm], fwhms[valid_fwhm],
                    label=f"Beam Index {i}", s=12, alpha=0.7, marker=markers[i])
         ax3.scatter(frames[valid_mask], a/a_0, label=f"Beam Index {i} (a)", s=12, alpha=0.7, marker=markers[i])
+        valid_T = np.isfinite(T_frame)
+        ax4.scatter(frames[valid_T], T_frame[valid_T],
+            s=12, alpha=0.7, marker=markers[i],
+            label=f"Beam {i}")
 
         max_move = np.nanmax(np.abs(diff_centers))
         max_moves.append(max_move)
