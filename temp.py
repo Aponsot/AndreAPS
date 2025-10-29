@@ -21,10 +21,10 @@ h, k, l = 2, 0, 0
 
 # Thermal expansion polynomial (fractional units)
 # Δa/a0 = C0 + C1*T + C2*T^2 + C3*T^3
-C0 = -0.358 
-C1 = 9.472e-3 
-C2 = 1.031e-6
-C3 = -2.978e-10
+C0 = -0.358 /100
+C1 = 9.472e-3 /100
+C2 = 1.031e-6/100
+C3 = -2.978e-10/100
 T_REF=300.0 # Anchor temperature in Kelvin
 # Anchor (reference) temperature in Kelvin
 def f_poly(T):
