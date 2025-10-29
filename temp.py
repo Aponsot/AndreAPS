@@ -10,11 +10,24 @@ try:
 except ImportError:
     tqdm = None
 
-# --- Simple tunables ---
-WINDOW = 0.50         # fitting window width (in q units)
-MIN_POINTS = 5        # minimum points in window to try a fit
-SEED_FRAMES = 30      # frames used to define baseline a0
-MAX_FRAMES = 200      # cap for frames processed
+# --- Tunables ---
+WINDOW = 0.50       # fitting window width (in q units)
+MIN_POINTS = 5      # minimum points in window to try a fit
+SEED_FRAMES = 30    # frames used to define baseline a0
+MAX_FRAMES = 200    # max frames processed
+
+# Reflection (set to your peak)
+h, k, l = 2, 0, 0
+
+# Thermal expansion polynomial (fractional units)
+# Δa/a0 = C0 + C1*T + C2*T^2 + C3*T^3
+C0 = -0.358 / 100.0
+C1 = 9.472e-3 / 100.0
+C2 = 1.031e-6 / 100.0
+C3 = -2.978e-10 / 100.0
+
+# Anchor (reference) temperature in Kelvin
+T_REF = 300.0
 
 # --- Helpers ---
 def robust_sigma(y):
@@ -33,12 +46,11 @@ def build_window(x, yfull, center, width):
 
 def fit_peak_single(xw, yw, seed_center):
     """
-    Single Gaussian + linear baseline. Minimal bounds; return absolute center in q.
+    Single Gaussian + linear baseline. Return absolute center (q) and FWHM.
     """
     if len(xw) < MIN_POINTS:
         return None
 
-    # simple baseline
     try:
         bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
     except Exception:
@@ -47,10 +59,9 @@ def fit_peak_single(xw, yw, seed_center):
     y_detr = yw - (bkg_slope * xw + bkg_intercept)
     noise = robust_sigma(y_detr)
 
-    # initial guesses
     peak_idx = np.abs(xw - seed_center).argmin()
     height0 = max(yw[peak_idx] - (bkg_slope * xw[peak_idx] + bkg_intercept), 0.5 * noise)
-    span = xw[-1] - xw[0]
+    span = max(xw[-1] - xw[0], 1e-9)
     sigma0 = max(span / 7.0, 1e-6)
     amp0 = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)
 
@@ -62,7 +73,6 @@ def fit_peak_single(xw, yw, seed_center):
         g_sigma=sigma0,
         g_amplitude=amp0,
     )
-    # loose bounds
     params["g_sigma"].set(min=1e-6, max=max(span, 1.0))
     params["g_amplitude"].set(min=0.0)
 
@@ -87,7 +97,7 @@ def load_q_and_I_q_only(h5_path):
         I_full = f["int"][:]
     return x, I_full
 
-def process_dataset(h5_path, initial_center, h, k, l, nframes_limit=MAX_FRAMES, show_progress=True):
+def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_progress=True):
     """
     Fit absolute peak centers per frame (in q). Compute baseline a0 from first SEED_FRAMES.
     Returns centers (q), fwhms, a0, frames_count.
@@ -103,7 +113,6 @@ def process_dataset(h5_path, initial_center, h, k, l, nframes_limit=MAX_FRAMES, 
     if show_progress and tqdm is not None:
         iterator = tqdm(iterator, desc=f"{h5_path}: fit", leave=False)
 
-    # track using previous center as seed, starting from initial_center
     seed = initial_center
     for frame in iterator:
         xw, yw = build_window(x, I[frame], seed, WINDOW)
@@ -115,8 +124,7 @@ def process_dataset(h5_path, initial_center, h, k, l, nframes_limit=MAX_FRAMES, 
         if res is not None:
             centers[frame] = res["center"]
             fwhms[frame]   = res["fwhm"]
-            seed = res["center"]  # update seed
-        # else keep NaN and seed unchanged
+            seed = res["center"]
 
     # Baseline q0 and a0 from early frames
     valid = np.isfinite(centers)
@@ -131,31 +139,39 @@ def process_dataset(h5_path, initial_center, h, k, l, nframes_limit=MAX_FRAMES, 
 
     return centers, fwhms, a0, nframes
 
-# Linear thermal expansion: delta = alpha * (T - Tref)
-def T_from_delta_linear(delta, alpha, Tref):
-    if alpha <= 0:
+# --- Polynomial thermal expansion (anchored inversion) ---
+def f_poly(T):
+    # fractional Δa/a0
+    return C0 + C1*T + C2*T**2 + C3*T**3
+
+def r_T(T):
+    # lattice ratio r(T) = 1 + f(T)
+    return 1.0 + f_poly(T)
+
+def T_from_delta_poly_anchored(delta, T_ref=T_REF):
+    """
+    Anchored inversion: r(T) = (1 + delta) * r(T_ref)
+    Solve C3*T^3 + C2*T^2 + C1*T + (1 + C0 - target) = 0,
+    where target = (1 + delta) * r(T_ref).
+    Returns the real root near T_ref.
+    """
+    target = (1.0 + delta) * r_T(T_ref)
+    coeffs = [C3, C2, C1, (1.0 + C0) - target]
+    roots = np.roots(coeffs)
+    real = roots[np.isreal(roots)].real
+    good = real[(real > 0) & (real < 4000)]
+    if good.size == 0:
         return np.nan
-    return Tref + (delta / alpha)
+    return good[np.argmin(np.abs(good - T_ref))]
 
 def main():
-    ap = argparse.ArgumentParser(description="Minimal: q -> a -> Δa/a0 -> T (linear CTE), q-only input.")
+    ap = argparse.ArgumentParser(description="q -> a -> Δa/a0 -> T (polynomial model), plotting in Celsius.")
     ap.add_argument("--h5", nargs='+', required=True, help="HDF5 files (one per dataset), must contain 'q' and 'int'")
     ap.add_argument("--center", nargs='+', type=float, required=True, help="Initial peak center guesses (in q units, 1/Å)")
-    ap.add_argument("--hkl", type=str, default="2,0,0", help="Reflection indices 'h,k,l' (default 2,0,0)")
-    ap.add_argument("--alpha", nargs='+', type=float, required=True,
-                    help="Linear CTE α in 1/K (one value or one per dataset; typical 10e-6..25e-6)")
-    ap.add_argument("--Tref", type=float, default=300.0, help="Reference temperature (K), default 300")
-    ap.add_argument("--nframes", type=int, default=MAX_FRAMES, help="Max frames per dataset")
-    ap.add_argument("--no-progress", action="store_true", help="Disable progress bars")
     args = ap.parse_args()
 
-    h,k,l = [int(s) for s in args.hkl.split(",")]
-    show_progress = not args.no_progress
-
-    # Allow single alpha or per-dataset alphas
-    alphas = args.alpha
-    if len(alphas) == 1 and len(args.h5) > 1:
-        alphas = alphas * len(args.h5)
+    if len(args.h5) != len(args.center):
+        raise ValueError("Number of --h5 files must match number of --center guesses.")
 
     # Plotting
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
@@ -164,13 +180,12 @@ def main():
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
 
     dataset_iter = range(len(args.h5))
-    if show_progress and tqdm is not None:
+    if tqdm is not None:
         dataset_iter = tqdm(dataset_iter, desc="Datasets")
 
     for i in dataset_iter:
         centers, fwhms, a0, nframes = process_dataset(
-            args.h5[i], args.center[i], h, k, l,
-            nframes_limit=args.nframes, show_progress=show_progress
+            args.h5[i], args.center[i], nframes_limit=MAX_FRAMES, show_progress=True
         )
 
         frames = np.arange(nframes)
@@ -180,28 +195,31 @@ def main():
             continue
 
         # Plot absolute q centers
-        ax_q.scatter(frames[valid], centers[valid], s=12, alpha=0.7, marker=markers[i % len(markers)], label=f"DS{i}")
+        ax_q.scatter(frames[valid], centers[valid], s=12, alpha=0.7,
+                     marker=markers[i % len(markers)], label=f"DS{i}")
 
         # Compute a per frame and fractional delta
         G_norm = sqrt(h**2 + k**2 + l**2)
         q_valid = centers[valid]
         a = (2.0 * pi / q_valid) * G_norm
-        delta = (a - a0) / a0  # fractional Δa/a0 (should start near ~0)
-        print(f"calculated a0={a0:.5f} Å for DS{i}")
-        # Temperature via linear CTE
-        alpha_i = alphas[i]
-        T_frame = T_from_delta_linear(delta, alpha_i, args.Tref)
+        delta = (a - a0) / a0  # fractional Δa/a0
+
+        # Temperature from polynomial (anchored to T_REF)
+        T_frame_K = np.array([T_from_delta_poly_anchored(d, T_REF) for d in delta])
+        T_frame_C = T_frame_K - 273.15
+        valid_T = np.isfinite(T_frame_C)
 
         # Plots
         v_fwhm = np.isfinite(fwhms)
-        ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7, marker=markers[i % len(markers)], label=f"DS{i}")
-        ax_ratio.scatter(frames[valid], (a / a0)-1, s=12, alpha=0.7, marker=markers[i % len(markers)], label=f"DS{i}")
-        v_T = np.isfinite(T_frame)
-        ax_T.scatter(frames[valid][v_T], T_frame[v_T], s=12, alpha=0.7, marker=markers[i % len(markers)], label=f"DS{i}")
+        ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
+                        marker=markers[i % len(markers)], label=f"DS{i}")
+        ax_ratio.scatter(frames[valid], a / a0, s=12, alpha=0.7,
+                         marker=markers[i % len(markers)], label=f"DS{i}")
+        ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.7,
+                     marker=markers[i % len(markers)], label=f"DS{i}")
 
         # Sanity prints
         dmin, dmax = float(np.nanmin(delta)), float(np.nanmax(delta))
-        # Baseline: first SEED_FRAMES among valid frames
         valid_idx = np.where(valid)[0]
         baseline_idx = valid_idx[valid_idx < min(SEED_FRAMES, nframes)]
         if baseline_idx.size > 0:
@@ -210,16 +228,17 @@ def main():
         else:
             baseline_delta_median = np.nan
         print(f"DS{i}: a0={a0:.5f} Å, baseline median Δa/a0={baseline_delta_median:.3e}, range={dmin:.3e}..{dmax:.3e}")
-        if np.isfinite(dmax):
-            Tmax_est = args.Tref + dmax / alpha_i
-            print(f"DS{i}: With α={alpha_i:.3e} 1/K, estimated Tmax≈{Tmax_est:.1f} K")
-        
+
+        if np.any(valid_T):
+            Tmin_C = float(np.nanmin(T_frame_C[valid_T]))
+            Tmax_C = float(np.nanmax(T_frame_C[valid_T]))
+            print(f"DS{i}: Temperature (°C) range {Tmin_C:.1f} .. {Tmax_C:.1f} (anchored at {T_REF:.1f} K)")
 
     # Configure axes
     ax_q.set_xlabel("Frame");   ax_q.set_ylabel("Peak center q (1/Å)"); ax_q.grid(True);   ax_q.legend()
     ax_fwhm.set_xlabel("Frame"); ax_fwhm.set_ylabel("FWHM (1/Å)");       ax_fwhm.grid(True); ax_fwhm.legend()
     ax_ratio.set_xlabel("Frame"); ax_ratio.set_ylabel("a/a0 (ratio)");   ax_ratio.grid(True); ax_ratio.legend()
-    ax_T.set_xlabel("Frame");     ax_T.set_ylabel("Temperature (K)");    ax_T.grid(True);     ax_T.legend()
+    ax_T.set_xlabel("Frame");     ax_T.set_ylabel("Temperature (°C)");   ax_T.grid(True);     ax_T.legend()
 
     fig.tight_layout()
     plt.show()
