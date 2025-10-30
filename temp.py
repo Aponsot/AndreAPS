@@ -237,7 +237,7 @@ def main():
         finite_mask = np.isfinite(T_full_C)
         depth_label = depths_um[i % len(depths_um)]
         ax.scatter(frames[finite_mask], T_full_C[finite_mask],
-                   s=8, alpha=0.8, color=Color, marker=markers[i % len(markers)])
+                   s=8, alpha=0.4,color=Color, marker=markers[i % len(markers)])
 
         # Build fit window and fit simple exponential decay
         max_frame_for_fit = min(nframes - 1, FIT_END)
@@ -269,7 +269,8 @@ def main():
                 x_line = np.arange(MELT_FRAME, nframes)
                 y_line = exp_decay(x_line, *popt)
                 # Plot fit line (same color, label only depth)
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0,
+                line = ['-','--',':'][i % 3]
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,  
                         label=f"{depth_label} μm")
 
                 # Intercept at MELT_FRAME for console info (not changing plotting unless desired)
