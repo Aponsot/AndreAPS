@@ -252,7 +252,7 @@ def main():
         ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
                         marker=markers[i % len(markers)], label=f"DS{i}")
         ax_ratio.scatter(frames[valid], a / a0, s=12, alpha=0.7,
-                         marker=markers[i % len(markers)], label=f"DS{i}",Color=Color)
+                         marker=markers[i % len(markers)], label=f"DS{i}",color=Color)
         # Sanity prints
         dmin, dmax = float(np.nanmin(delta)), float(np.nanmax(delta))
         valid_idx = np.where(valid)[0]
