@@ -230,10 +230,10 @@ def main():
         if not np.any(valid):
             print(f"DS{i}: No valid centers; skipping.")
             continue
-
+        depth= [50, 100, 150]
         # Plot absolute q centers
         ax_q.scatter(frames[valid], centers[valid], s=12, alpha=0.7,
-                     marker=markers[i % len(markers)], label=f"DS{i}")
+                     marker=markers[i % len(markers)], label=f"depth {depth[i]}m")
 
         # Compute a per frame and fractional delta
         G_norm = sqrt(h**2 + k**2 + l**2)
@@ -247,7 +247,7 @@ def main():
         valid_T = np.isfinite(T_frame_C)
 
         ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.7,
-             marker=markers[i % len(markers)], label=f"DS{i}")
+             marker=markers[i % len(markers)], label=f"depth {depth[i]}m")
         v_fwhm = np.isfinite(fwhms)
         ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
                         marker=markers[i % len(markers)], label=f"DS{i}")
