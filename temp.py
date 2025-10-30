@@ -2,7 +2,7 @@ import argparse
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
-from lmfit.models import GaussianModel, LinearModel
+from lmfit.models import GaussianModel, LinearModel, ExponentialModel, ConstantModel
 from math import pi, sqrt
 
 try:
@@ -15,6 +15,11 @@ WINDOW = 0.50       # fitting window width (in q units)
 MIN_POINTS = 5      # minimum points in window to try a fit
 SEED_FRAMES = 30    # frames used to define baseline a0
 MAX_FRAMES = 200    # max frames processed
+
+# Frames of interest
+MELT_FRAME = 58     # where melting happened
+FIT_START  = 65     # start frame for exponential fit
+FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
 
 # Reflection (set to your peak)
 h, k, l = 2, 0, 0
@@ -66,6 +71,7 @@ def T_from_delta_poly_lookup_K(delta_array, Tref_K=T_REF_K, Tmin_K=250.0, Tmax_K
     m = (target >= r_sorted[0]) & (target <= r_sorted[-1])
     T_out[m] = np.interp(target[m], r_sorted, T_sorted)
     return T_out
+
 # --- Helpers ---
 def robust_sigma(y):
     med = np.median(y)
@@ -202,7 +208,7 @@ def T_from_delta_poly_anchored(delta, T_ref=T_REF_K):
     return good[np.argmin(np.abs(good - T_ref))]
 
 def main():
-    ap = argparse.ArgumentParser(description="q -> a -> Δa/a0 -> T (polynomial model), plotting in Celsius.")
+    ap = argparse.ArgumentParser(description="Temperature plots and exponential fit (frames 65–200), extrapolated to frame 58.")
     ap.add_argument("--h5", nargs='+', required=True, help="HDF5 files (one per dataset), must contain 'q' and 'int'")
     ap.add_argument("--center", nargs='+', type=float, required=True, help="Initial peak center guesses (in q units, 1/Å)")
     args = ap.parse_args()
@@ -210,13 +216,14 @@ def main():
     if len(args.h5) != len(args.center):
         raise ValueError("Number of --h5 files must match number of --center guesses.")
 
-    # Plotting
+    # Plotting config
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    ax_q, ax_fwhm, ax_ratio, ax_T = axes.ravel()
-    markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
-    Color ='C1'
-    linestyles = ['-', '--', ':']
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(12, 5), sharex=True)
+    markers    = ['o', 's', 'D', '^', 'v', 'p', 'X']
+    linestyles = ['-', '--', ':']  # different line style per dataset
+    Color      = 'C1'              # single hue for all, as requested
+    depths_um  = [50, 100, 150]    # labels for datasets
+
     dataset_iter = range(len(args.h5))
     if tqdm is not None:
         dataset_iter = tqdm(dataset_iter, desc="Datasets")
@@ -231,30 +238,72 @@ def main():
         if not np.any(valid):
             print(f"DS{i}: No valid centers; skipping.")
             continue
-        depth= [50, 100, 150]
-        # Plot absolute q centers
-        ax_q.scatter(frames[valid], centers[valid], s=12, alpha=0.7,
-                     marker=markers[i % len(markers)], label=f"depth {depth[i]}m")
 
         # Compute a per frame and fractional delta
         G_norm = sqrt(h**2 + k**2 + l**2)
         q_valid = centers[valid]
         a = (2.0 * pi / q_valid) * G_norm
-        delta = (a - a0) / a0  # fractional Δa/a0 (should start near ~0)
+        delta = (a - a0) / a0
 
-# Temperature from polynomial via lookup (anchored to T_REF)
+        # Temperature from polynomial via lookup (anchored to T_REF)
         T_frame_K = T_from_delta_poly_lookup_K(delta, Tref_K=T_REF_K)
         T_frame_C = T_frame_K - 273.15
-        valid_T = np.isfinite(T_frame_C)
 
-        ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.6,
-             marker=markers[i % len(markers)], label=f"depth {depth[i]}um", color=Color)
-        v_fwhm = np.isfinite(fwhms)
-        ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
-                        marker=markers[i % len(markers)], label=f"DS{i}")
-        ax_ratio.scatter(frames[valid], a / a0, s=12, alpha=0.7,
-                         marker=markers[i % len(markers)], label=f"DS{i}")
-        # Sanity prints
+        # Left panel: scatter of temperature vs frame
+        valid_T = np.isfinite(T_frame_C)
+        ds_mask = valid.copy()
+        ds_mask[valid] = valid_T  # apply temperature validity only where centers valid
+
+        depth_label = depths_um[i % len(depths_um)]
+        ax_left.scatter(frames[ds_mask], T_frame_C[valid_T], s=20, alpha=0.6,
+                        marker=markers[i % len(markers)], color=Color,
+                        label=f"depth {depth_label} um")
+
+        # Right panel: exponential fit on frames FIT_START..FIT_END, extrapolate back to MELT_FRAME
+        max_frame_for_fit = min(nframes - 1, FIT_END)
+        fit_mask = valid.copy()
+        fit_mask &= (frames >= FIT_START) & (frames <= max_frame_for_fit)
+        # Also require finite temperatures
+        fit_mask[valid] &= valid_T
+
+        x_fit_data = frames[fit_mask]
+        y_fit_data = T_frame_C[valid_T][(frames[valid] >= FIT_START) & (frames[valid] <= max_frame_for_fit)]
+        # Guard against insufficient data
+        if x_fit_data.size >= 5 and y_fit_data.size == x_fit_data.size:
+            # Build model: y = c + amplitude * exp(decay * x), with decay < 0
+            model = ConstantModel() + ExponentialModel()
+            # Initial guesses: c ~ median of last few points, amplitude ~ first - c, decay negative
+            last_n = max(3, min(10, x_fit_data.size))
+            c0 = float(np.nanmedian(y_fit_data[-last_n:]))
+            a0_exp = float(y_fit_data[0] - c0)
+            decay0 = -0.02  # reasonable starting slope per frame
+
+            params = model.make_params(c=c0, amplitude=a0_exp, decay=decay0)
+            params['decay'].set(max=-1e-6)  # force decay to be negative (decay)
+            # Fit
+            try:
+                result = model.fit(y_fit_data, params, x=x_fit_data, nan_policy="omit")
+                p = result.params
+                c_fit     = p['c'].value
+                amp_fit   = p['amplitude'].value
+                decay_fit = p['decay'].value
+                tau_fit   = (-1.0 / decay_fit) if decay_fit < 0 else np.inf
+
+                # Extrapolate and plot from MELT_FRAME to max_frame_for_fit
+                x_line = np.arange(MELT_FRAME, max_frame_for_fit + 1)
+                y_line = model.eval(params=p, x=x_line)
+                ax_right.plot(x_line, y_line, linestyle=linestyles[i % len(linestyles)],
+                              color=Color, linewidth=1.8, label=f"depth {depth_label} um (τ≈{tau_fit:.1f} frames)")
+            except Exception as e:
+                print(f"DS{i}: Exp fit failed: {e}")
+        else:
+            print(f"DS{i}: Not enough points for exp fit in frames {FIT_START}..{max_frame_for_fit}.")
+
+        # Optional: overlay faint scatter on right to show raw points (can comment out)
+        ax_right.scatter(frames[ds_mask], T_frame_C[valid_T], s=16, alpha=0.25,
+                         marker=markers[i % len(markers)], color=Color)
+
+        # Diagnostics
         dmin, dmax = float(np.nanmin(delta)), float(np.nanmax(delta))
         valid_idx = np.where(valid)[0]
         baseline_idx = valid_idx[valid_idx < min(SEED_FRAMES, nframes)]
@@ -265,16 +314,29 @@ def main():
             baseline_delta_median = np.nan
         print(f"DS{i}: a0={a0:.5f} Å, baseline median Δa/a0={baseline_delta_median:.3e}, range={dmin:.3e}..{dmax:.3e}")
 
-        if np.any(valid_T):
+        if np.any(ds_mask):
             Tmin_C = float(np.nanmin(T_frame_C[valid_T]))
             Tmax_C = float(np.nanmax(T_frame_C[valid_T]))
             print(f"DS{i}: Temperature (°C) range {Tmin_C:.1f} .. {Tmax_C:.1f} (anchored at {T_REF_K - 273.15:.1f} °C)")
 
-    # Configure axes
-    ax_q.set_xlabel("Frame");   ax_q.set_ylabel("Peak center q (1/Å)"); ax_q.grid(True);   ax_q.legend()
-    ax_fwhm.set_xlabel("Frame"); ax_fwhm.set_ylabel("FWHM (1/Å)");       ax_fwhm.grid(True); ax_fwhm.legend()
-    ax_ratio.set_xlabel("Frame"); ax_ratio.set_ylabel("a/a0 (ratio)");   ax_ratio.grid(True); ax_ratio.legend()
-    ax_T.set_xlabel("Frame");     ax_T.set_ylabel("Temperature (°C)");   ax_T.grid(True);     ax_T.legend()
+    # Decorate plots
+    for ax in (ax_left, ax_right):
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("Frame")
+        ax.axvline(MELT_FRAME, color='0.6', linestyle='--', linewidth=1.0)
+        ax.axvline(FIT_START, color='0.7', linestyle=':', linewidth=1.0)
+        ax.annotate("melt", xy=(MELT_FRAME, ax.get_ylim()[0]), xytext=(5, 5),
+                    textcoords='offset points', fontsize=10, color='0.3')
+        ax.annotate("fit start", xy=(FIT_START, ax.get_ylim()[0]), xytext=(5, 5),
+                    textcoords='offset points', fontsize=10, color='0.4')
+
+    ax_left.set_ylabel("Temperature (°C)")
+    ax_left.set_title("Temperature vs Frame (scatter)")
+    ax_left.legend()
+
+    ax_right.set_ylabel("Temperature (°C)")
+    ax_right.set_title(f"Exp. decay fit (frames {FIT_START}–{FIT_END}), extrapolated to frame {MELT_FRAME}")
+    ax_right.legend()
 
     fig.tight_layout()
     plt.show()
