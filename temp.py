@@ -1,9 +1,10 @@
 import argparse
+import os
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
-from lmfit.models import GaussianModel, LinearModel, ExponentialModel, ConstantModel
 from math import pi, sqrt
+from scipy.optimize import curve_fit
 
 try:
     from tqdm.auto import tqdm
@@ -17,7 +18,7 @@ SEED_FRAMES = 30    # frames used to define baseline a0
 MAX_FRAMES = 200    # max frames processed
 
 # Frames of interest
-MELT_FRAME = 58     # where melting happened
+MELT_FRAME = 58     # where melting happened (intercept point)
 FIT_START  = 65     # start frame for exponential fit
 FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
 
@@ -108,6 +109,8 @@ def fit_peak_single(xw, yw, seed_center):
     sigma0 = max(span / 7.0, 1e-6)
     amp0 = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)
 
+    # Build model
+    from lmfit.models import GaussianModel, LinearModel
     model = LinearModel(prefix="bkg_") + GaussianModel(prefix="g_")
     params = model.make_params(
         bkg_slope=bkg_slope,
@@ -182,33 +185,12 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
 
     return centers, fwhms, a0, nframes
 
-# --- Polynomial thermal expansion (anchored inversion) ---
-def f_poly(T):
-    # fractional Δa/a0
-    return C0 + C1*T + C2*T**2 + C3*T**3
-
-def r_T(T):
-    # lattice ratio r(T) = 1 + f(T)
-    return 1.0 + f_poly(T)
-
-def T_from_delta_poly_anchored(delta, T_ref=T_REF_K):
-    """
-    Anchored inversion: r(T) = (1 + delta) * r(T_ref)
-    Solve C3*T^3 + C2*T^2 + C1*T + (1 + C0 - target) = 0,
-    where target = (1 + delta) * r(T_ref).
-    Returns the real root near T_ref.
-    """
-    target = (1.0 + delta) * r_T(T_ref)
-    coeffs = [C3, C2, C1, (1.0 + C0) - target]
-    roots = np.roots(coeffs)
-    real = roots[np.isreal(roots)].real
-    good = real[(real > 0) & (real < 4000)]
-    if good.size == 0:
-        return np.nan
-    return good[np.argmin(np.abs(good - T_ref))]
+# Simple exponential decay model for curve_fit: y = c + A * exp(-(x - FIT_START)/tau)
+def exp_decay(x, c, A, tau):
+    return c + A * np.exp(-(x - FIT_START) / tau)
 
 def main():
-    ap = argparse.ArgumentParser(description="Temperature plots and exponential fit (frames 65–200), extrapolated to frame 58.")
+    ap = argparse.ArgumentParser(description="Raw temperature scatter with simple exponential decay fits and extrapolated intercept at frame 58.")
     ap.add_argument("--h5", nargs='+', required=True, help="HDF5 files (one per dataset), must contain 'q' and 'int'")
     ap.add_argument("--center", nargs='+', type=float, required=True, help="Initial peak center guesses (in q units, 1/Å)")
     args = ap.parse_args()
@@ -218,11 +200,8 @@ def main():
 
     # Plotting config
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
-    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(12, 5), sharex=True)
-    markers    = ['o', 's', 'D', '^', 'v', 'p', 'X']
-    linestyles = ['-', '--', ':']  # different line style per dataset
-    Color      = 'C1'              # single hue for all
-    depths_um  = [50, 100, 150]    # labels for datasets
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7'])
 
     dataset_iter = range(len(args.h5))
     if tqdm is not None:
@@ -232,106 +211,83 @@ def main():
         centers, fwhms, a0, nframes = process_dataset(
             args.h5[i], args.center[i], nframes_limit=MAX_FRAMES, show_progress=True
         )
-
         frames = np.arange(nframes)
-        valid = np.isfinite(centers) & (centers > 0)
-        if not np.any(valid):
+        valid_centers = np.isfinite(centers) & (centers > 0)
+
+        if not np.any(valid_centers):
             print(f"DS{i}: No valid centers; skipping.")
             continue
 
-        # Compute a per frame and fractional delta (full-length, aligned to frames)
+        # Compute lattice parameter and fractional delta (full-length)
         G_norm = sqrt(h**2 + k**2 + l**2)
         a_full = np.full(nframes, np.nan)
-        a_full[valid] = (2.0 * pi / centers[valid]) * G_norm
-        delta_full = (a_full - a0) / a0  # NaNs where invalid
+        a_full[valid_centers] = (2.0 * pi / centers[valid_centers]) * G_norm
+        delta_full = (a_full - a0) / a0
 
-        # Temperature from polynomial via lookup (anchored to T_REF), aligned to frames
+        # Convert to temperature (°C), aligned to frames
         T_full_K = np.full(nframes, np.nan)
-        T_full_K[valid] = T_from_delta_poly_lookup_K(delta_full[valid], Tref_K=T_REF_K)
+        T_full_K[valid_centers] = T_from_delta_poly_lookup_K(delta_full[valid_centers], Tref_K=T_REF_K)
         T_full_C = T_full_K - 273.15
 
-        depth_label = depths_um[i % len(depths_um)]
-
-        # Left panel: raw scatter only
-        ds_mask = np.isfinite(T_full_C)
-        ax_left.scatter(frames[ds_mask], T_full_C[ds_mask], s=20, alpha=0.6,
-                        marker=markers[i % len(markers)], color=Color,
-                        label=f"depth {depth_label} um")
-
-        # Right panel: exponential fit (frames FIT_START..FIT_END), fit-only
-        max_frame_for_fit = min(nframes - 1, FIT_END)
-        fit_window_mask = (frames >= FIT_START) & (frames <= max_frame_for_fit)
+        # Scatter raw temperatures
         finite_mask = np.isfinite(T_full_C)
-        fit_idx = np.where(fit_window_mask & finite_mask)[0]
+        ds_color = colors[i % len(colors)]
+        label = os.path.basename(args.h5[i])
+        ax.scatter(frames[finite_mask], T_full_C[finite_mask], s=8, alpha=0.8, color=ds_color, label=f"{label} (raw)")
 
-        x_fit_data = frames[fit_idx]
-        y_fit_data = T_full_C[fit_idx]
+        # Build fit window and fit simple exponential decay
+        max_frame_for_fit = min(nframes - 1, FIT_END)
+        fit_mask = finite_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
+        fit_idx = np.where(fit_mask)[0]
+        x_fit = frames[fit_idx]
+        y_fit = T_full_C[fit_idx]
 
-        # Debug/guard: ensure we have enough finite points in the window
-        print(f"DS{i}: fit window frames [{FIT_START}..{max_frame_for_fit}], points available = {y_fit_data.size}")
-        if y_fit_data.size >= 5:
-            model = ConstantModel() + ExponentialModel()  # y = c + A * exp(decay * x)
-
-            last_n = max(3, min(10, y_fit_data.size))
-            c0 = float(np.nanmedian(y_fit_data[-last_n:]))
-            a0_exp = float(y_fit_data[0] - c0)
-            decay0 = -0.02  # starting slope per frame
-
-            params = model.make_params(c=c0, amplitude=a0_exp, decay=decay0)
-            params['decay'].set(max=-1e-6)  # force decay negative
+        print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
+        if y_fit.size >= 5 and np.ptp(x_fit) > 0:
+            # Initial guesses
+            last_n = max(3, min(10, y_fit.size))
+            c0 = float(np.nanmedian(y_fit[-last_n:]))
+            A0 = float(y_fit[0] - c0)
+            if abs(A0) < 1e-6:  # avoid zero initial amplitude
+                A0 = 1.0
+            tau0 = max(5.0, (x_fit[-1] - x_fit[0]) / 3.0)
 
             try:
-                result = model.fit(y_fit_data, params, x=x_fit_data, nan_policy="omit")
-                p = result.params
-                decay_fit = p['decay'].value
-                tau_fit = (-1.0 / decay_fit) if decay_fit < 0 else np.inf
+                popt, pcov = curve_fit(
+                    exp_decay, x_fit, y_fit,
+                    p0=(c0, A0, tau0),
+                    bounds=([-1e6, -1e6, 1e-6], [1e6, 1e6, 1e6]),
+                    maxfev=5000
+                )
+                c_fit, A_fit, tau_fit = popt
+                y_pred = exp_decay(x_fit, *popt)
+                ss_res = float(np.sum((y_fit - y_pred)**2))
+                ss_tot = float(np.sum((y_fit - np.nanmean(y_fit))**2))
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-                # Extrapolate from MELT_FRAME to max_frame_for_fit
-                x_line = np.arange(MELT_FRAME, max_frame_for_fit + 1)
-                y_line = model.eval(params=p, x=x_line)
-                ax_right.plot(x_line, y_line, linestyle=linestyles[i % len(linestyles)],
-                              color=Color, linewidth=1.8,
-                              label=f"depth {depth_label} um (τ≈{tau_fit:.1f} frames)")
+                # Extrapolate from MELT_FRAME onward
+                x_line = np.arange(MELT_FRAME, nframes)
+                y_line = exp_decay(x_line, *popt)
+                ax.plot(x_line, y_line, color=ds_color, linewidth=2.0,
+                        label=f"{label} fit (τ={tau_fit:.1f}, R²={r2:.2f})")
+
+                # Intercept at MELT_FRAME
+                T_melt = float(exp_decay(MELT_FRAME, *popt))
+                print(f"DS{i}: T@frame {MELT_FRAME} (extrapolated) = {T_melt:.1f} °C, tau={tau_fit:.2f}, R²={r2:.3f}")
+
             except Exception as e:
-                print(f"DS{i}: Exp fit failed: {e}")
+                print(f"DS{i}: curve_fit failed: {e}")
         else:
-            print(f"DS{i}: Not enough finite points for exp fit in frames {FIT_START}..{max_frame_for_fit}.")
+            print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
 
-        # Diagnostics (compute once, from full-length arrays)
-        dmin = float(np.nanmin(delta_full))
-        dmax = float(np.nanmax(delta_full))
-        baseline_idx = np.where(valid & (frames < min(SEED_FRAMES, nframes)))[0]
-        if baseline_idx.size > 0:
-            a_baseline = (2.0 * pi / centers[baseline_idx]) * G_norm
-            baseline_delta_median = float(np.nanmedian((a_baseline - a0) / a0))
-        else:
-            baseline_delta_median = np.nan
-        print(f"DS{i}: a0={a0:.5f} Å, baseline median Δa/a0={baseline_delta_median:.3e}, range={dmin:.3e}..{dmax:.3e}")
-
-        if np.any(ds_mask):
-            Tmin_C = float(np.nanmin(T_full_C[ds_mask]))
-            Tmax_C = float(np.nanmax(T_full_C[ds_mask]))
-            print(f"DS{i}: Temperature (°C) range {Tmin_C:.1f} .. {Tmax_C:.1f} (anchored at {T_REF_K - 273.15:.1f} °C)")
-
-    # Decorate plots
-    for ax in (ax_left, ax_right):
-        ax.grid(True, alpha=0.3)
-        ax.set_xlabel("Frame")
-        ax.axvline(MELT_FRAME, color='0.6', linestyle='--', linewidth=1.0)
-        ax.axvline(FIT_START, color='0.7', linestyle=':', linewidth=1.0)
-        ax.annotate("melt", xy=(MELT_FRAME, ax.get_ylim()[0]), xytext=(5, 5),
-                    textcoords='offset points', fontsize=10, color='0.3')
-        ax.annotate("fit start", xy=(FIT_START, ax.get_ylim()[0]), xytext=(5, 5),
-                    textcoords='offset points', fontsize=10, color='0.4')
-
-    ax_left.set_ylabel("Temperature (°C)")
-    ax_left.set_title("Temperature vs Frame (scatter)")
-    ax_left.legend()
-
-    ax_right.set_ylabel("Temperature (°C)")
-    ax_right.set_title(f"Exp. decay fit (frames {FIT_START}–{FIT_END}), extrapolated to frame {MELT_FRAME}")
-    ax_right.legend()
-
+    # Decorate single plot
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Temperature (°C)")
+    ax.set_title(f"Raw temperature scatter and exponential decay fits (fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})")
+    ax.axvline(MELT_FRAME, color='0.5', linestyle='--', linewidth=1.0)
+    ax.axvline(FIT_START, color='0.6', linestyle=':', linewidth=1.0)
+    ax.legend(ncol=2, fontsize=9)
     fig.tight_layout()
     plt.show()
 
