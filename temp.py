@@ -201,7 +201,11 @@ def main():
     # Plotting config
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-    colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0','C1','C2','C3','C4','C5','C6','C7'])
+
+    # Plot styling (do not change calculations)
+    Color = 'C1'  # single hue for all datasets
+    markers = ['o', 's', 'D', '^', 'v', 'p', 'X']  # different marker per dataset
+    depths_um = [50, 100, 150]  # known depths
 
     dataset_iter = range(len(args.h5))
     if tqdm is not None:
@@ -229,11 +233,11 @@ def main():
         T_full_K[valid_centers] = T_from_delta_poly_lookup_K(delta_full[valid_centers], Tref_K=T_REF_K)
         T_full_C = T_full_K - 273.15
 
-        # Scatter raw temperatures
+        # Scatter raw temperatures (small points, alpha ~0.8), same color, different marker
         finite_mask = np.isfinite(T_full_C)
-        ds_color = colors[i % len(colors)]
-        label = os.path.basename(args.h5[i])
-        ax.scatter(frames[finite_mask], T_full_C[finite_mask], s=8, alpha=0.8, color=ds_color, label=f"{label} (raw)")
+        depth_label = depths_um[i % len(depths_um)]
+        ax.scatter(frames[finite_mask], T_full_C[finite_mask],
+                   s=8, alpha=0.8, color=Color, marker=markers[i % len(markers)])
 
         # Build fit window and fit simple exponential decay
         max_frame_for_fit = min(nframes - 1, FIT_END)
@@ -248,7 +252,7 @@ def main():
             last_n = max(3, min(10, y_fit.size))
             c0 = float(np.nanmedian(y_fit[-last_n:]))
             A0 = float(y_fit[0] - c0)
-            if abs(A0) < 1e-6:  # avoid zero initial amplitude
+            if abs(A0) < 1e-6:
                 A0 = 1.0
             tau0 = max(5.0, (x_fit[-1] - x_fit[0]) / 3.0)
 
@@ -260,20 +264,17 @@ def main():
                     maxfev=5000
                 )
                 c_fit, A_fit, tau_fit = popt
-                y_pred = exp_decay(x_fit, *popt)
-                ss_res = float(np.sum((y_fit - y_pred)**2))
-                ss_tot = float(np.sum((y_fit - np.nanmean(y_fit))**2))
-                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
                 # Extrapolate from MELT_FRAME onward
                 x_line = np.arange(MELT_FRAME, nframes)
                 y_line = exp_decay(x_line, *popt)
-                ax.plot(x_line, y_line, color=ds_color, linewidth=2.0,
-                        label=f"{label} fit (τ={tau_fit:.1f}, R²={r2:.2f})")
+                # Plot fit line (same color, label only depth)
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0,
+                        label=f"{depth_label} μm")
 
-                # Intercept at MELT_FRAME
+                # Intercept at MELT_FRAME for console info (not changing plotting unless desired)
                 T_melt = float(exp_decay(MELT_FRAME, *popt))
-                print(f"DS{i}: T@frame {MELT_FRAME} (extrapolated) = {T_melt:.1f} °C, tau={tau_fit:.2f}, R²={r2:.3f}")
+                print(f"DS{i}: T@frame {MELT_FRAME} (extrapolated) = {T_melt:.1f} °C, tau={tau_fit:.2f}")
 
             except Exception as e:
                 print(f"DS{i}: curve_fit failed: {e}")
@@ -287,7 +288,10 @@ def main():
     ax.set_title(f"Raw temperature scatter and exponential decay fits (fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})")
     ax.axvline(MELT_FRAME, color='0.5', linestyle='--', linewidth=1.0)
     ax.axvline(FIT_START, color='0.6', linestyle=':', linewidth=1.0)
-    ax.legend(ncol=2, fontsize=9)
+
+    # Legend: only shows which curve corresponds to which depth
+    ax.legend(ncol=1, fontsize=10)
+
     fig.tight_layout()
     plt.show()
 
