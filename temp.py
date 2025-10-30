@@ -15,7 +15,7 @@ except ImportError:
 WINDOW = 0.50       # fitting window width (in q units)
 MIN_POINTS = 5      # minimum points in window to try a fit
 SEED_FRAMES = 30    # frames used to define baseline a0
-MAX_FRAMES = 200    # max frames processed
+MAX_FRAMES = 500    # max frames processed
 
 # Frames of interest
 MELT_FRAME = 57    # where melting happened (intercept point)
