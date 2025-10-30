@@ -19,7 +19,7 @@ MAX_FRAMES = 200    # max frames processed
 
 # Frames of interest
 MELT_FRAME = 59   # where melting happened (intercept point)
-FIT_START  = 60    # start frame for exponential fit
+FIT_START  = 59    # start frame for exponential fit
 FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
 
 # Reflection (set to your peak)
@@ -304,7 +304,7 @@ def main():
                 # Extrapolate from MELT_FRAME onward
                 x_line = np.arange(MELT_FRAME, nframes)
                 y_line = exp_bi(x_line, *popt)
-                line = ['--', '-.', ':'][i % 3]  # different line style per dataset
+                line = ['-', '--', '.'][i % 3]  # different line style per dataset
                 # Plot fit line (same color, label only depth)
                 ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,  
                         label=f"{depth_label} μm")
