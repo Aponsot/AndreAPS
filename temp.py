@@ -286,7 +286,7 @@ def main():
 
             # Weight early points more: sigma small near FIT_START -> higher weight
             # curve_fit minimizes sum((resid/sigma)^2), so smaller sigma increases weight.
-            w_strength = .4  # increase to 1.0 for stronger emphasis on early points
+            w_strength = .3  # increase to 1.0 for stronger emphasis on early points
             sigma = 1.0 / (1.0 + w_strength * (x_fit - FIT_START))
 
             try:
