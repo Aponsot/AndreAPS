@@ -247,7 +247,74 @@ def main():
         y_fit = T_full_C[fit_idx]
 
         print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
+        # Build fit window and fit bi-exponential decay (weighted to emphasize early times)
+        max_frame_for_fit = min(nframes - 1, FIT_END)
+        fit_mask = finite_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
+        fit_idx = np.where(fit_mask)[0]
+        x_fit = frames[fit_idx]
+        y_fit = T_full_C[fit_idx]
+
+        print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
         if y_fit.size >= 8 and np.ptp(x_fit) > 0:
+            # Initial guesses
+            last_n = max(3, min(10, y_fit.size))
+            c0 = float(np.nanmedian(y_fit[-last_n:]))
+            A_total = float(y_fit[0] - c0)
+            # Ensure positive total amplitude (cooling)
+            if A_total < 0:
+                # If initial guess suggests heating (unlikely), flip sign to enforce cooling
+                A_total = abs(A_total)
+
+            # Split amplitude between fast and slow components
+            A1_0 = 0.7 * A_total  # more weight to fast component
+            A2_0 = 0.3 * A_total
+
+            span = float(x_fit[-1] - x_fit[0])
+            # Fast component should be small compared to span
+            tau1_0 = max(2.0, span / 15.0)
+            # Slow component noticeably larger
+            tau2_0 = max(10.0, span / 3.0)
+
+            # Bounds:
+            # - c near late-time median (± 2*|A_total|)
+            # - A1, A2 >= 0 (monotonic decay)
+            # - tau1 small-ish; tau2 larger
+            c_lo = c0 - 2.0 * abs(A_total)
+            c_hi = c0 + 2.0 * abs(A_total)
+            tau1_hi = max(5.0, span / 8.0)     # tighten upper bound for fast time constant
+            tau2_lo = max(8.0, span / 6.0)     # ensure slow time constant is not too small
+
+            # Weight early points more: sigma small near FIT_START -> higher weight
+            # curve_fit minimizes sum((resid/sigma)^2), so smaller sigma increases weight.
+            w_strength = 0.6  # increase to 1.0 for stronger emphasis on early points
+            sigma = 1.0 / (1.0 + w_strength * (x_fit - FIT_START))
+
+            try:
+                popt, pcov = curve_fit(
+                    exp_bi, x_fit, y_fit,
+                    p0=(c0, A1_0, tau1_0, A2_0, tau2_0),
+                    bounds=([c_lo, 0.0, 1e-3, 0.0, tau2_lo],
+                            [c_hi, 1e6, tau1_hi, 1e6, 1e6]),
+                    sigma=sigma,
+                    absolute_sigma=True,
+                    maxfev=10000
+                )
+                c_fit, A1_fit, tau1_fit, A2_fit, tau2_fit = popt
+
+                # Extrapolate from MELT_FRAME onward
+                x_line = np.arange(MELT_FRAME, nframes)
+                y_line = exp_bi(x_line, *popt)
+                # Plot fit line (same color, label only depth)
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0,
+                        label=f"{depth_label} μm")
+
+                # Intercept at MELT_FRAME for console info
+                T_melt = float(exp_bi(MELT_FRAME, *popt))
+                print(f"Depth {depth_label} μm: T@{MELT_FRAME} = {T_melt:.1f} °C; τ_fast={tau1_fit:.1f}, τ_slow={tau2_fit:.1f}")
+            except Exception as e:
+                print(f"DS{i}: bi-exponential curve_fit failed: {e}")
+        else:
+            print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
             # Initial guesses
             last_n = max(3, min(10, y_fit.size))
             c0 = float(np.nanmedian(y_fit[-last_n:]))
@@ -283,8 +350,8 @@ def main():
 
             except Exception as e:
                 print(f"DS{i}: bi-exponential curve_fit failed: {e}")
-        else:
-            print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
+            else:
+                print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
 
     # Decorate single plot
     ax.grid(True, alpha=0.3)
