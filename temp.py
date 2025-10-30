@@ -239,53 +239,46 @@ def main():
             print(f"DS{i}: No valid centers; skipping.")
             continue
 
-        # Compute a per frame and fractional delta
+# Compute a per frame and fractional delta
         G_norm = sqrt(h**2 + k**2 + l**2)
-        q_valid = centers[valid]
-        a = (2.0 * pi / q_valid) * G_norm
-        delta = (a - a0) / a0
+        a_full = np.full(nframes, np.nan)
+        a_full[valid] = (2.0 * pi / centers[valid]) * G_norm
+        delta_full = (a_full - a0) / a0  # full-length, with NaNs where invalid
 
-        # Temperature from polynomial via lookup (anchored to T_REF)
-        T_frame_K = T_from_delta_poly_lookup_K(delta, Tref_K=T_REF_K)
-        T_frame_C = T_frame_K - 273.15
+        # Temperature from polynomial via lookup (anchored to T_REF), aligned to frames
+        T_full_K = np.full(nframes, np.nan)
+        # Lookup only on valid frames
+        T_valid_K = T_from_delta_poly_lookup_K(delta_full[valid], Tref_K=T_REF_K)
+        T_full_K[valid] = T_valid_K
+        T_full_C = T_full_K - 273.15
 
-        # Left panel: scatter of temperature vs frame
-        valid_T = np.isfinite(T_frame_C)
-        ds_mask = valid.copy()
-        ds_mask[valid] = valid_T  # apply temperature validity only where centers valid
-
+        # Left panel: scatter of temperature vs frame (raw-only)
+        ds_mask = np.isfinite(T_full_C)
         depth_label = depths_um[i % len(depths_um)]
-        ax_left.scatter(frames[ds_mask], T_frame_C[valid_T], s=20, alpha=0.6,
+        ax_left.scatter(frames[ds_mask], T_full_C[ds_mask], s=20, alpha=0.6,
                         marker=markers[i % len(markers)], color=Color,
                         label=f"depth {depth_label} um")
 
-        # Right panel: exponential fit on frames FIT_START..FIT_END, extrapolate back to MELT_FRAME
+        # Right panel: exponential fit on frames FIT_START..max_frame_for_fit; show only the fit
         max_frame_for_fit = min(nframes - 1, FIT_END)
-        fit_mask = valid.copy()
-        fit_mask &= (frames >= FIT_START) & (frames <= max_frame_for_fit)
-        # Also require finite temperatures
-        fit_mask[valid] &= valid_T
-
+        fit_mask = ds_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
         x_fit_data = frames[fit_mask]
-        y_fit_data = T_frame_C[valid_T][(frames[valid] >= FIT_START) & (frames[valid] <= max_frame_for_fit)]
-        # Guard against insufficient data
-        if x_fit_data.size >= 5 and y_fit_data.size == x_fit_data.size:
-            # Build model: y = c + amplitude * exp(decay * x), with decay < 0
+        y_fit_data = T_full_C[fit_mask]
+
+        if x_fit_data.size >= 5:
+            # Model: y = c + amplitude * exp(decay * x), with decay < 0
             model = ConstantModel() + ExponentialModel()
-            # Initial guesses: c ~ median of last few points, amplitude ~ first - c, decay negative
             last_n = max(3, min(10, x_fit_data.size))
             c0 = float(np.nanmedian(y_fit_data[-last_n:]))
             a0_exp = float(y_fit_data[0] - c0)
-            decay0 = -0.02  # reasonable starting slope per frame
+            decay0 = -0.02  # starting slope per frame
 
             params = model.make_params(c=c0, amplitude=a0_exp, decay=decay0)
-            params['decay'].set(max=-1e-6)  # force decay to be negative (decay)
-            # Fit
+            params['decay'].set(max=-1e-6)  # force decay to be negative
+
             try:
                 result = model.fit(y_fit_data, params, x=x_fit_data, nan_policy="omit")
                 p = result.params
-                c_fit     = p['c'].value
-                amp_fit   = p['amplitude'].value
                 decay_fit = p['decay'].value
                 tau_fit   = (-1.0 / decay_fit) if decay_fit < 0 else np.inf
 
@@ -299,14 +292,10 @@ def main():
         else:
             print(f"DS{i}: Not enough points for exp fit in frames {FIT_START}..{max_frame_for_fit}.")
 
-        # Optional: overlay faint scatter on right to show raw points (can comment out)
-        ax_right.scatter(frames[ds_mask], T_frame_C[valid_T], s=16, alpha=0.25,
-                         marker=markers[i % len(markers)], color=Color)
-
         # Diagnostics
-        dmin, dmax = float(np.nanmin(delta)), float(np.nanmax(delta))
-        valid_idx = np.where(valid)[0]
-        baseline_idx = valid_idx[valid_idx < min(SEED_FRAMES, nframes)]
+        dmin = float(np.nanmin(delta_full))
+        dmax = float(np.nanmax(delta_full))
+        baseline_idx = np.where(valid & (frames < min(SEED_FRAMES, nframes)))[0]
         if baseline_idx.size > 0:
             a_baseline = (2.0 * pi / centers[baseline_idx]) * G_norm
             baseline_delta_median = float(np.nanmedian((a_baseline - a0) / a0))
@@ -315,9 +304,10 @@ def main():
         print(f"DS{i}: a0={a0:.5f} Å, baseline median Δa/a0={baseline_delta_median:.3e}, range={dmin:.3e}..{dmax:.3e}")
 
         if np.any(ds_mask):
-            Tmin_C = float(np.nanmin(T_frame_C[valid_T]))
-            Tmax_C = float(np.nanmax(T_frame_C[valid_T]))
+            Tmin_C = float(np.nanmin(T_full_C[ds_mask]))
+            Tmax_C = float(np.nanmax(T_full_C[ds_mask]))
             print(f"DS{i}: Temperature (°C) range {Tmin_C:.1f} .. {Tmax_C:.1f} (anchored at {T_REF_K - 273.15:.1f} °C)")
+
 
     # Decorate plots
     for ax in (ax_left, ax_right):
