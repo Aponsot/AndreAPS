@@ -18,7 +18,7 @@ SEED_FRAMES = 30    # frames used to define baseline a0
 MAX_FRAMES = 200    # max frames processed
 
 # Frames of interest
-MELT_FRAME = 58     # where melting happened (intercept point)
+MELT_FRAME = 56    # where melting happened (intercept point)
 FIT_START  = 65     # start frame for exponential fit
 FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
 
@@ -237,7 +237,7 @@ def main():
         finite_mask = np.isfinite(T_full_C)
         depth_label = depths_um[i % len(depths_um)]
         ax.scatter(frames[finite_mask], T_full_C[finite_mask],
-                   s=8, alpha=0.8, color=Color, marker=markers[i % len(markers)])
+                   s=8, alpha=0.4, color=Color, marker=markers[i % len(markers)])
 
         # Build fit window and fit bi-exponential decay
         max_frame_for_fit = min(nframes - 1, FIT_END)
@@ -272,8 +272,9 @@ def main():
                 # Extrapolate from MELT_FRAME onward
                 x_line = np.arange(MELT_FRAME, nframes)
                 y_line = exp_bi(x_line, *popt)
+                line = ['--', '-.', ':'][i % 3]  # different line style per dataset
                 # Plot fit line (same color, label only depth)
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0,
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,
                         label=f"{depth_label} μm")
 
                 # Intercept at MELT_FRAME for console info
