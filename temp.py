@@ -15,10 +15,10 @@ except ImportError:
 WINDOW = 0.50       # fitting window width (in q units)
 MIN_POINTS = 5      # minimum points in window to try a fit
 SEED_FRAMES = 30    # frames used to define baseline a0
-MAX_FRAMES = 500    # max frames processed
+MAX_FRAMES = 200    # max frames processed
 
 # Frames of interest
-MELT_FRAME = 57    # where melting happened (intercept point)
+MELT_FRAME = 58     # where melting happened (intercept point)
 FIT_START  = 65     # start frame for exponential fit
 FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
 
@@ -185,12 +185,12 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
 
     return centers, fwhms, a0, nframes
 
-# Simple exponential decay model for curve_fit: y = c + A * exp(-(x - FIT_START)/tau)
-def exp_decay(x, c, A, tau):
-    return c + A * np.exp(-(x - FIT_START) / tau)
+# Bi-exponential model: fast + slow components
+def exp_bi(x, c, A1, tau1, A2, tau2):
+    return c + A1 * np.exp(-(x - FIT_START) / tau1) + A2 * np.exp(-(x - FIT_START) / tau2)
 
 def main():
-    ap = argparse.ArgumentParser(description="Raw temperature scatter with simple exponential decay fits and extrapolated intercept at frame 58.")
+    ap = argparse.ArgumentParser(description="Raw temperature scatter with bi-exponential decay fits and extrapolated intercept at frame 58.")
     ap.add_argument("--h5", nargs='+', required=True, help="HDF5 files (one per dataset), must contain 'q' and 'int'")
     ap.add_argument("--center", nargs='+', type=float, required=True, help="Initial peak center guesses (in q units, 1/Å)")
     args = ap.parse_args()
@@ -200,10 +200,10 @@ def main():
 
     # Plotting config
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
-    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
     # Plot styling (do not change calculations)
-    Color = 'C6'  # single hue for all datasets
+    Color = 'C1'  # single hue for all datasets
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']  # different marker per dataset
     depths_um = [50, 100, 150]  # known depths
 
@@ -237,9 +237,9 @@ def main():
         finite_mask = np.isfinite(T_full_C)
         depth_label = depths_um[i % len(depths_um)]
         ax.scatter(frames[finite_mask], T_full_C[finite_mask],
-                   s=8, alpha=0.4,color=Color, marker=markers[i % len(markers)])
+                   s=8, alpha=0.8, color=Color, marker=markers[i % len(markers)])
 
-        # Build fit window and fit simple exponential decay
+        # Build fit window and fit bi-exponential decay
         max_frame_for_fit = min(nframes - 1, FIT_END)
         fit_mask = finite_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
         fit_idx = np.where(fit_mask)[0]
@@ -247,38 +247,41 @@ def main():
         y_fit = T_full_C[fit_idx]
 
         print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
-        if y_fit.size >= 5 and np.ptp(x_fit) > 0:
+        if y_fit.size >= 8 and np.ptp(x_fit) > 0:
             # Initial guesses
             last_n = max(3, min(10, y_fit.size))
             c0 = float(np.nanmedian(y_fit[-last_n:]))
-            A0 = float(y_fit[0] - c0)
-            if abs(A0) < 1e-6:
-                A0 = 1.0
-            tau0 = max(5.0, (x_fit[-1] - x_fit[0]) / 3.0)
+            A_total = float(y_fit[0] - c0)
+            # Split amplitude between fast and slow components
+            A1_0 = 0.6 * A_total
+            A2_0 = 0.4 * A_total
+            span = float(x_fit[-1] - x_fit[0])
+            tau1_0 = max(2.0, span / 12.0)   # fast component
+            tau2_0 = max(8.0, span / 3.0)    # slow component
 
             try:
                 popt, pcov = curve_fit(
-                    exp_decay, x_fit, y_fit,
-                    p0=(c0, A0, tau0),
-                    bounds=([-1e6, -1e6, 1e-6], [1e6, 1e6, 1e6]),
-                    maxfev=5000
+                    exp_bi, x_fit, y_fit,
+                    p0=(c0, A1_0, tau1_0, A2_0, tau2_0),
+                    bounds=([-1e6, -1e6, 1e-3, -1e6, 1e-3],
+                            [ 1e6,  1e6, 1e6,  1e6, 1e6]),
+                    maxfev=8000
                 )
-                c_fit, A_fit, tau_fit = popt
+                c_fit, A1_fit, tau1_fit, A2_fit, tau2_fit = popt
 
                 # Extrapolate from MELT_FRAME onward
                 x_line = np.arange(MELT_FRAME, nframes)
-                y_line = exp_decay(x_line, *popt)
+                y_line = exp_bi(x_line, *popt)
                 # Plot fit line (same color, label only depth)
-                line = ['-','--',':'][i % 3]
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,  
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0,
                         label=f"{depth_label} μm")
 
-                # Intercept at MELT_FRAME for console info (not changing plotting unless desired)
-                T_melt = float(exp_decay(MELT_FRAME, *popt))
-                print(f"DS{i}: T@frame {MELT_FRAME} (extrapolated) = {T_melt:.1f} °C, tau={tau_fit:.2f}")
+                # Intercept at MELT_FRAME for console info
+                T_melt = float(exp_bi(MELT_FRAME, *popt))
+                print(f"Depth {depth_label} μm: T@{MELT_FRAME} = {T_melt:.1f} °C; τ_fast={tau1_fit:.1f}, τ_slow={tau2_fit:.1f}")
 
             except Exception as e:
-                print(f"DS{i}: curve_fit failed: {e}")
+                print(f"DS{i}: bi-exponential curve_fit failed: {e}")
         else:
             print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
 
@@ -286,7 +289,7 @@ def main():
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("Frame")
     ax.set_ylabel("Temperature (°C)")
-    ax.set_title(f"Raw temperature scatter and exponential decay fits (fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})")
+    ax.set_title(f"Raw temperature scatter and bi-exponential decay fits (fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})")
     ax.axvline(MELT_FRAME, color='0.5', linestyle='--', linewidth=1.0)
     ax.axvline(FIT_START, color='0.6', linestyle=':', linewidth=1.0)
 
