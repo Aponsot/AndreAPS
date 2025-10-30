@@ -200,10 +200,10 @@ def main():
 
     # Plotting config
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
 
     # Plot styling (do not change calculations)
-    Color = 'C1'  # single hue for all datasets
+    Color = 'C6' # single hue for all datasets
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']  # different marker per dataset
     depths_um = [50, 100, 150]  # known depths
 
@@ -304,8 +304,9 @@ def main():
                 # Extrapolate from MELT_FRAME onward
                 x_line = np.arange(MELT_FRAME, nframes)
                 y_line = exp_bi(x_line, *popt)
+                line = ['--', '-.', ':'][i % 3]  # different line style per dataset
                 # Plot fit line (same color, label only depth)
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0,
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,  
                         label=f"{depth_label} μm")
 
                 # Intercept at MELT_FRAME for console info
@@ -325,34 +326,6 @@ def main():
             span = float(x_fit[-1] - x_fit[0])
             tau1_0 = max(1.0, span / 15.0)  # fast component
             tau2_0 = max(8.0, span / 3.0)    # slow component
-
-            try:
-                popt, pcov = curve_fit(
-                    exp_bi, x_fit, y_fit,
-                    p0=(c0, A1_0, tau1_0, A2_0, tau2_0),
-                    bounds=([-1e6, -1e6, 1e-3, -1e6, 1e-3],
-                            [ 1e6,  1e6, 1e6,  1e6, 1e6]),
-                    maxfev=8000
-                )
-                c_fit, A1_fit, tau1_fit, A2_fit, tau2_fit = popt
-
-                # Extrapolate from MELT_FRAME onward
-                x_line = np.arange(MELT_FRAME, nframes)
-                y_line = exp_bi(x_line, *popt)
-                line = ['--', '-.', ':'][i % 3]  # different line style per dataset
-                # Plot fit line (same color, label only depth)
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,
-                        label=f"{depth_label} μm")
-
-                # Intercept at MELT_FRAME for console info
-                T_melt = float(exp_bi(MELT_FRAME, *popt))
-                print(f"Depth {depth_label} μm: T@{MELT_FRAME} = {T_melt:.1f} °C; τ_fast={tau1_fit:.1f}, τ_slow={tau2_fit:.1f}")
-
-            except Exception as e:
-                print(f"DS{i}: bi-exponential curve_fit failed: {e}")
-            else:
-                print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
-
     # Decorate single plot
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("Frame")
