@@ -221,7 +221,7 @@ def main():
     fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(12, 5), sharex=True)
     markers    = ['o', 's', 'D', '^', 'v', 'p', 'X']
     linestyles = ['-', '--', ':']  # different line style per dataset
-    Color      = 'C1'              # single hue for all, as requested
+    Color      = 'C1'              # single hue for all
     depths_um  = [50, 100, 150]    # labels for datasets
 
     dataset_iter = range(len(args.h5))
@@ -239,60 +239,59 @@ def main():
             print(f"DS{i}: No valid centers; skipping.")
             continue
 
-# Compute a per frame and fractional delta
+        # Compute a per frame and fractional delta (full-length, aligned to frames)
         G_norm = sqrt(h**2 + k**2 + l**2)
         a_full = np.full(nframes, np.nan)
         a_full[valid] = (2.0 * pi / centers[valid]) * G_norm
-        delta_full = (a_full - a0) / a0  # full-length, with NaNs where invalid
+        delta_full = (a_full - a0) / a0  # NaNs where invalid
 
         # Temperature from polynomial via lookup (anchored to T_REF), aligned to frames
         T_full_K = np.full(nframes, np.nan)
-        # Lookup only on valid frames
-        T_valid_K = T_from_delta_poly_lookup_K(delta_full[valid], Tref_K=T_REF_K)
-        T_full_K[valid] = T_valid_K
+        T_full_K[valid] = T_from_delta_poly_lookup_K(delta_full[valid], Tref_K=T_REF_K)
         T_full_C = T_full_K - 273.15
 
-        # Left panel: scatter of temperature vs frame (raw-only)
-        ds_mask = np.isfinite(T_full_C)
         depth_label = depths_um[i % len(depths_um)]
+
+        # Left panel: raw scatter only
+        ds_mask = np.isfinite(T_full_C)
         ax_left.scatter(frames[ds_mask], T_full_C[ds_mask], s=20, alpha=0.6,
                         marker=markers[i % len(markers)], color=Color,
                         label=f"depth {depth_label} um")
 
-        # Right panel: exponential fit on frames FIT_START..max_frame_for_fit; show only the fit
+        # Right panel: exponential fit (frames FIT_START..FIT_END), fit-only
         max_frame_for_fit = min(nframes - 1, FIT_END)
         fit_mask = ds_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
         x_fit_data = frames[fit_mask]
         y_fit_data = T_full_C[fit_mask]
 
         if x_fit_data.size >= 5:
-            # Model: y = c + amplitude * exp(decay * x), with decay < 0
-            model = ConstantModel() + ExponentialModel()
+            model = ConstantModel() + ExponentialModel()  # y = c + A * exp(decay * x)
             last_n = max(3, min(10, x_fit_data.size))
             c0 = float(np.nanmedian(y_fit_data[-last_n:]))
             a0_exp = float(y_fit_data[0] - c0)
             decay0 = -0.02  # starting slope per frame
 
             params = model.make_params(c=c0, amplitude=a0_exp, decay=decay0)
-            params['decay'].set(max=-1e-6)  # force decay to be negative
+            params['decay'].set(max=-1e-6)  # force decay negative
 
             try:
                 result = model.fit(y_fit_data, params, x=x_fit_data, nan_policy="omit")
                 p = result.params
                 decay_fit = p['decay'].value
-                tau_fit   = (-1.0 / decay_fit) if decay_fit < 0 else np.inf
+                tau_fit = (-1.0 / decay_fit) if decay_fit < 0 else np.inf
 
-                # Extrapolate and plot from MELT_FRAME to max_frame_for_fit
+                # Extrapolate from MELT_FRAME to max_frame_for_fit
                 x_line = np.arange(MELT_FRAME, max_frame_for_fit + 1)
                 y_line = model.eval(params=p, x=x_line)
                 ax_right.plot(x_line, y_line, linestyle=linestyles[i % len(linestyles)],
-                              color=Color, linewidth=1.8, label=f"depth {depth_label} um (τ≈{tau_fit:.1f} frames)")
+                              color=Color, linewidth=1.8,
+                              label=f"depth {depth_label} um (τ≈{tau_fit:.1f} frames)")
             except Exception as e:
                 print(f"DS{i}: Exp fit failed: {e}")
         else:
             print(f"DS{i}: Not enough points for exp fit in frames {FIT_START}..{max_frame_for_fit}.")
 
-        # Diagnostics
+        # Diagnostics (compute once, from full-length arrays)
         dmin = float(np.nanmin(delta_full))
         dmax = float(np.nanmax(delta_full))
         baseline_idx = np.where(valid & (frames < min(SEED_FRAMES, nframes)))[0]
@@ -307,7 +306,6 @@ def main():
             Tmin_C = float(np.nanmin(T_full_C[ds_mask]))
             Tmax_C = float(np.nanmax(T_full_C[ds_mask]))
             print(f"DS{i}: Temperature (°C) range {Tmin_C:.1f} .. {Tmax_C:.1f} (anchored at {T_REF_K - 273.15:.1f} °C)")
-
 
     # Decorate plots
     for ax in (ax_left, ax_right):
