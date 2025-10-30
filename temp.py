@@ -260,13 +260,19 @@ def main():
 
         # Right panel: exponential fit (frames FIT_START..FIT_END), fit-only
         max_frame_for_fit = min(nframes - 1, FIT_END)
-        fit_mask = ds_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
-        x_fit_data = frames[fit_mask]
-        y_fit_data = T_full_C[fit_mask]
+        fit_window_mask = (frames >= FIT_START) & (frames <= max_frame_for_fit)
+        finite_mask = np.isfinite(T_full_C)
+        fit_idx = np.where(fit_window_mask & finite_mask)[0]
 
-        if x_fit_data.size >= 5:
+        x_fit_data = frames[fit_idx]
+        y_fit_data = T_full_C[fit_idx]
+
+        # Debug/guard: ensure we have enough finite points in the window
+        print(f"DS{i}: fit window frames [{FIT_START}..{max_frame_for_fit}], points available = {y_fit_data.size}")
+        if y_fit_data.size >= 5:
             model = ConstantModel() + ExponentialModel()  # y = c + A * exp(decay * x)
-            last_n = max(3, min(10, x_fit_data.size))
+
+            last_n = max(3, min(10, y_fit_data.size))
             c0 = float(np.nanmedian(y_fit_data[-last_n:]))
             a0_exp = float(y_fit_data[0] - c0)
             decay0 = -0.02  # starting slope per frame
@@ -289,7 +295,7 @@ def main():
             except Exception as e:
                 print(f"DS{i}: Exp fit failed: {e}")
         else:
-            print(f"DS{i}: Not enough points for exp fit in frames {FIT_START}..{max_frame_for_fit}.")
+            print(f"DS{i}: Not enough finite points for exp fit in frames {FIT_START}..{max_frame_for_fit}.")
 
         # Diagnostics (compute once, from full-length arrays)
         dmin = float(np.nanmin(delta_full))
