@@ -18,8 +18,8 @@ SEED_FRAMES = 30    # frames used to define baseline a0
 MAX_FRAMES = 200    # max frames processed
 
 # Frames of interest
-MELT_FRAME = 59   # where melting happened (intercept point)
-FIT_START  = 59    # start frame for exponential fit
+MELT_FRAME = 58   # where melting happened (intercept point)
+FIT_START  = 58    # start frame for exponential fit
 FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
 
 # Reflection (set to your peak)
