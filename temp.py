@@ -281,7 +281,7 @@ def main():
             # - tau1 small-ish; tau2 larger
             c_lo = c0 - 2.0 * abs(A_total)
             c_hi = c0 + 2.0 * abs(A_total)
-            tau1_hi = max(5.0, span / 8.0)     # tighten upper bound for fast time constant
+            tau1_hi = max(5.0, span / 10.0)     # tighten upper bound for fast time constant
             tau2_lo = max(8.0, span / 6.0)     # ensure slow time constant is not too small
 
             # Weight early points more: sigma small near FIT_START -> higher weight
