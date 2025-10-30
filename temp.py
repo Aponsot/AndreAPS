@@ -247,7 +247,7 @@ def main():
         T_frame_C = T_frame_K - 273.15
         valid_T = np.isfinite(T_frame_C)
 
-        ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.4,linestyles=linestyles[i % len(linestyles)],
+        ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.6,
              marker=markers[i % len(markers)], label=f"depth {depth[i]}um", color=Color)
         v_fwhm = np.isfinite(fwhms)
         ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
