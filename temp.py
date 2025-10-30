@@ -215,7 +215,7 @@ def main():
     fig, axes = plt.subplots(2, 2, figsize=(10, 8))
     ax_q, ax_fwhm, ax_ratio, ax_T = axes.ravel()
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
-    Color ='C0'
+    Color ='C1'
     dataset_iter = range(len(args.h5))
     if tqdm is not None:
         dataset_iter = tqdm(dataset_iter, desc="Datasets")
