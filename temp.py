@@ -203,7 +203,7 @@ def main():
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
     # Plot styling (do not change calculations)
-    Color = 'C1'  # single hue for all datasets
+    Color = 'C6'  # single hue for all datasets
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']  # different marker per dataset
     depths_um = [50, 100, 150]  # known depths
 
