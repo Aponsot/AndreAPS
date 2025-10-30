@@ -200,7 +200,7 @@ def main():
 
     # Plotting config
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
-    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
 
     # Plot styling (do not change calculations)
     Color = 'C6'  # single hue for all datasets
