@@ -200,10 +200,10 @@ def main():
 
     # Plotting config
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
 
     # Plot styling (do not change calculations)
-    Color = 'C1'  # single hue for all datasets
+    Color = 'C6' # single hue for all datasets
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']  # different marker per dataset
     depths_um = [50, 100, 150]  # known depths
 
@@ -269,7 +269,8 @@ def main():
                 x_line = np.arange(MELT_FRAME, nframes)
                 y_line = exp_decay(x_line, *popt)
                 # Plot fit line (same color, label only depth)
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0,
+                line = ['-', '--', ':'][i % 3]  # different line style per dataset
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,
                         label=f"{depth_label} μm")
 
                 # Intercept at MELT_FRAME for console info (not changing plotting unless desired)
