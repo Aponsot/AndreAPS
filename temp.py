@@ -323,7 +323,7 @@ def main():
             A1_0 = 0.5* A_total
             A2_0 = 0.5* A_total
             span = float(x_fit[-1] - x_fit[0])
-            tau1_0 = max(2.0, span / 15.0)  # fast component
+            tau1_0 = max(1.0, span / 15.0)  # fast component
             tau2_0 = max(8.0, span / 3.0)    # slow component
 
             try:
