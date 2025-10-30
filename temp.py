@@ -253,8 +253,8 @@ def main():
             c0 = float(np.nanmedian(y_fit[-last_n:]))
             A_total = float(y_fit[0] - c0)
             # Split amplitude between fast and slow components
-            A1_0 = 0.6 * A_total
-            A2_0 = 0.4 * A_total
+            A1_0 = 0.5* A_total
+            A2_0 = 0.5* A_total
             span = float(x_fit[-1] - x_fit[0])
             tau1_0 = max(2.0, span / 12.0)   # fast component
             tau2_0 = max(8.0, span / 3.0)    # slow component
