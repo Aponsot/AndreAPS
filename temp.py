@@ -215,7 +215,7 @@ def main():
     fig, axes = plt.subplots(2, 2, figsize=(10, 8))
     ax_q, ax_fwhm, ax_ratio, ax_T = axes.ravel()
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']
-
+    Color ='blue'
     dataset_iter = range(len(args.h5))
     if tqdm is not None:
         dataset_iter = tqdm(dataset_iter, desc="Datasets")
@@ -247,12 +247,12 @@ def main():
         valid_T = np.isfinite(T_frame_C)
 
         ax_T.scatter(frames[valid][valid_T], T_frame_C[valid_T], s=12, alpha=0.7,
-             marker=markers[i % len(markers)], label=f"depth {depth[i]}m")
+             marker=markers[i % len(markers)], label=f"depth {depth[i]}um")
         v_fwhm = np.isfinite(fwhms)
         ax_fwhm.scatter(frames[v_fwhm], fwhms[v_fwhm], s=12, alpha=0.7,
                         marker=markers[i % len(markers)], label=f"DS{i}")
         ax_ratio.scatter(frames[valid], a / a0, s=12, alpha=0.7,
-                         marker=markers[i % len(markers)], label=f"DS{i}")
+                         marker=markers[i % len(markers)], label=f"DS{i}",Color=Color)
         # Sanity prints
         dmin, dmax = float(np.nanmin(delta)), float(np.nanmax(delta))
         valid_idx = np.where(valid)[0]
