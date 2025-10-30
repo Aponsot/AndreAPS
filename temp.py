@@ -237,7 +237,7 @@ def main():
         finite_mask = np.isfinite(T_full_C)
         depth_label = depths_um[i % len(depths_um)]
         ax.scatter(frames[finite_mask], T_full_C[finite_mask],
-                   s=8, alpha=0.8, color=Color, marker=markers[i % len(markers)])
+                   s=8, alpha=0.2, color=Color, marker=markers[i % len(markers)])
 
         # Build fit window and fit simple exponential decay
         max_frame_for_fit = min(nframes - 1, FIT_END)
