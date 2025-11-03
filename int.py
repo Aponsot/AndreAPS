@@ -226,10 +226,6 @@ def integrate_em(tiff_folder: str,
         plt.tight_layout()
         plt.show()
     
-    total_time = time.time() - start_time
-    print(f"\nCompleted in {total_time:.2f}s ({total_time/nframes:.3f}s/frame)")
-    print("=" * 70)
-    
     return output_file
 
 
@@ -244,3 +240,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
+
