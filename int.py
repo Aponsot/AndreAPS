@@ -197,7 +197,7 @@ def integrate_em(tiff_folder: str,
 
         # Concurrency: default to 16 workers (override via CLI)
         if max_workers is None:
-            max_workers = min(16, os.cpu_count() or 1)
+            max_workers = min(32, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
 
         processing_start = time.time()
@@ -250,4 +250,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
+
 
