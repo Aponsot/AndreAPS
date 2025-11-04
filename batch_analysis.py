@@ -16,7 +16,7 @@ WINDOW = 0.20
 # - min_sigma prevents “delta-like” peaks smaller than sampling resolution.
 # - max_sigma prevents a single broad peak from absorbing background/overlaps.
 MIN_SIGMA_ABS = 0.001      # absolute lower bound on sigma (q units)
-MAX_SIGMA_ABS = 0.012      # absolute upper bound on sigma (q units)
+MAX_SIGMA_ABS = 0.015      # absolute upper bound on sigma (q units)
 MAX_SIGMA_FRAC = 0.20      # also cap sigma to this fraction of WINDOW
 
 # Seeding: allowed per-frame center movement (q units)
@@ -549,6 +549,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
