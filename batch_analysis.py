@@ -43,6 +43,22 @@ SCATTER_MARKER_SIZE = 12
 SCATTER_CMAP = "plasma"
 SCATTER_VMAX_PERCENTILE = 99  # clip color scale to this percentile of heights
 
+# ------------------------------
+# Background controls (new)
+# ------------------------------
+
+# Use a lower quantile as baseline to seed sigma/height robustly
+BASELINE_QUANTILE = 0.20
+
+# Robust background initialization excluding peak neighborhoods
+BKG_EXCLUDE_RADIUS = 0.010      # q units to exclude around each peak center
+BKG_TRIM_FRACTION = 0.30        # fraction of largest residuals trimmed in robust line fit
+BKG_SLOPE_TOL = 0.5             # allowed deviation around robust slope (intensity per q)
+BKG_SLOPE_MAX_ABS = 2.0         # hard cap for slope magnitude (intensity per q)
+
+# Use robust loss in least-squares to reduce outlier impact
+USE_ROBUST_LOSS = True
+
 
 # ------------------------------
 # Core utilities
@@ -82,20 +98,56 @@ def _estimate_sigma0(xw, yw, baseline, cx):
     fwhm = max(xr - xl, np.mean(np.diff(xw)))
     return max(fwhm / 2.354820045, MIN_SIGMA_ABS)
 
+def _robust_line_fit(x, y, max_iter=4, trim_frac=0.30):
+    # Simple trimmed regression: fit, trim largest residuals, refit
+    m, b = np.polyfit(x, y, 1)
+    for _ in range(max_iter):
+        resid = y - (m * x + b)
+        cutoff = np.quantile(np.abs(resid), 1.0 - trim_frac)
+        keep = np.abs(resid) <= cutoff
+        if keep.sum() < max(3, int(0.2 * len(x))):
+            break
+        m, b = np.polyfit(x[keep], y[keep], 1)
+    return float(m), float(b)
+
+def _background_init(xw, yw, centers, exclude_radius):
+    mask = np.ones_like(xw, dtype=bool)
+    for cx in centers:
+        mask &= (np.abs(xw - cx) > exclude_radius)
+    if mask.sum() >= max(5, int(0.2 * len(xw))):
+        m, b = _robust_line_fit(xw[mask], yw[mask], trim_frac=BKG_TRIM_FRACTION)
+    else:
+        # Fallback if not enough off-peak points: use flat baseline near lower envelope
+        m = 0.0
+        b = np.quantile(yw, BASELINE_QUANTILE)
+    # Bound slope reasonably
+    m = float(np.clip(m, -BKG_SLOPE_MAX_ABS, BKG_SLOPE_MAX_ABS))
+    return m, float(b)
+
 def build_model(xw, yw, centers, baseline, center_bounds=None, init_from=None):
     """
     Build a model with a linear background and Gaussian peaks at given centers.
     Sigma is constrained by data sampling and instrument bounds.
     Amplitude is non-negative. Center bounds come from center_bounds or default to window edges.
+    Background slope is initialized robustly and bounded to avoid runaway tilt.
     """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
     # Data-informed sigma bounds
     min_sigma = max(0.75 * dx, MIN_SIGMA_ABS)
     max_sigma = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
 
+    # Robust background initialization excluding peak neighborhoods
+    init_slope, init_intercept = _background_init(xw, yw, centers, BKG_EXCLUDE_RADIUS)
     bkg = LinearModel(prefix="bkg_")
     model = bkg
-    params = bkg.make_params(slope=0.0, intercept=baseline)
+    params = bkg.make_params(slope=init_slope, intercept=init_intercept)
+
+    # Constrain slope around robust estimate; hard cap prevents runaway tilt
+    smin = max(-BKG_SLOPE_MAX_ABS, init_slope - BKG_SLOPE_TOL)
+    smax = min(BKG_SLOPE_MAX_ABS,  init_slope + BKG_SLOPE_TOL)
+    params["bkg_slope"].set(min=smin, max=smax, value=init_slope, vary=True)
+    # Intercept can vary freely (add bounds if your data requires)
+    params["bkg_intercept"].set(value=init_intercept, vary=True)
 
     for i, cx in enumerate(centers):
         gi = GaussianModel(prefix=f"g{i}_")
@@ -184,6 +236,17 @@ def _detect_bounds_stuck_centers(result, center_bounds, frac_tol=0.05):
             hits += 1
     return hits >= max(1, n // 2)
 
+def _param_at_bounds(result, name, frac_tol=0.05):
+    """Check if a parameter is near its min/max bounds."""
+    if name not in result.params:
+        return False
+    p = result.params[name]
+    if (p.min is None) or (p.max is None):
+        return False
+    rng = max(p.max - p.min, 1e-12)
+    rel = (p.value - p.min) / rng
+    return (rel < frac_tol) or (rel > 1 - frac_tol)
+
 def in_any_range(frame, ranges):
     for a, b in ranges:
         if a <= frame <= b:
@@ -203,6 +266,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
       - Free bounds within the window in frames within FREE_RANGES (amorphous zones).
 
     Fallback: if seeded fit looks poor or centers are stuck on bounds, refit with free bounds (but keep anchor on the initial frame for peak 0).
+             If the background slope is stuck at bounds, refit with the slope frozen to the robust initialization (still linear background).
 
     After fitting, prune peaks with height < HEIGHT_MIN by fixing their amplitude to 0
     (and fixing center/sigma), then refit so pruned components do not affect other parameters.
@@ -218,7 +282,8 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
     if xw.size < 5:
         raise ValueError("Too few points in window.")
 
-    baseline = np.median(yw)
+    # Lower-quantile baseline for robust sigma/height seeding
+    baseline = np.quantile(yw, BASELINE_QUANTILE)
 
     # Seed arrays from previous solution if available
     init_from = None
@@ -256,6 +321,11 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
             cmax = min(xw[-1], prev_c + PER_FRAME_SHIFT)
         center_bounds_seed.append((cmin, cmax))
 
+    # Robust loss configuration
+    loss_kwargs = {}
+    if USE_ROBUST_LOSS:
+        loss_kwargs = {"loss": "soft_l1", "f_scale": robust_sigma(yw)}
+
     # First, seeded (or initial anchored/free) fit
     model_seed, params_seed, sigma_limits = build_model(
         xw, yw, peak_positions, baseline,
@@ -263,13 +333,14 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
         init_from=init_from
     )
     result_seed = model_seed.fit(yw, params_seed, x=xw, calc_covar=False,
-                                 method="least_squares", max_nfev=800)
+                                 method="least_squares", max_nfev=800, **loss_kwargs)
     r2_seed = compute_r2(yw, result_seed.best_fit)
     peaks_seed = extract_peaks(result_seed)
     stuck_seed = _detect_bounds_stuck_centers(result_seed, center_bounds_seed)
+    bkg_stuck = _param_at_bounds(result_seed, "bkg_slope", frac_tol=0.05)
 
-    # Fallback: if quality is poor or centers stuck on bounds
-    use_fallback = (r2_seed < R2_MIN) or (not free_here and stuck_seed)
+    # Fallback: if quality is poor, centers stuck, or background slope stuck at bounds
+    use_fallback = (r2_seed < R2_MIN) or (not free_here and stuck_seed) or bkg_stuck
     if use_fallback:
         center_bounds_fallback = []
         for i, cx in enumerate(peak_positions):
@@ -286,8 +357,13 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
             center_bounds=center_bounds_fallback,
             init_from=init_from
         )
+
+        # If slope was stuck, freeze it to the robust init (still linear background)
+        if bkg_stuck:
+            params_fb["bkg_slope"].set(value=params_fb["bkg_slope"].value, vary=False)
+
         result_fb = model_fb.fit(yw, params_fb, x=xw, calc_covar=False,
-                                 method="least_squares", max_nfev=800)
+                                 method="least_squares", max_nfev=800, **loss_kwargs)
         r2_fb = compute_r2(yw, result_fb.best_fit)
         peaks_fb = extract_peaks(result_fb)
 
@@ -331,7 +407,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
             params_refit[f"g{i}_sigma"].set(value=init_from_refit["sigma"][i], vary=False)
 
         result = model_refit.fit(yw, params_refit, x=xw, calc_covar=False,
-                                 method="least_squares", max_nfev=800)
+                                 method="least_squares", max_nfev=800, **loss_kwargs)
         r2 = compute_r2(yw, result.best_fit)
         peaks = extract_peaks(result)
 
@@ -538,6 +614,9 @@ def main():
     if FREE_RANGES:
         print(f"Free movement ranges (amorphous): {FREE_RANGES}")
     print(f"Sigma bounds: [{MIN_SIGMA_ABS}, {min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)}] q (data-informed)")
+    print(f"Background: BASELINE_QUANTILE={BASELINE_QUANTILE}, EXCLUDE_RADIUS={BKG_EXCLUDE_RADIUS}, "
+          f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_TOL={BKG_SLOPE_TOL}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
+          f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
 
     if args.frame is not None:
         fit_peaks(args.h5, args.frame, peak_positions, plot=True)
@@ -549,12 +628,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
