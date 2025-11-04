@@ -10,7 +10,7 @@ from tqdm import tqdm
 # ------------------------------
 
 # Window (in q units) around the mean of specified peak positions
-WINDOW = 0.15
+WINDOW = 0.20
 
 # Sigma bounds reasoning:
 # - min_sigma prevents “delta-like” peaks smaller than sampling resolution.
@@ -29,7 +29,7 @@ ANCHOR_TOL = 0.005  # q units around the specified first peak position
 R2_MIN = 0.6
 
 # Pruning threshold: remove peaks (set amplitude to 0) if height < HEIGHT_MIN
-HEIGHT_MIN = 1.0
+HEIGHT_MIN = 5.0
 
 # Amorphous/free movement ranges (disable per-frame center constraints in these frame ranges)
 # Example: FREE_RANGES = [(400, 520), (780, 820)]
@@ -549,3 +549,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
