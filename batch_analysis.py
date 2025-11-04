@@ -31,7 +31,12 @@ FREE_RANGES = []
 
 # Plot controls
 SHOW_EXAMPLE_FIT = True   # Show detailed fit for the first frame in map mode
-SUMMARY_PLOTS = True      # Show summary plots (centers and heights vs frame) in map mode
+SUMMARY_PLOTS = False     # Disable line summary plots; we use scatter colored by height instead
+
+# Scatter map styling
+SCATTER_MARKER_SIZE = 12
+SCATTER_CMAP = "plasma"
+SCATTER_VMAX_PERCENTILE = 99  # clip color scale to this percentile of heights
 
 
 # ------------------------------
@@ -146,7 +151,7 @@ def _detect_bounds_stuck(result, center_bounds, sigma_bounds, frac_tol=0.05):
             hits += 1
         if at_bound(sval, smin, smax):
             hits += 1
-    return hits >= max(1, n // 2)  # flag if half or more touch bounds
+    return hits >= max(1, n // 2)
 
 def in_any_range(frame, ranges):
     for a, b in ranges:
@@ -262,7 +267,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
     if len(pruned_indices) > 0:
         init_from_refit = {
             "center": [result.params[f"g{i}_center"].value for i in range(len(peak_positions))],
-            "sigma": [result.params[f"g{i}_sigma"].value for i in range(len(peak_positions))],
+            "sigma":  [result.params[f"g{i}_sigma"].value  for i in range(len(peak_positions))],
             "amplitude": [result.params[f"g{i}_amplitude"].value for i in range(len(peak_positions))]
         }
         model_refit, params_refit = build_model(
@@ -353,8 +358,7 @@ def track_sequential(h5_path, peak_positions):
     Sequentially fit frames with seeding from previous frame and small per-frame shift bounds.
     In frames within FREE_RANGES (amorphous zones), per-frame constraints are disabled.
 
-    Prunes small peaks per frame using HEIGHT_MIN so summary plots are cleaner.
-    Produces summary plots: centers vs frame and heights vs frame.
+    Returns tracking arrays for centers and heights (after pruning).
     """
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
@@ -381,7 +385,7 @@ def track_sequential(h5_path, peak_positions):
                 r2 = out["r2"]
                 r2_tr.append(r2)
 
-                # Extract centers/heights; mask pruned (height < threshold) as NaN for center and 0 height
+                # Extract centers/heights; mask pruned (height < threshold) as NaN center and 0 height
                 for i in range(len(peak_positions)):
                     ai = result.params[f"g{i}_amplitude"].value
                     si = result.params[f"g{i}_sigma"].value
@@ -410,29 +414,6 @@ def track_sequential(h5_path, peak_positions):
 
             first = False
 
-    if SUMMARY_PLOTS:
-        # Summary plots: centers vs frame and heights vs frame
-        plt.rcParams.update({
-            "figure.dpi": 160, "savefig.dpi": 300,
-            "font.size": 16, "axes.labelsize": 18, "axes.titlesize": 20,
-            "xtick.labelsize": 14, "ytick.labelsize": 14,
-        })
-        fig, axs = plt.subplots(2, 1, figsize=(10, 7.5), sharex=True)
-        # Centers
-        for i, pos in enumerate(peak_positions):
-            axs[0].plot(list(frames), centers_tr[i], lw=2, label=f"Peak {i+1} (init {pos:.4f})")
-        axs[0].set_ylabel("Center q (1/Å)")
-        axs[0].grid(alpha=0.3)
-        axs[0].legend(loc="best")
-        # Heights
-        for i, _ in enumerate(peak_positions):
-            axs[1].plot(list(frames), heights_tr[i], lw=2, label=f"Peak {i+1}")
-        axs[1].set_ylabel("Height (a.u.)")
-        axs[1].set_xlabel("Frame")
-        axs[1].grid(alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-
     return {
         "frames": list(frames),
         "centers": centers_tr,
@@ -441,6 +422,49 @@ def track_sequential(h5_path, peak_positions):
         "peak_positions": peak_positions,
         "height_min": HEIGHT_MIN
     }
+
+def plot_scatter_map(tracking):
+    """
+    Plot scatter: frame vs q-center, color = peak height.
+    """
+    frames = tracking["frames"]
+    centers_tr = tracking["centers"]
+    heights_tr = tracking["heights"]
+
+    xs = []  # frame
+    ys = []  # q center
+    cs = []  # height
+
+    for i in range(len(centers_tr)):
+        for f_idx, fr in enumerate(frames):
+            c = centers_tr[i][f_idx]
+            h = heights_tr[i][f_idx]
+            if np.isfinite(c) and h > 0.0:
+                xs.append(fr)
+                ys.append(c)
+                cs.append(h)
+
+    if len(xs) == 0:
+        print("No peaks above height_min found to plot.")
+        return
+
+    # Color clipping to avoid outliers dominating the color scale
+    vmax = np.percentile(cs, SCATTER_VMAX_PERCENTILE) if len(cs) > 20 else max(cs)
+    plt.rcParams.update({
+        "figure.dpi": 160, "savefig.dpi": 300,
+        "font.size": 20, "axes.labelsize": 20, "axes.titlesize": 20,
+        "xtick.labelsize": 16, "ytick.labelsize": 16,
+    })
+
+    plt.figure(figsize=(9, 5))
+    sc = plt.scatter(xs, ys, c=cs, s=SCATTER_MARKER_SIZE, cmap=SCATTER_CMAP, vmin=0.0, vmax=vmax)
+    cbar = plt.colorbar(sc)
+    cbar.set_label("Peak height (a.u.)")
+    plt.xlabel("Frame")
+    plt.ylabel("q (1/Å)")
+    plt.title(f"Peak map (height_min={HEIGHT_MIN})")
+    plt.tight_layout()
+    plt.show()
 
 
 # ------------------------------
@@ -455,7 +479,7 @@ def main():
     parser.add_argument("peaks", type=float, nargs='+',
                         help="Peak q-positions (e.g., 3.025 3.012)")
     parser.add_argument("--frame", type=int, help="Fit a single frame and show plot")
-    parser.add_argument("--map", action="store_true", help="Sequential tracking for all frames")
+    parser.add_argument("--map", action="store_true", help="Sequential tracking across all frames (scatter colored by height)")
 
     args = parser.parse_args()
     peak_positions = sorted(args.peaks)
@@ -468,7 +492,8 @@ def main():
     if args.frame is not None:
         fit_peaks(args.h5, args.frame, peak_positions, plot=True)
     elif args.map:
-        track_sequential(args.h5, peak_positions)
+        tr = track_sequential(args.h5, peak_positions)
+        plot_scatter_map(tr)
     else:
         print("Specify --frame N to fit a single frame, or --map for sequential tracking across all frames.")
 
