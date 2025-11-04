@@ -8,7 +8,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-WINDOW = 0.15
+WINDOW = 0.20
 MIN_SIGMA = 1e-6
 MAX_SIGMA_FRAC = 0.22
 AIC_IMPROVE = 6.0
@@ -254,3 +254,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
