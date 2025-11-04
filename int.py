@@ -8,7 +8,8 @@ import h5py
 import tifffile as tiff
 import yaml
 from scipy.ndimage import median_filter
-import concurrent.futures
+import threading
+import queue
 
 from hexrd import instrument
 from hexrd.projections.polar import PolarView
@@ -70,11 +71,10 @@ def tth_to_q(tth_degrees: np.ndarray, wavelength_angstrom: float) -> np.ndarray:
     return (4 * np.pi * np.sin(theta_radians)) / wavelength_angstrom
 
 
-def process_frame_path(path: str,
-                       pv: PolarView,
-                       det_keys: List[str],
-                       cake_slices: Optional[List[Tuple[float, float]]] = None) -> Tuple[np.ndarray, Optional[List[np.ndarray]]]:
-    # Read frame from disk
+def process_one_frame(path: str,
+                      pv: PolarView,
+                      det_keys: List[str],
+                      cake_slices: Optional[List[Tuple[float, float]]] = None) -> Tuple[np.ndarray, Optional[List[np.ndarray]]]:
     img = tiff.imread(path)
     image = img.astype(np.float32, copy=False)
 
@@ -117,7 +117,49 @@ def process_frame_path(path: str,
                 cake_int = np.zeros(polar_image.shape[1], dtype=np.float32)
             cake_intensities.append(cake_int)
 
+    # Help GC
+    del img, image, background, image_subtracted, image_processed, local_imsd, polar_image
+
     return integrated_intensity, cake_intensities
+
+
+def worker_loop(task_q: "queue.Queue[Tuple[int, str]]",
+                pv: PolarView,
+                det_keys: List[str],
+                cake_slices: Optional[List[Tuple[float, float]]],
+                d_int,
+                d_cake,
+                writer_lock: threading.Lock,
+                progress_lock: threading.Lock,
+                progress_state: dict,
+                total_frames: int):
+    while True:
+        item = task_q.get()
+        if item is None:
+            task_q.task_done()
+            break
+        i, path = item
+        try:
+            intensity, cake_int = process_one_frame(path, pv, det_keys, cake_slices)
+            # Serialize HDF5 writes
+            with writer_lock:
+                d_int[i, :] = intensity
+                if d_cake is not None and cake_int is not None:
+                    for k, arr in enumerate(cake_int):
+                        d_cake[i, k, :] = arr
+            # Progress
+            with progress_lock:
+                progress_state["done"] += 1
+                done = progress_state["done"]
+                if done % 100 == 0 or done == total_frames:
+                    elapsed = time.time() - progress_state["start"]
+                    rate = done / max(elapsed, 1e-6)
+                    print(f"  {done}/{total_frames} frames ({rate:.1f} fps)")
+        except Exception as e:
+            print(f"Error processing frame {i} ({path}): {e}")
+        finally:
+            # Ensure we release queue slot even on error
+            task_q.task_done()
 
 
 def integrate_em(tiff_folder: str,
@@ -195,28 +237,41 @@ def integrate_em(tiff_folder: str,
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
 
-        # Concurrency: default to 16 workers (override via CLI)
+        # Choose worker count (keep modest to avoid OOM)
         if max_workers is None:
-            max_workers = min(32, os.cpu_count() or 1)
+            max_workers = min(16, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
 
-        processing_start = time.time()
-        paths = [os.path.join(tiff_folder, f) for f in tiff_files]
+        # Bounded task queue to cap prefetch/in-flight jobs
+        task_q: "queue.Queue[Tuple[int, str]]" = queue.Queue(maxsize=max_workers * 2)
 
-        # Stream frames and write incrementally
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(process_frame_path, p, pv, det_keys, cake_slices): i for i, p in enumerate(paths)}
-            for completed_idx, future in enumerate(concurrent.futures.as_completed(futures)):
-                i = futures[future]
-                intensity, cake_int = future.result()
-                d_int[i, :] = intensity
-                if d_cake is not None and cake_int is not None:
-                    for k, arr in enumerate(cake_int):
-                        d_cake[i, k, :] = arr
-                if (completed_idx + 1) % 100 == 0 or (completed_idx + 1) == nframes:
-                    elapsed = time.time() - processing_start
-                    rate = (completed_idx + 1) / max(elapsed, 1e-6)
-                    print(f"  {completed_idx + 1}/{nframes} frames ({rate:.1f} fps)")
+        writer_lock = threading.Lock()
+        progress_lock = threading.Lock()
+        progress_state = {"done": 0, "start": time.time()}
+
+        # Start worker threads
+        threads = []
+        for _ in range(max_workers):
+            t = threading.Thread(target=worker_loop,
+                                 args=(task_q, pv, det_keys, cake_slices,
+                                       d_int, d_cake, writer_lock, progress_lock,
+                                       progress_state, nframes),
+                                 daemon=True)
+            t.start()
+            threads.append(t)
+
+        # Enqueue tasks
+        for i, fname in enumerate(tiff_files):
+            task_q.put((i, os.path.join(tiff_folder, fname)))
+
+        # Wait for completion
+        task_q.join()
+
+        # Stop workers
+        for _ in threads:
+            task_q.put((None))
+        for t in threads:
+            t.join()
 
     if plot:
         import matplotlib.pyplot as plt
@@ -250,5 +305,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
-
-
