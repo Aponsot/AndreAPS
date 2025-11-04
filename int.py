@@ -10,7 +10,6 @@ import yaml
 from scipy.ndimage import median_filter
 import concurrent.futures
 import threading
-import queue
 import gc
 
 from hexrd import instrument
@@ -39,6 +38,10 @@ INFLATE_FACTOR = 20
 
 DEFAULT_OUTPUT_DIR = "/home/beams/PONSOT/Data/h5"
 
+# Preload factor: number of frames to preload per worker in each chunk.
+# Increase to 3–4 if you have RAM headroom and fast storage; keep small on network storage.
+PRELOAD_FACTOR = 2
+
 
 def calculate_wavelength(energy_kev: float) -> float:
     wavelength_cm = (PLANCK_CONSTANT * SPEED_OF_LIGHT) / energy_kev
@@ -61,9 +64,12 @@ def tth_to_q(tth_degrees: np.ndarray, wavelength_angstrom: float) -> np.ndarray:
     return (4 * np.pi * np.sin(theta_radians)) / wavelength_angstrom
 
 
-def process_frame_array(image: np.ndarray,
-                        pv: PolarView,
-                        det_keys: List[str]) -> np.ndarray:
+def process_and_write(idx: int,
+                      image: np.ndarray,
+                      pv: PolarView,
+                      det_keys: List[str],
+                      d_int,
+                      writer_lock: threading.Lock) -> None:
     # Work on float32 array
     image = image.astype(np.float32, copy=False)
 
@@ -72,14 +78,14 @@ def process_frame_array(image: np.ndarray,
     for val in BACKGROUND_VALUES:
         mask |= (np.abs(image - val) <= BACKGROUND_TOLERANCE)
 
-    # Background subtraction
+    # Background subtraction (creates new array)
     background = median_filter(image, size=MEDIAN_FILTER_SIZE)
     # In-place subtract to limit temporaries
     np.subtract(image, background, out=image)
     background = None
     image[mask] = 0.0
 
-    # Threshold + inflate
+    # Threshold + inflate (mostly in-place)
     idx_low = image <= INTENSITY_THRESHOLD
     image[idx_low] = 0.0
     np.multiply(image, INFLATE_FACTOR, out=image, where=image > 0)
@@ -94,25 +100,13 @@ def process_frame_array(image: np.ndarray,
     else:
         integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
 
+    # Thread-safe write into HDF5
+    with writer_lock:
+        d_int[idx, :] = integrated_intensity
+
     # Cleanup
-    del local_imsd, polar_image
+    del local_imsd, polar_image, image, integrated_intensity
     gc.collect()
-
-    return integrated_intensity
-
-
-def reader_thread(paths: List[str], q: "queue.Queue[tuple[int, np.ndarray]]", dtype=np.float32):
-    try:
-        for i, p in enumerate(paths):
-            # Sequential read to keep I/O linear
-            img = tiff.imread(p)
-            arr = img.astype(dtype, copy=False)
-            q.put((i, arr))
-        # Sentinel
-        q.put((-1, None))
-    except Exception as e:
-        print(f"Reader error: {e}")
-        q.put((-1, None))
 
 
 def integrate_em(tiff_folder: str,
@@ -177,7 +171,7 @@ def integrate_em(tiff_folder: str,
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
 
-        # Concurrency controls
+        # Concurrency: set via CLI; default modest to avoid OOM
         if max_workers is None:
             max_workers = min(16, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
@@ -186,50 +180,38 @@ def integrate_em(tiff_folder: str,
         processing_start = time.time()
         completed = 0
 
-        # Small prefetch queue to overlap I/O with compute without ballooning RAM
-        prefetch = max(2, min(4, max_workers))  # 2–4 frames prefetched
-        q: "queue.Queue[tuple[int, np.ndarray]]" = queue.Queue(maxsize=prefetch)
+        writer_lock = threading.Lock()
 
-        # Start reader
-        rt = threading.Thread(target=reader_thread, args=(paths, q), daemon=True)
-        rt.start()
+        # Chunked preloading: read a limited batch sequentially, process in parallel
+        chunk_size = max(1, PRELOAD_FACTOR * max_workers)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {}
-            in_flight = 0
-            reader_done = False
+            for start in range(0, nframes, chunk_size):
+                end = min(start + chunk_size, nframes)
+                # Preload this chunk sequentially (good locality; leverages OS cache)
+                preload = []
+                for i in range(start, end):
+                    img = tiff.imread(paths[i])
+                    arr = img.astype(np.float32, copy=False)
+                    preload.append((i, arr))
 
-            while True:
-                # Fill up to max_workers in-flight tasks
-                while in_flight < max_workers and not reader_done:
-                    idx, arr = q.get()
-                    if idx == -1:
-                        reader_done = True
-                        break
-                    fut = executor.submit(process_frame_array, arr, pv, det_keys)
-                    future_to_idx[fut] = idx
-                    in_flight += 1
+                futures = []
+                for idx, arr in preload:
+                    fut = executor.submit(process_and_write, idx, arr, pv, det_keys, d_int, writer_lock)
+                    futures.append(fut)
 
-                if not future_to_idx and reader_done:
-                    break
-
-                done, _ = concurrent.futures.wait(
-                    future_to_idx.keys(),
-                    return_when=concurrent.futures.FIRST_COMPLETED
-                )
-                for f in done:
-                    idx = future_to_idx.pop(f)
-                    intensity = f.result()
-                    d_int[idx, :] = intensity
+                # Wait for this chunk to finish
+                for f in concurrent.futures.as_completed(futures):
+                    f.result()  # propagate exceptions
                     completed += 1
-                    in_flight -= 1
-
                     if completed % 100 == 0 or completed == nframes:
                         elapsed = time.time() - processing_start
                         rate = completed / max(elapsed, 1e-6)
                         print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
 
-        rt.join()
+                # Free preloaded arrays
+                del preload
+                gc.collect()
 
     if plot:
         import matplotlib.pyplot as plt
@@ -261,6 +243,4 @@ if __name__ == "__main__":
     parser.add_argument("--max_workers", type=int, help="Parallel workers")
 
     args = parser.parse_args()
-
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
-
