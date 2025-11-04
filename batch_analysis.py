@@ -12,10 +12,6 @@ from tqdm import tqdm
 # Window (in q units) around the mean of specified peak positions
 WINDOW = 0.15
 
-# Peak width constraints
-MIN_SIGMA = 1e-6
-MAX_SIGMA_FRAC = 0.22
-
 # Seeding: allowed per-frame center movement (q units)
 PER_FRAME_SHIFT = 0.015
 
@@ -31,7 +27,6 @@ FREE_RANGES = []
 
 # Plot controls
 SHOW_EXAMPLE_FIT = True   # Show detailed fit for the first frame in map mode
-SUMMARY_PLOTS = False     # Disable line summary plots; we use scatter colored by height instead
 
 # Scatter map styling
 SCATTER_MARKER_SIZE = 12
@@ -54,15 +49,11 @@ def compute_r2(y, yfit):
 
 def build_model(xw, yw, centers, baseline, center_bounds=None, init_from=None):
     """
-    Build a model with a linear background and Gaussian peaks at given centers,
-    with constraints on center (from center_bounds), sigma, and non-negative amplitude.
-
-    center_bounds: optional list of (min,max) per peak center.
-    init_from: optional dict with 'center', 'sigma', 'amplitude' arrays for initial values.
+    Build a model with a linear background and Gaussian peaks at given centers.
+    Sigma is unconstrained (no min/max). Amplitude is non-negative. Center bounds
+    come from center_bounds or default to window edges.
     """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
-    min_sigma = max(dx / 3.0, MIN_SIGMA)
-    max_sigma = MAX_SIGMA_FRAC * WINDOW
 
     bkg = LinearModel(prefix="bkg_")
     model = bkg
@@ -76,7 +67,7 @@ def build_model(xw, yw, centers, baseline, center_bounds=None, init_from=None):
         p = np.argmin(np.abs(xw - cx))
         ypk = yw[p]
         height0 = max(ypk - baseline, robust_sigma(yw))
-        sigma0 = np.clip(dx, min_sigma, max_sigma)
+        sigma0 = dx  # reasonable starting width from sampling
         amp0 = height0 * sigma0 * np.sqrt(2 * np.pi)
 
         params.update(gi.make_params(center=cx, sigma=sigma0, amplitude=amp0))
@@ -98,12 +89,14 @@ def build_model(xw, yw, centers, baseline, center_bounds=None, init_from=None):
             if "center" in init_from and i < len(init_from["center"]) and init_from["center"][i] is not None:
                 c_init = np.clip(init_from["center"][i], cmin, cmax)
             if "sigma" in init_from and i < len(init_from["sigma"]) and init_from["sigma"][i] is not None:
-                s_init = float(np.clip(init_from["sigma"][i], min_sigma, max_sigma))
+                s_init = float(abs(init_from["sigma"][i]))  # seed with positive width
             if "amplitude" in init_from and i < len(init_from["amplitude"]) and init_from["amplitude"][i] is not None:
                 a_init = max(float(init_from["amplitude"][i]), 0.0)
 
         params[f"g{i}_center"].set(min=cmin, max=cmax, value=c_init)
-        params[f"g{i}_sigma"].set(min=min_sigma, max=max_sigma, value=s_init)
+        # Sigma unconstrained: set only value, no min/max
+        params[f"g{i}_sigma"].set(value=s_init)
+        # Non-negative amplitude
         params[f"g{i}_amplitude"].set(min=0.0, value=a_init)
 
     return model, params
@@ -115,11 +108,13 @@ def extract_peaks(result):
         ctr = result.params[f"g{i}_center"].value
         sig = result.params[f"g{i}_sigma"].value
         amp = result.params[f"g{i}_amplitude"].value
-        hgt = amp / (sig * np.sqrt(2 * np.pi)) if sig > 0 else 0.0
-        fwhm = 2.354820045 * sig
+        # Use abs(sigma) for physical height/FWHM
+        sig_abs = abs(sig) if np.isfinite(sig) else np.nan
+        hgt = amp / (sig_abs * np.sqrt(2 * np.pi)) if (sig_abs > 0 and np.isfinite(sig_abs)) else 0.0
+        fwhm = 2.354820045 * sig_abs if np.isfinite(sig_abs) else np.nan
         peaks.append({
             "index": i, "center": ctr, "height": hgt,
-            "fwhm": fwhm, "amplitude": amp
+            "fwhm": fwhm, "amplitude": amp, "sigma": sig
         })
         i += 1
     return peaks
@@ -133,8 +128,8 @@ def _window_data(x, yfull, peak_positions):
     xw, yw = xw[mfin], yw[mfin]
     return center, half, xw, yw
 
-def _detect_bounds_stuck(result, center_bounds, sigma_bounds, frac_tol=0.05):
-    """Return True if any center/sigma is too close to bounds, suggesting instability."""
+def _detect_bounds_stuck_centers(result, center_bounds, frac_tol=0.05):
+    """Return True if any center is too close to bounds, suggesting instability."""
     def at_bound(val, low, high):
         rng = max(high - low, 1e-12)
         rel = (val - low) / rng
@@ -144,20 +139,10 @@ def _detect_bounds_stuck(result, center_bounds, sigma_bounds, frac_tol=0.05):
     hits = 0
     for i in range(n):
         cmin, cmax = center_bounds[i]
-        smin, smax = sigma_bounds[i]
         cval = result.params[f"g{i}_center"].value
-        sval = result.params[f"g{i}_sigma"].value
         if at_bound(cval, cmin, cmax):
             hits += 1
-        if at_bound(sval, smin, smax):
-            hits += 1
     return hits >= max(1, n // 2)
-
-def in_any_range(frame, ranges):
-    for a, b in ranges:
-        if a <= frame <= b:
-            return True
-    return False
 
 
 # ------------------------------
@@ -169,7 +154,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
     Fit the specified peaks in a single frame with:
       - Seeded per-frame bounds: center in [prev_center ± PER_FRAME_SHIFT], if available.
       - Free bounds within the window in frames within FREE_RANGES (amorphous zones).
-    Fallback: if seeded fit looks poor or is stuck on bounds, refit with free bounds.
+    Fallback: if seeded fit looks poor or centers are stuck on bounds, refit with free bounds.
 
     After fitting, prune peaks with height < HEIGHT_MIN by fixing their amplitude to 0
     (and fixing center/sigma), then refit so pruned components do not affect other parameters.
@@ -201,12 +186,6 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
                              if f"g{i}_amplitude" in prev_solution.params else None)
         init_from = {"center": centers_seed, "sigma": sigmas_seed, "amplitude": amps_seed}
 
-    # Build bounds
-    dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
-    min_sigma = max(dx / 3.0, MIN_SIGMA)
-    max_sigma = MAX_SIGMA_FRAC * WINDOW
-    sigma_bounds = [(min_sigma, max_sigma) for _ in peak_positions]
-
     # Center bounds for seeded attempt (or free in amorphous ranges)
     free_here = in_any_range(frame, FREE_RANGES)
     center_bounds_seed = []
@@ -229,9 +208,9 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
                                  method="least_squares", max_nfev=600)
     r2_seed = compute_r2(yw, result_seed.best_fit)
     peaks_seed = extract_peaks(result_seed)
-    stuck_seed = _detect_bounds_stuck(result_seed, center_bounds_seed, sigma_bounds)
+    stuck_seed = _detect_bounds_stuck_centers(result_seed, center_bounds_seed)
 
-    # Fallback: if quality is poor or stuck on bounds, retry with free bounds (window only)
+    # Fallback: if quality is poor or centers stuck on bounds, retry with free bounds (window only)
     use_fallback = (r2_seed < R2_MIN) or (not free_here and stuck_seed)
     if use_fallback:
         center_bounds_free = [(xw[0], xw[-1]) for _ in peak_positions]
@@ -267,7 +246,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
     if len(pruned_indices) > 0:
         init_from_refit = {
             "center": [result.params[f"g{i}_center"].value for i in range(len(peak_positions))],
-            "sigma":  [result.params[f"g{i}_sigma"].value  for i in range(len(peak_positions))],
+            "sigma":  [abs(result.params[f"g{i}_sigma"].value) for i in range(len(peak_positions))],
             "amplitude": [result.params[f"g{i}_amplitude"].value for i in range(len(peak_positions))]
         }
         model_refit, params_refit = build_model(
@@ -344,7 +323,6 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
         "r2": r2,
         "rows": rows,  # kept peaks only
         "result": result,
-        "noise": noise,
         "n_peaks": len(kept)
     }
 
@@ -355,7 +333,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
 
 def track_sequential(h5_path, peak_positions):
     """
-    Sequentially fit frames with seeding from previous frame and small per-frame shift bounds.
+    Sequentially fit frames with seeding from previous frame and small per-frame center bounds.
     In frames within FREE_RANGES (amorphous zones), per-frame constraints are disabled.
 
     Returns tracking arrays for centers and heights (after pruning).
@@ -389,7 +367,7 @@ def track_sequential(h5_path, peak_positions):
                 for i in range(len(peak_positions)):
                     ai = result.params[f"g{i}_amplitude"].value
                     si = result.params[f"g{i}_sigma"].value
-                    hi = ai / (si * np.sqrt(2 * np.pi)) if si > 0 else 0.0
+                    hi = ai / (abs(si) * np.sqrt(2 * np.pi)) if abs(si) > 0 else 0.0
                     if hi >= HEIGHT_MIN:
                         ci = result.params[f"g{i}_center"].value
                         centers_tr[i].append(ci)
@@ -448,7 +426,6 @@ def plot_scatter_map(tracking):
         print("No peaks above height_min found to plot.")
         return
 
-    # Color clipping to avoid outliers dominating the color scale
     vmax = np.percentile(cs, SCATTER_VMAX_PERCENTILE) if len(cs) > 20 else max(cs)
     plt.rcParams.update({
         "figure.dpi": 160, "savefig.dpi": 300,
@@ -488,6 +465,7 @@ def main():
     print(f"Window: {WINDOW} q | Per-frame shift: {PER_FRAME_SHIFT} q | R2_MIN: {R2_MIN} | height_min: {HEIGHT_MIN}")
     if FREE_RANGES:
         print(f"Free movement ranges (amorphous): {FREE_RANGES}")
+    print("Sigma constraints: none (unconstrained).")
 
     if args.frame is not None:
         fit_peaks(args.h5, args.frame, peak_positions, plot=True)
@@ -499,5 +477,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
