@@ -19,21 +19,14 @@ MIN_SIGMA_ABS = 0.001      # absolute lower bound on sigma (q units)
 MAX_SIGMA_ABS = 0.025      # absolute upper bound on sigma (q units)
 MAX_SIGMA_FRAC = 0.20      # also cap sigma to this fraction of WINDOW
 
-# Seeding: allowed per-frame center movement (q units)
-PER_FRAME_SHIFT = 0.015
-
-# Anchor for the first peak on the initial fit (no previous solution)
+# Anchor for peak 0
 ANCHOR_TOL = 0.005  # q units around the specified first peak position
 
-# Quality threshold for accepting seeded result
+# Quality threshold for adopting seeds to the next frame
 R2_MIN = 0.6
 
 # Pruning threshold: remove peaks (set amplitude to 0) if height < HEIGHT_MIN
 HEIGHT_MIN = 5.0
-
-# Amorphous/free movement ranges (disable per-frame center constraints in these frame ranges)
-# Example: FREE_RANGES = [(400, 520), (780, 820)]
-FREE_RANGES = []
 
 # Plot controls
 SHOW_EXAMPLE_FIT = True   # Show detailed fit for the first frame in map mode
@@ -44,7 +37,7 @@ SCATTER_CMAP = "plasma"
 SCATTER_VMAX_PERCENTILE = 99  # clip color scale to this percentile of heights
 
 # ------------------------------
-# Background controls (new)
+# Background controls (robust linear background)
 # ------------------------------
 
 # Use a lower quantile as baseline to seed sigma/height robustly
@@ -184,7 +177,10 @@ def build_model(xw, yw, centers, baseline, center_bounds=None, init_from=None):
             if "sigma" in init_from and i < len(init_from["sigma"]) and init_from["sigma"][i] is not None:
                 s_init = float(np.clip(abs(init_from["sigma"][i]), min_sigma, max_sigma))
             if "amplitude" in init_from and i < len(init_from["amplitude"]) and init_from["amplitude"][i] is not None:
-                a_init = max(float(init_from["amplitude"][i]), 0.0)
+                a_seed = float(init_from["amplitude"][i])
+                if a_seed > 0.0:
+                    a_init = a_seed
+                # else keep local estimate amp0
 
         params[f"g{i}_center"].set(min=cmin, max=cmax, value=c_init)
         # Sigma constrained by min/max
@@ -220,22 +216,6 @@ def _window_data(x, yfull, peak_positions):
     xw, yw = xw[mfin], yw[mfin]
     return center, half, xw, yw
 
-def _detect_bounds_stuck_centers(result, center_bounds, frac_tol=0.05):
-    """Return True if any center is too close to bounds, suggesting instability."""
-    def at_bound(val, low, high):
-        rng = max(high - low, 1e-12)
-        rel = (val - low) / rng
-        return (rel < frac_tol) or (rel > 1 - frac_tol)
-
-    n = len(center_bounds)
-    hits = 0
-    for i in range(n):
-        cmin, cmax = center_bounds[i]
-        cval = result.params[f"g{i}_center"].value
-        if at_bound(cval, cmin, cmax):
-            hits += 1
-    return hits >= max(1, n // 2)
-
 def _param_at_bounds(result, name, frac_tol=0.05):
     """Check if a parameter is near its min/max bounds."""
     if name not in result.params:
@@ -247,28 +227,22 @@ def _param_at_bounds(result, name, frac_tol=0.05):
     rel = (p.value - p.min) / rng
     return (rel < frac_tol) or (rel > 1 - frac_tol)
 
-def in_any_range(frame, ranges):
-    for a, b in ranges:
-        if a <= frame <= b:
-            return True
-    return False
-
 
 # ------------------------------
-# Fit one frame (with pruning)
+# Fit one frame (seed-only logic; pruning)
 # ------------------------------
 
-def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
+def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None,
+              seed_only=True, anchor_each_frame=True):
     """
-    Fit the specified peaks in a single frame with:
-      - Initial anchor: peak 0 center ∈ [cx0 ± ANCHOR_TOL] if no previous solution.
-      - Seeded per-frame bounds afterwards: center ∈ [prev_center ± PER_FRAME_SHIFT].
-      - Free bounds within the window in frames within FREE_RANGES (amorphous zones).
+    Fit the specified peaks in a single frame using seed-only logic:
+      - Centers free within the window for all peaks (no per-frame movement constraints).
+      - Optionally anchor peak 0 center within [cx0 ± ANCHOR_TOL] every frame.
+      - Use previous frame's best-fit parameters only to seed initial values.
 
-    Fallback: if seeded fit looks poor or centers are stuck on bounds, refit with free bounds (but keep anchor on the initial frame for peak 0).
-             If the background slope is stuck at bounds, refit with the slope frozen to the robust initialization (still linear background).
+    Robust linear background and pruning are applied.
 
-    After fitting, prune peaks with height < HEIGHT_MIN by fixing their amplitude to 0
+    After fitting, prune peaks with height < HEIGHT_MIN by fixing amplitude to 0
     (and fixing center/sigma), then refit so pruned components do not affect other parameters.
     """
     with h5py.File(h5_path, "r") as f:
@@ -285,7 +259,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
     # Lower-quantile baseline for robust sigma/height seeding
     baseline = np.quantile(yw, BASELINE_QUANTILE)
 
-    # Seed arrays from previous solution if available
+    # Seed arrays from previous solution if available (used for initialization only)
     init_from = None
     if prev_solution is not None:
         centers_seed, sigmas_seed, amps_seed = [], [], []
@@ -298,96 +272,41 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
                              if f"g{i}_amplitude" in prev_solution.params else None)
         init_from = {"center": centers_seed, "sigma": sigmas_seed, "amplitude": amps_seed}
 
-    # Build center bounds: initial anchor for peak 0, then seeded bounds
-    free_here = in_any_range(frame, FREE_RANGES)
-    is_initial = (prev_solution is None) and (not free_here)
-
-    center_bounds_seed = []
+    # Build center bounds: seed-only => free within window; optional anchor peak 0 every frame
+    center_bounds = []
     for i, cx in enumerate(peak_positions):
-        if free_here:
-            # free within window in amorphous ranges
-            cmin, cmax = xw[0], xw[-1]
-        elif is_initial:
-            # initial anchor: peak 0 tightly constrained; others free in window
-            if i == 0:
-                cmin = max(xw[0], cx - ANCHOR_TOL)
-                cmax = min(xw[-1], cx + ANCHOR_TOL)
-            else:
-                cmin, cmax = xw[0], xw[-1]
+        if anchor_each_frame and i == 0:
+            cmin = max(xw[0], cx - ANCHOR_TOL)
+            cmax = min(xw[-1], cx + ANCHOR_TOL)
         else:
-            # seeded bounds around previous centers
-            prev_c = init_from["center"][i] if init_from is not None else cx
-            cmin = max(xw[0], prev_c - PER_FRAME_SHIFT)
-            cmax = min(xw[-1], prev_c + PER_FRAME_SHIFT)
-        center_bounds_seed.append((cmin, cmax))
+            cmin, cmax = xw[0], xw[-1]
+        center_bounds.append((cmin, cmax))
 
     # Robust loss configuration
     loss_kwargs = {}
     if USE_ROBUST_LOSS:
         loss_kwargs = {"loss": "soft_l1", "f_scale": robust_sigma(yw)}
 
-    # First, seeded (or initial anchored/free) fit
-    model_seed, params_seed, sigma_limits = build_model(
+    # Fit
+    model, params, _ = build_model(
         xw, yw, peak_positions, baseline,
-        center_bounds=center_bounds_seed,
+        center_bounds=center_bounds,
         init_from=init_from
     )
-    result_seed = model_seed.fit(yw, params_seed, x=xw, calc_covar=False,
-                                 method="least_squares", max_nfev=800, **loss_kwargs)
-    r2_seed = compute_r2(yw, result_seed.best_fit)
-    peaks_seed = extract_peaks(result_seed)
-    stuck_seed = _detect_bounds_stuck_centers(result_seed, center_bounds_seed)
-    bkg_stuck = _param_at_bounds(result_seed, "bkg_slope", frac_tol=0.05)
+    result = model.fit(yw, params, x=xw, calc_covar=False,
+                       method="least_squares", max_nfev=800, **loss_kwargs)
+    r2 = compute_r2(yw, result.best_fit)
 
-    # Fallback: if quality is poor, centers stuck, or background slope stuck at bounds
-    use_fallback = (r2_seed < R2_MIN) or (not free_here and stuck_seed) or bkg_stuck
-    if use_fallback:
-        center_bounds_fallback = []
-        for i, cx in enumerate(peak_positions):
-            if is_initial and (i == 0):
-                # keep anchor for peak 0 in initial frame even in fallback
-                cmin = max(xw[0], cx - ANCHOR_TOL)
-                cmax = min(xw[-1], cx + ANCHOR_TOL)
-            else:
-                cmin, cmax = xw[0], xw[-1]
-            center_bounds_fallback.append((cmin, cmax))
-
-        model_fb, params_fb, _ = build_model(
-            xw, yw, peak_positions, baseline,
-            center_bounds=center_bounds_fallback,
-            init_from=init_from
-        )
-
-        # If slope was stuck, freeze it to the robust init (still linear background)
-        if bkg_stuck:
-            params_fb["bkg_slope"].set(value=params_fb["bkg_slope"].value, vary=False)
-
-        result_fb = model_fb.fit(yw, params_fb, x=xw, calc_covar=False,
-                                 method="least_squares", max_nfev=800, **loss_kwargs)
-        r2_fb = compute_r2(yw, result_fb.best_fit)
-        peaks_fb = extract_peaks(result_fb)
-
-        # Choose the better by R²
-        if r2_fb >= r2_seed:
-            result = result_fb
-            peaks = peaks_fb
-            r2 = r2_fb
-            center_bounds_used = center_bounds_fallback
-            model_used = model_fb
-        else:
-            result = result_seed
-            peaks = peaks_seed
-            r2 = r2_seed
-            center_bounds_used = center_bounds_seed
-            model_used = model_seed
-    else:
-        result = result_seed
-        peaks = peaks_seed
-        r2 = r2_seed
-        center_bounds_used = center_bounds_seed
-        model_used = model_seed
+    # If background slope is stuck near its bounds, freeze it to the robust init and refit
+    if _param_at_bounds(result, "bkg_slope", frac_tol=0.05):
+        params2 = result.params.copy()
+        params2["bkg_slope"].set(value=params2["bkg_slope"].value, vary=False)
+        result = model.fit(yw, params2, x=xw, calc_covar=False,
+                           method="least_squares", max_nfev=800, **loss_kwargs)
+        r2 = compute_r2(yw, result.best_fit)
 
     # Prune small peaks by height and refit with amplitudes fixed to 0 (and center/sigma fixed)
+    peaks = extract_peaks(result)
     pruned_indices = [p["index"] for p in peaks if p["height"] < HEIGHT_MIN]
     if len(pruned_indices) > 0:
         init_from_refit = {
@@ -397,7 +316,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
         }
         model_refit, params_refit, _ = build_model(
             xw, yw, peak_positions, baseline,
-            center_bounds=center_bounds_used,
+            center_bounds=center_bounds,
             init_from=init_from_refit
         )
         # Fix pruned peaks to zero amplitude and freeze center/sigma to avoid wandering
@@ -409,6 +328,8 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
         result = model_refit.fit(yw, params_refit, x=xw, calc_covar=False,
                                  method="least_squares", max_nfev=800, **loss_kwargs)
         r2 = compute_r2(yw, result.best_fit)
+        peaks = extract_peaks(result)
+    else:
         peaks = extract_peaks(result)
 
     bkg_slope = result.params["bkg_slope"].value
@@ -474,15 +395,17 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
 
 
 # ------------------------------
-# Sequential tracking (map mode)
+# Sequential tracking (seed-only map)
 # ------------------------------
 
-def track_sequential(h5_path, peak_positions):
+def track_sequential(h5_path, peak_positions, anchor_every_frame=True):
     """
-    Sequentially fit frames with initial anchor for peak 0, then seeding per frame.
-    In frames within FREE_RANGES (amorphous zones), per-frame constraints are disabled.
+    Sequentially fit frames with seed-only logic:
+      - Centers free within the window (no per-frame movement constraints).
+      - Optionally anchor peak 0 every frame within ANCHOR_TOL.
+      - Seed from the immediate prior frame only if the prior fit is reasonable (R2 >= R2_MIN).
 
-    Returns tracking arrays for centers and heights (after pruning).
+    Returns tracking arrays for centers and heights (post-pruning).
     """
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
@@ -495,46 +418,39 @@ def track_sequential(h5_path, peak_positions):
         r2_tr = []
 
         prev_solution = None
-        last_good = None
         first = True
 
-        for fr in tqdm(frames, desc="Sequential tracking", unit="frame"):
+        for fr in tqdm(frames, desc="Seed-only tracking", unit="frame"):
             plot_this = SHOW_EXAMPLE_FIT and first
             try:
                 out = fit_peaks(
                     h5_path, fr, peak_positions, plot=plot_this,
-                    prev_solution=(prev_solution or last_good)
+                    prev_solution=prev_solution,
+                    seed_only=True,
+                    anchor_each_frame=anchor_every_frame
                 )
                 result = out["result"]
                 r2 = out["r2"]
                 r2_tr.append(r2)
 
-                # Extract centers/heights; mask pruned (height < threshold) as NaN center and 0 height
+                # Extract centers/heights after pruning; peaks below threshold get height=0 and center from frozen values
                 for i in range(len(peak_positions)):
                     ai = result.params[f"g{i}_amplitude"].value
                     si = abs(result.params[f"g{i}_sigma"].value)
                     hi = ai / (si * np.sqrt(2 * np.pi)) if si > 0 else 0.0
-                    if hi >= HEIGHT_MIN:
-                        ci = result.params[f"g{i}_center"].value
-                        centers_tr[i].append(ci)
-                        heights_tr[i].append(hi)
-                    else:
-                        centers_tr[i].append(np.nan)
-                        heights_tr[i].append(0.0)
+                    ci = result.params[f"g{i}_center"].value
+                    centers_tr[i].append(ci)
+                    heights_tr[i].append(max(hi, 0.0))
 
-                # Update seeds: adopt current if fit is reasonable
-                if r2 >= R2_MIN:
-                    prev_solution = result
-                    last_good = result
-                else:
-                    prev_solution = last_good
+                # Seed next frame only if fit is reasonable
+                prev_solution = result if r2 >= R2_MIN else None
 
             except Exception:
                 r2_tr.append(np.nan)
                 for i in range(len(peak_positions)):
                     centers_tr[i].append(np.nan)
                     heights_tr[i].append(0.0)
-                prev_solution = last_good
+                prev_solution = None
 
             first = False
 
@@ -603,25 +519,25 @@ def main():
                         help="Peak q-positions (e.g., 3.025 3.012)")
     parser.add_argument("--frame", type=int, help="Fit a single frame and show plot")
     parser.add_argument("--map", action="store_true",
-                        help="Sequential tracking across all frames (scatter colored by height)")
+                        help="Sequential tracking across all frames (seed-only; anchors peak 0 every frame)")
 
     args = parser.parse_args()
     peak_positions = sorted(args.peaks)
 
     print(f"Peaks: {peak_positions}")
-    print(f"Window: {WINDOW} q | Per-frame shift: {PER_FRAME_SHIFT} q | Anchor tol (initial peak 0): {ANCHOR_TOL} q")
+    print(f"Window: {WINDOW} q | Anchor tol (peak 0 each frame): {ANCHOR_TOL} q")
     print(f"R2_MIN: {R2_MIN} | height_min: {HEIGHT_MIN}")
-    if FREE_RANGES:
-        print(f"Free movement ranges (amorphous): {FREE_RANGES}")
     print(f"Sigma bounds: [{MIN_SIGMA_ABS}, {min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)}] q (data-informed)")
     print(f"Background: BASELINE_QUANTILE={BASELINE_QUANTILE}, EXCLUDE_RADIUS={BKG_EXCLUDE_RADIUS}, "
           f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_TOL={BKG_SLOPE_TOL}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
 
     if args.frame is not None:
-        fit_peaks(args.h5, args.frame, peak_positions, plot=True)
+        # Single-frame fit uses the same seed-only logic
+        fit_peaks(args.h5, args.frame, peak_positions, plot=True,
+                  prev_solution=None, seed_only=True, anchor_each_frame=True)
     elif args.map:
-        tr = track_sequential(args.h5, peak_positions)
+        tr = track_sequential(args.h5, peak_positions, anchor_every_frame=True)
         plot_scatter_map(tr)
     else:
         print("Specify --frame N to fit a single frame, or --map for sequential tracking across all frames.")
