@@ -9,6 +9,7 @@ import tifffile as tiff
 import yaml
 from scipy.ndimage import median_filter
 import concurrent.futures
+import gc
 
 from hexrd import instrument
 from hexrd.projections.polar import PolarView
@@ -75,23 +76,27 @@ def process_frame_path(path: str,
     for val in BACKGROUND_VALUES:
         mask |= (np.abs(image - val) <= BACKGROUND_TOLERANCE)
 
-    # Background subtraction
+    # Background subtraction (creates a new array)
     background = median_filter(image, size=MEDIAN_FILTER_SIZE)
-    image_subtracted = image - background
 
-    # Apply mask and threshold
-    image_subtracted[mask] = 0.0
-    image_processed = np.where(
-        image_subtracted > INTENSITY_THRESHOLD,
-        image_subtracted * INFLATE_FACTOR,
-        0.0
-    ).astype(np.float32, copy=False)
+    # In-place subtract to avoid creating another large array
+    np.subtract(image, background, out=image)
+    background = None  # let GC reclaim
+    # Apply mask
+    image[mask] = 0.0
 
-    # Map to detector(s); adjust if you truly have multiple, distinct detector images
-    local_imsd = {det_key: image_processed for det_key in det_keys}
+    # In-place thresholding/inflation to minimize temporaries
+    # First zero everything <= threshold
+    idx_low = image <= INTENSITY_THRESHOLD
+    image[idx_low] = 0.0
+    # Inflate the remaining positives
+    np.multiply(image, INFLATE_FACTOR, out=image, where=image > 0)
 
-    # Polar warp (match original behavior with padding and interpolation)
-    polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True).astype(np.float32, copy=False)
+    # Map to detector(s); adjust if you truly have multiple distinct detectors
+    local_imsd = {det_key: image for det_key in det_keys}
+
+    # Polar warp (original behavior with padding and interpolation)
+    polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
 
     # Average over full azimuthal (eta) to get 1D intensity
     if np.ma.isMaskedArray(polar_image):
@@ -100,7 +105,8 @@ def process_frame_path(path: str,
         integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
 
     # Help GC
-    del img, image, background, image_subtracted, image_processed, local_imsd, polar_image
+    del img, image, local_imsd, polar_image
+    gc.collect()
 
     return integrated_intensity
 
@@ -168,17 +174,17 @@ def integrate_em(tiff_folder: str,
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
 
-        # Concurrency: default to 16 workers (override via CLI)
+        # Concurrency: modest default; override via CLI
         if max_workers is None:
-            max_workers = min(32, os.cpu_count() or 1)
+            max_workers = min(16, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
 
         paths = [os.path.join(tiff_folder, f) for f in tiff_files]
         processing_start = time.time()
         completed = 0
 
-        # Throttle the number of in-flight futures to limit memory
-        max_pending = max_workers * 2
+        # Limit the number of in-flight tasks tightly to avoid memory spikes
+        max_pending = max_workers  # not 2x; keep ≤ workers alive
         future_to_idx = {}
         pending = set()
 
@@ -188,14 +194,20 @@ def integrate_em(tiff_folder: str,
                 future_to_idx[fut] = i
                 pending.add(fut)
 
+                # Keep at most max_pending in-flight
                 if len(pending) >= max_pending:
-                    done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                    done, pending = concurrent.futures.wait(
+                        pending, return_when=concurrent.futures.FIRST_COMPLETED
+                    )
                     for f in done:
                         idx = future_to_idx.pop(f)
                         intensity = f.result()
                         d_int[idx, :] = intensity
                         completed += 1
-                        print(f"  {completed}/{nframes} frames", end='\r')
+                        if completed % 100 == 0 or completed == nframes:
+                            elapsed = time.time() - processing_start
+                            rate = completed / max(elapsed, 1e-6)
+                            print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
 
             # Drain remaining futures
             for f in concurrent.futures.as_completed(pending):
@@ -240,5 +252,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
-
-
