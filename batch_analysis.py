@@ -503,7 +503,7 @@ def main():
     parser.add_argument("peaks", type=float, nargs='+',
                         help="Peak q-positions (e.g., 3.025 3.012)")
     parser.add_argument("--frame", type=int, help="Fit a single frame and show plot")
-    parser.add_argument("--map", action="store_true,",
+    parser.add_argument("--map", action="store_true",
                         help="Sequential tracking across all frames (scatter colored by height)")
 
     args = parser.parse_args()
@@ -525,3 +525,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
