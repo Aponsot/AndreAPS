@@ -263,4 +263,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
-Why this helps
+
