@@ -8,8 +8,7 @@ import h5py
 import tifffile as tiff
 import yaml
 from scipy.ndimage import median_filter
-import threading
-import queue
+import concurrent.futures
 
 from hexrd import instrument
 from hexrd.projections.polar import PolarView
@@ -27,7 +26,6 @@ TTH_MAX = 14.0
 ETA_MIN = -180.0
 ETA_MAX = 180.0
 NDIV = 3
-CAKE_WIDTH = 10.0
 
 SATURATION_VALUE = 2**32 - 1
 BACKGROUND_VALUES = [0.0, 0.5]
@@ -60,21 +58,15 @@ def load_tiff_files(tiff_folder: str) -> Tuple[List[str], str]:
     return tiff_files, experiment_name
 
 
-def generate_cake_slices(eta_min: float, eta_max: float, cake_width: float) -> List[Tuple[float, float]]:
-    n_cakes = int((eta_max - eta_min) / cake_width)
-    return [(eta_min + i * cake_width, eta_min + (i + 1) * cake_width)
-            for i in range(n_cakes)]
-
-
 def tth_to_q(tth_degrees: np.ndarray, wavelength_angstrom: float) -> np.ndarray:
     theta_radians = np.radians(tth_degrees / 2)
     return (4 * np.pi * np.sin(theta_radians)) / wavelength_angstrom
 
 
-def process_one_frame(path: str,
-                      pv: PolarView,
-                      det_keys: List[str],
-                      cake_slices: Optional[List[Tuple[float, float]]] = None) -> Tuple[np.ndarray, Optional[List[np.ndarray]]]:
+def process_frame_path(path: str,
+                       pv: PolarView,
+                       det_keys: List[str]) -> np.ndarray:
+    # Read frame from disk
     img = tiff.imread(path)
     image = img.astype(np.float32, copy=False)
 
@@ -101,65 +93,16 @@ def process_one_frame(path: str,
     # Polar warp (match original behavior with padding and interpolation)
     polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True).astype(np.float32, copy=False)
 
-    # Average over eta to get 1D intensity
-    integrated_intensity = np.array(np.ma.average(polar_image, axis=0)).astype(np.float32)
-
-    cake_intensities = None
-    if cake_slices is not None:
-        cake_intensities = []
-        eta_axis = np.linspace(pv.eta_min, pv.eta_max, polar_image.shape[0]) * 180 / np.pi
-
-        for eta_start, eta_end in cake_slices:
-            mask_eta = (eta_axis >= eta_start) & (eta_axis < eta_end)
-            if np.any(mask_eta):
-                cake_int = np.array(np.ma.average(polar_image[mask_eta, :], axis=0)).astype(np.float32)
-            else:
-                cake_int = np.zeros(polar_image.shape[1], dtype=np.float32)
-            cake_intensities.append(cake_int)
+    # Average over full azimuthal (eta) to get 1D intensity
+    if np.ma.isMaskedArray(polar_image):
+        integrated_intensity = np.array(np.ma.average(polar_image, axis=0), dtype=np.float32)
+    else:
+        integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
 
     # Help GC
     del img, image, background, image_subtracted, image_processed, local_imsd, polar_image
 
-    return integrated_intensity, cake_intensities
-
-
-def worker_loop(task_q: "queue.Queue[Tuple[int, str]]",
-                pv: PolarView,
-                det_keys: List[str],
-                cake_slices: Optional[List[Tuple[float, float]]],
-                d_int,
-                d_cake,
-                writer_lock: threading.Lock,
-                progress_lock: threading.Lock,
-                progress_state: dict,
-                total_frames: int):
-    while True:
-        item = task_q.get()
-        if item is None:
-            task_q.task_done()
-            break
-        i, path = item
-        try:
-            intensity, cake_int = process_one_frame(path, pv, det_keys, cake_slices)
-            # Serialize HDF5 writes
-            with writer_lock:
-                d_int[i, :] = intensity
-                if d_cake is not None and cake_int is not None:
-                    for k, arr in enumerate(cake_int):
-                        d_cake[i, k, :] = arr
-            # Progress
-            with progress_lock:
-                progress_state["done"] += 1
-                done = progress_state["done"]
-                if done % 100 == 0 or done == total_frames:
-                    elapsed = time.time() - progress_state["start"]
-                    rate = done / max(elapsed, 1e-6)
-                    print(f"  {done}/{total_frames} frames ({rate:.1f} fps)")
-        except Exception as e:
-            print(f"Error processing frame {i} ({path}): {e}")
-        finally:
-            # Ensure we release queue slot even on error
-            task_q.task_done()
+    return integrated_intensity
 
 
 def integrate_em(tiff_folder: str,
@@ -200,8 +143,7 @@ def integrate_em(tiff_folder: str,
         cache_coordinate_map=True
     )
 
-    cake_slices = generate_cake_slices(ETA_MIN, ETA_MAX, CAKE_WIDTH)
-    print(f"2θ: {TTH_MIN}-{TTH_MAX}° | η: {ETA_MIN}-{ETA_MAX}° | Cakes: {len(cake_slices)}")
+    print(f"2θ: {TTH_MIN}-{TTH_MAX}° | η: {ETA_MIN}-{ETA_MAX}°")
     print(f"Polar image shape (eta, tth): {pv.shape}")
 
     # Axes
@@ -221,57 +163,53 @@ def integrate_em(tiff_folder: str,
         h5_file.create_dataset("q", data=q_values)
         h5_file.create_dataset("time", data=time_axis)
 
-        d_cake = None
-        if cake_slices:
-            d_cake = h5_file.create_dataset(
-                "cake_int",
-                shape=(nframes, len(cake_slices), pv.shape[1]),
-                dtype='f4',
-                chunks=(min(64, nframes), 1, pv.shape[1]),
-                compression="gzip"
-            )
-            h5_file.create_dataset("cake_eta_ranges", data=np.array(cake_slices, dtype='f4'))
-
         h5_file.attrs["experiment_name"] = experiment_name
         h5_file.attrs["nframes"] = nframes
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
 
-        # Choose worker count (keep modest to avoid OOM)
+        # Concurrency: default to 16 workers (override via CLI)
         if max_workers is None:
-            max_workers = min(32, os.cpu_count() or 1)
+            max_workers = min(16, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
 
-        # Bounded task queue to cap prefetch/in-flight jobs
-        task_q: "queue.Queue[Tuple[int, str]]" = queue.Queue(maxsize=max_workers * 2)
+        paths = [os.path.join(tiff_folder, f) for f in tiff_files]
+        processing_start = time.time()
+        completed = 0
 
-        writer_lock = threading.Lock()
-        progress_lock = threading.Lock()
-        progress_state = {"done": 0, "start": time.time()}
+        # Throttle the number of in-flight futures to limit memory
+        max_pending = max_workers * 2
+        future_to_idx = {}
+        pending = set()
 
-        # Start worker threads
-        threads = []
-        for _ in range(max_workers):
-            t = threading.Thread(target=worker_loop,
-                                 args=(task_q, pv, det_keys, cake_slices,
-                                       d_int, d_cake, writer_lock, progress_lock,
-                                       progress_state, nframes),
-                                 daemon=True)
-            t.start()
-            threads.append(t)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i, p in enumerate(paths):
+                fut = executor.submit(process_frame_path, p, pv, det_keys)
+                future_to_idx[fut] = i
+                pending.add(fut)
 
-        # Enqueue tasks
-        for i, fname in enumerate(tiff_files):
-            task_q.put((i, os.path.join(tiff_folder, fname)))
+                if len(pending) >= max_pending:
+                    done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for f in done:
+                        idx = future_to_idx.pop(f)
+                        intensity = f.result()
+                        d_int[idx, :] = intensity
+                        completed += 1
+                        if completed % 100 == 0 or completed == nframes:
+                            elapsed = time.time() - processing_start
+                            rate = completed / max(elapsed, 1e-6)
+                            print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
 
-        # Wait for completion
-        task_q.join()
-
-        # Stop workers
-        for _ in threads:
-            task_q.put((None))
-        for t in threads:
-            t.join()
+            # Drain remaining futures
+            for f in concurrent.futures.as_completed(pending):
+                idx = future_to_idx.pop(f)
+                intensity = f.result()
+                d_int[idx, :] = intensity
+                completed += 1
+                if completed % 100 == 0 or completed == nframes:
+                    elapsed = time.time() - processing_start
+                    rate = completed / max(elapsed, 1e-6)
+                    print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
 
     if plot:
         import matplotlib.pyplot as plt
@@ -305,4 +243,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
-
