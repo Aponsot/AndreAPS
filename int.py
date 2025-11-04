@@ -195,10 +195,7 @@ def integrate_em(tiff_folder: str,
                         intensity = f.result()
                         d_int[idx, :] = intensity
                         completed += 1
-                        if completed % 100 == 0 or completed == nframes:
-                            elapsed = time.time() - processing_start
-                            rate = completed / max(elapsed, 1e-6)
-                            print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
+                        print(f"  {completed}/{nframes} frames", end='\r')
 
             # Drain remaining futures
             for f in concurrent.futures.as_completed(pending):
@@ -243,4 +240,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
+
 
