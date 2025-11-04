@@ -173,7 +173,7 @@ def integrate_em(tiff_folder: str,
 
         # Concurrency: set via CLI; default modest to avoid OOM
         if max_workers is None:
-            max_workers = min(16, os.cpu_count() or 1)
+            max_workers = min(32, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
 
         paths = [os.path.join(tiff_folder, f) for f in tiff_files]
@@ -244,3 +244,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
+
