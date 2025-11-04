@@ -22,11 +22,14 @@ MAX_SIGMA_FRAC = 0.20      # also cap sigma to this fraction of WINDOW
 # Seeding: allowed per-frame center movement (q units)
 PER_FRAME_SHIFT = 0.015
 
+# Anchor for the first peak on the initial fit (no previous solution)
+ANCHOR_TOL = 0.005  # q units around the specified first peak position
+
 # Quality threshold for accepting seeded result
 R2_MIN = 0.6
 
 # Pruning threshold: remove peaks (set amplitude to 0) if height < HEIGHT_MIN
-HEIGHT_MIN = 5.0
+HEIGHT_MIN = 1.0
 
 # Amorphous/free movement ranges (disable per-frame center constraints in these frame ranges)
 # Example: FREE_RANGES = [(400, 520), (780, 820)]
@@ -56,7 +59,6 @@ def compute_r2(y, yfit):
 
 def _estimate_sigma0(xw, yw, baseline, cx):
     # Estimate initial sigma from a local FWHM around cx using half-maximum
-    # FWHM ~ (x_right - x_left) at half height; sigma0 = FWHM / 2.3548
     if xw.size < 3:
         return max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
     p = np.argmin(np.abs(xw - cx))
@@ -67,7 +69,6 @@ def _estimate_sigma0(xw, yw, baseline, cx):
     xl = xw[0]
     for i in range(p, 0, -1):
         if yw[i] <= half_level and yw[i-1] > half_level:
-            # linear interpolation
             t = (half_level - yw[i]) / (yw[i-1] - yw[i] + 1e-16)
             xl = xw[i] + t * (xw[i-1] - xw[i])
             break
@@ -197,9 +198,11 @@ def in_any_range(frame, ranges):
 def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
     """
     Fit the specified peaks in a single frame with:
-      - Seeded per-frame bounds: center in [prev_center ± PER_FRAME_SHIFT], if available.
+      - Initial anchor: peak 0 center ∈ [cx0 ± ANCHOR_TOL] if no previous solution.
+      - Seeded per-frame bounds afterwards: center ∈ [prev_center ± PER_FRAME_SHIFT].
       - Free bounds within the window in frames within FREE_RANGES (amorphous zones).
-    Fallback: if seeded fit looks poor or centers are stuck on bounds, refit with free bounds.
+
+    Fallback: if seeded fit looks poor or centers are stuck on bounds, refit with free bounds (but keep anchor on the initial frame for peak 0).
 
     After fitting, prune peaks with height < HEIGHT_MIN by fixing their amplitude to 0
     (and fixing center/sigma), then refit so pruned components do not affect other parameters.
@@ -230,19 +233,30 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
                              if f"g{i}_amplitude" in prev_solution.params else None)
         init_from = {"center": centers_seed, "sigma": sigmas_seed, "amplitude": amps_seed}
 
-    # Center bounds for seeded attempt (or free in amorphous ranges)
+    # Build center bounds: initial anchor for peak 0, then seeded bounds
     free_here = in_any_range(frame, FREE_RANGES)
+    is_initial = (prev_solution is None) and (not free_here)
+
     center_bounds_seed = []
     for i, cx in enumerate(peak_positions):
-        if free_here or prev_solution is None or init_from is None:
-            cmin, cmax = xw[0], xw[-1]  # free within window
+        if free_here:
+            # free within window in amorphous ranges
+            cmin, cmax = xw[0], xw[-1]
+        elif is_initial:
+            # initial anchor: peak 0 tightly constrained; others free in window
+            if i == 0:
+                cmin = max(xw[0], cx - ANCHOR_TOL)
+                cmax = min(xw[-1], cx + ANCHOR_TOL)
+            else:
+                cmin, cmax = xw[0], xw[-1]
         else:
-            prev_c = init_from["center"][i]
+            # seeded bounds around previous centers
+            prev_c = init_from["center"][i] if init_from is not None else cx
             cmin = max(xw[0], prev_c - PER_FRAME_SHIFT)
             cmax = min(xw[-1], prev_c + PER_FRAME_SHIFT)
         center_bounds_seed.append((cmin, cmax))
 
-    # First, seeded (or free) fit
+    # First, seeded (or initial anchored/free) fit
     model_seed, params_seed, sigma_limits = build_model(
         xw, yw, peak_positions, baseline,
         center_bounds=center_bounds_seed,
@@ -254,27 +268,36 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
     peaks_seed = extract_peaks(result_seed)
     stuck_seed = _detect_bounds_stuck_centers(result_seed, center_bounds_seed)
 
-    # Fallback: if quality is poor or centers stuck on bounds, retry with free bounds (window only)
+    # Fallback: if quality is poor or centers stuck on bounds
     use_fallback = (r2_seed < R2_MIN) or (not free_here and stuck_seed)
     if use_fallback:
-        center_bounds_free = [(xw[0], xw[-1]) for _ in peak_positions]
-        model_free, params_free, _ = build_model(
+        center_bounds_fallback = []
+        for i, cx in enumerate(peak_positions):
+            if is_initial and (i == 0):
+                # keep anchor for peak 0 in initial frame even in fallback
+                cmin = max(xw[0], cx - ANCHOR_TOL)
+                cmax = min(xw[-1], cx + ANCHOR_TOL)
+            else:
+                cmin, cmax = xw[0], xw[-1]
+            center_bounds_fallback.append((cmin, cmax))
+
+        model_fb, params_fb, _ = build_model(
             xw, yw, peak_positions, baseline,
-            center_bounds=center_bounds_free,
+            center_bounds=center_bounds_fallback,
             init_from=init_from
         )
-        result_free = model_free.fit(yw, params_free, x=xw, calc_covar=False,
-                                     method="least_squares", max_nfev=800)
-        r2_free = compute_r2(yw, result_free.best_fit)
-        peaks_free = extract_peaks(result_free)
+        result_fb = model_fb.fit(yw, params_fb, x=xw, calc_covar=False,
+                                 method="least_squares", max_nfev=800)
+        r2_fb = compute_r2(yw, result_fb.best_fit)
+        peaks_fb = extract_peaks(result_fb)
 
         # Choose the better by R²
-        if r2_free >= r2_seed:
-            result = result_free
-            peaks = peaks_free
-            r2 = r2_free
-            center_bounds_used = center_bounds_free
-            model_used = model_free
+        if r2_fb >= r2_seed:
+            result = result_fb
+            peaks = peaks_fb
+            r2 = r2_fb
+            center_bounds_used = center_bounds_fallback
+            model_used = model_fb
         else:
             result = result_seed
             peaks = peaks_seed
@@ -380,7 +403,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None):
 
 def track_sequential(h5_path, peak_positions):
     """
-    Sequentially fit frames with seeding from previous frame and small per-frame center bounds.
+    Sequentially fit frames with initial anchor for peak 0, then seeding per frame.
     In frames within FREE_RANGES (amorphous zones), per-frame constraints are disabled.
 
     Returns tracking arrays for centers and heights (after pruning).
@@ -486,7 +509,7 @@ def plot_scatter_map(tracking):
     cbar.set_label("Peak height (a.u.)")
     plt.xlabel("Frame")
     plt.ylabel("q (1/Å)")
-    plt.title(f"Peak map (height_min={HEIGHT_MIN})")
+    plt.title(f"Peak map (height_min={HEIGHT_MIN}, anchor_tol={ANCHOR_TOL})")
     plt.tight_layout()
     plt.show()
 
@@ -510,7 +533,8 @@ def main():
     peak_positions = sorted(args.peaks)
 
     print(f"Peaks: {peak_positions}")
-    print(f"Window: {WINDOW} q | Per-frame shift: {PER_FRAME_SHIFT} q | R2_MIN: {R2_MIN} | height_min: {HEIGHT_MIN}")
+    print(f"Window: {WINDOW} q | Per-frame shift: {PER_FRAME_SHIFT} q | Anchor tol (initial peak 0): {ANCHOR_TOL} q")
+    print(f"R2_MIN: {R2_MIN} | height_min: {HEIGHT_MIN}")
     if FREE_RANGES:
         print(f"Free movement ranges (amorphous): {FREE_RANGES}")
     print(f"Sigma bounds: [{MIN_SIGMA_ABS}, {min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)}] q (data-informed)")
@@ -525,5 +549,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
