@@ -19,11 +19,8 @@ MIN_SIGMA_ABS = 0.001      # absolute lower bound on sigma (q units)
 MAX_SIGMA_ABS = 0.025      # absolute upper bound on sigma (q units)
 MAX_SIGMA_FRAC = 0.20      # also cap sigma to this fraction of WINDOW
 
-# Anchor for peak 0
+# Anchor for peak 0 every frame
 ANCHOR_TOL = 0.005  # q units around the specified first peak position
-
-# Quality threshold for adopting seeds to the next frame
-R2_MIN = 0.6
 
 # Pruning threshold: remove peaks (set amplitude to 0) if height < HEIGHT_MIN
 HEIGHT_MIN = 5.0
@@ -179,8 +176,7 @@ def build_model(xw, yw, centers, baseline, center_bounds=None, init_from=None):
             if "amplitude" in init_from and i < len(init_from["amplitude"]) and init_from["amplitude"][i] is not None:
                 a_seed = float(init_from["amplitude"][i])
                 if a_seed > 0.0:
-                    a_init = a_seed
-                # else keep local estimate amp0
+                    a_init = a_seed  # keep local amp0 when seed <= 0
 
         params[f"g{i}_center"].set(min=cmin, max=cmax, value=c_init)
         # Sigma constrained by min/max
@@ -229,21 +225,16 @@ def _param_at_bounds(result, name, frac_tol=0.05):
 
 
 # ------------------------------
-# Fit one frame (seed-only logic; pruning)
+# Fit one frame (independent; pruning)
 # ------------------------------
 
-def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None,
-              seed_only=True, anchor_each_frame=True):
+def fit_one_frame(h5_path, frame, peak_positions, plot=False, init_from=None, anchor_each_frame=True):
     """
-    Fit the specified peaks in a single frame using seed-only logic:
-      - Centers free within the window for all peaks (no per-frame movement constraints).
-      - Optionally anchor peak 0 center within [cx0 ± ANCHOR_TOL] every frame.
-      - Use previous frame's best-fit parameters only to seed initial values.
+    Independent single-frame fit:
+      - Centers free within the window; optionally anchor peak 0 within [cx0 ± ANCHOR_TOL] every frame.
+      - init_from can seed initial values (e.g., from previous frame), but does not constrain bounds.
 
     Robust linear background and pruning are applied.
-
-    After fitting, prune peaks with height < HEIGHT_MIN by fixing amplitude to 0
-    (and fixing center/sigma), then refit so pruned components do not affect other parameters.
     """
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
@@ -259,20 +250,7 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None,
     # Lower-quantile baseline for robust sigma/height seeding
     baseline = np.quantile(yw, BASELINE_QUANTILE)
 
-    # Seed arrays from previous solution if available (used for initialization only)
-    init_from = None
-    if prev_solution is not None:
-        centers_seed, sigmas_seed, amps_seed = [], [], []
-        for i in range(len(peak_positions)):
-            centers_seed.append(prev_solution.params[f"g{i}_center"].value
-                                if f"g{i}_center" in prev_solution.params else peak_positions[i])
-            sigmas_seed.append(prev_solution.params[f"g{i}_sigma"].value
-                               if f"g{i}_sigma" in prev_solution.params else None)
-            amps_seed.append(prev_solution.params[f"g{i}_amplitude"].value
-                             if f"g{i}_amplitude" in prev_solution.params else None)
-        init_from = {"center": centers_seed, "sigma": sigmas_seed, "amplitude": amps_seed}
-
-    # Build center bounds: seed-only => free within window; optional anchor peak 0 every frame
+    # Build center bounds: free within window; optional anchor peak 0 every frame
     center_bounds = []
     for i, cx in enumerate(peak_positions):
         if anchor_each_frame and i == 0:
@@ -298,7 +276,8 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None,
     r2 = compute_r2(yw, result.best_fit)
 
     # If background slope is stuck near its bounds, freeze it to the robust init and refit
-    if _param_at_bounds(result, "bkg_slope", frac_tol=0.05):
+    bkg_stuck = _param_at_bounds(result, "bkg_slope", frac_tol=0.05)
+    if bkg_stuck:
         params2 = result.params.copy()
         params2["bkg_slope"].set(value=params2["bkg_slope"].value, vary=False)
         result = model.fit(yw, params2, x=xw, calc_covar=False,
@@ -328,8 +307,6 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None,
         result = model_refit.fit(yw, params_refit, x=xw, calc_covar=False,
                                  method="least_squares", max_nfev=800, **loss_kwargs)
         r2 = compute_r2(yw, result.best_fit)
-        peaks = extract_peaks(result)
-    else:
         peaks = extract_peaks(result)
 
     bkg_slope = result.params["bkg_slope"].value
@@ -384,75 +361,85 @@ def fit_peaks(h5_path, frame, peak_positions, plot=True, prev_solution=None,
         plt.tight_layout()
         plt.show()
 
+    # Return per-frame detailed result with centers/heights for all peaks
+    centers_all = [result.params[f"g{i}_center"].value for i in range(len(peak_positions))]
+    heights_all = []
+    for i in range(len(peak_positions)):
+        ai = result.params[f"g{i}_amplitude"].value
+        si = abs(result.params[f"g{i}_sigma"].value)
+        hi = ai / (si * np.sqrt(2 * np.pi)) if si > 0 else 0.0
+        heights_all.append(max(hi, 0.0))
+
     return {
         "frame": frame,
         "background": {"slope": bkg_slope, "intercept": bkg_intercept},
         "r2": r2,
         "rows": rows,  # kept peaks only
         "result": result,
-        "n_peaks": len(kept)
+        "n_peaks": len(kept),
+        "centers_all": centers_all,
+        "heights_all": heights_all,
+        "pruned_indices": pruned_indices,
+        "bkg_slope_stuck": bkg_stuck
     }
 
 
 # ------------------------------
-# Sequential tracking (seed-only map)
+# Independent map (aggregate of single-frame fits)
 # ------------------------------
 
-def track_sequential(h5_path, peak_positions, anchor_every_frame=True):
+def run_map_independent(h5_path, peak_positions, anchor_each_frame=True):
     """
-    Sequentially fit frames with seed-only logic:
-      - Centers free within the window (no per-frame movement constraints).
-      - Optionally anchor peak 0 every frame within ANCHOR_TOL.
-      - Seed from the immediate prior frame only if the prior fit is reasonable (R2 >= R2_MIN).
-
-    Returns tracking arrays for centers and heights (post-pruning).
+    Loop over all frames, calling fit_one_frame independently for each.
+    No inter-frame constraints are used; optional init_from can be used if desired,
+    but by default this is fully independent to match single-frame logic exactly.
     """
     with h5py.File(h5_path, "r") as f:
-        x = f["q"][:] if "q" in f else f["tth"][:]
         int_ds = f["int"]
         nframes_total = int_ds.shape[0]
         frames = range(0, nframes_total)
 
-        centers_tr = [[] for _ in peak_positions]
-        heights_tr = [[] for _ in peak_positions]
-        r2_tr = []
+    centers_tr = [[] for _ in peak_positions]
+    heights_tr = [[] for _ in peak_positions]
+    r2_tr = []
+    issues = []  # collect flags per frame (e.g., slope stuck, pruned indices)
 
-        prev_solution = None
-        first = True
+    first = True
+    for fr in tqdm(frames, desc="Independent map", unit="frame"):
+        plot_this = SHOW_EXAMPLE_FIT and first
+        try:
+            out = fit_one_frame(
+                h5_path, fr, peak_positions, plot=plot_this,
+                init_from=None,  # fully independent
+                anchor_each_frame=anchor_each_frame
+            )
+            r2_tr.append(out["r2"])
+            # record centers/heights for all peaks (even if low)
+            for i in range(len(peak_positions)):
+                centers_tr[i].append(out["centers_all"][i])
+                heights_tr[i].append(out["heights_all"][i])
 
-        for fr in tqdm(frames, desc="Seed-only tracking", unit="frame"):
-            plot_this = SHOW_EXAMPLE_FIT and first
-            try:
-                out = fit_peaks(
-                    h5_path, fr, peak_positions, plot=plot_this,
-                    prev_solution=prev_solution,
-                    seed_only=True,
-                    anchor_each_frame=anchor_every_frame
-                )
-                result = out["result"]
-                r2 = out["r2"]
-                r2_tr.append(r2)
+            issues.append({
+                "frame": fr,
+                "bkg_slope_stuck": bool(out["bkg_slope_stuck"]),
+                "pruned_indices": out["pruned_indices"],
+                "r2": out["r2"]
+            })
 
-                # Extract centers/heights after pruning; peaks below threshold get height=0 and center from frozen values
-                for i in range(len(peak_positions)):
-                    ai = result.params[f"g{i}_amplitude"].value
-                    si = abs(result.params[f"g{i}_sigma"].value)
-                    hi = ai / (si * np.sqrt(2 * np.pi)) if si > 0 else 0.0
-                    ci = result.params[f"g{i}_center"].value
-                    centers_tr[i].append(ci)
-                    heights_tr[i].append(max(hi, 0.0))
+        except Exception as ex:
+            r2_tr.append(np.nan)
+            for i in range(len(peak_positions)):
+                centers_tr[i].append(np.nan)
+                heights_tr[i].append(0.0)
+            issues.append({
+                "frame": fr,
+                "error": str(ex),
+                "bkg_slope_stuck": False,
+                "pruned_indices": [],
+                "r2": np.nan
+            })
 
-                # Seed next frame only if fit is reasonable
-                prev_solution = result if r2 >= R2_MIN else None
-
-            except Exception:
-                r2_tr.append(np.nan)
-                for i in range(len(peak_positions)):
-                    centers_tr[i].append(np.nan)
-                    heights_tr[i].append(0.0)
-                prev_solution = None
-
-            first = False
+        first = False
 
     return {
         "frames": list(frames),
@@ -460,12 +447,15 @@ def track_sequential(h5_path, peak_positions, anchor_every_frame=True):
         "heights": heights_tr,
         "r2": r2_tr,
         "peak_positions": peak_positions,
-        "height_min": HEIGHT_MIN
+        "height_min": HEIGHT_MIN,
+        "issues": issues
     }
 
-def plot_scatter_map(tracking):
+def plot_scatter_map(tracking, show_all=True):
     """
     Plot scatter: frame vs q-center, color = peak height.
+    - If show_all=True, plot all points (even below HEIGHT_MIN).
+    - If show_all=False, only plot points with height >= HEIGHT_MIN.
     """
     frames = tracking["frames"]
     centers_tr = tracking["centers"]
@@ -479,13 +469,16 @@ def plot_scatter_map(tracking):
         for f_idx, fr in enumerate(frames):
             c = centers_tr[i][f_idx]
             h = heights_tr[i][f_idx]
-            if np.isfinite(c) and h > 0.0:
-                xs.append(fr)
-                ys.append(c)
-                cs.append(h)
+            if not np.isfinite(c):
+                continue
+            if (not show_all) and (h < HEIGHT_MIN):
+                continue
+            xs.append(fr)
+            ys.append(c)
+            cs.append(h)
 
     if len(xs) == 0:
-        print("No peaks above height_min found to plot.")
+        print("No peaks found to plot.")
         return
 
     vmax = np.percentile(cs, SCATTER_VMAX_PERCENTILE) if len(cs) > 20 else max(cs)
@@ -501,9 +494,35 @@ def plot_scatter_map(tracking):
     cbar.set_label("Peak height (a.u.)")
     plt.xlabel("Frame")
     plt.ylabel("q (1/Å)")
-    plt.title(f"Peak map (height_min={HEIGHT_MIN}, anchor_tol={ANCHOR_TOL})")
+    title_suffix = "all points" if show_all else f"height ≥ {HEIGHT_MIN}"
+    plt.title(f"Peak map ({title_suffix}, anchor_tol={ANCHOR_TOL})")
     plt.tight_layout()
     plt.show()
+
+def print_issue_summary(tracking, max_rows=20):
+    """
+    Print a brief summary of frames with issues (background slope stuck, pruned peaks, errors).
+    """
+    print("\nIssue summary (first rows):")
+    count = 0
+    for it in tracking["issues"]:
+        if count >= max_rows:
+            print("... (truncated)")
+            break
+        flags = []
+        if it.get("error", None):
+            flags.append(f"ERROR={it['error']}")
+        if it.get("bkg_slope_stuck", False):
+            flags.append("bkg_slope_stuck")
+        if it.get("pruned_indices", []):
+            flags.append(f"pruned={it['pruned_indices']}")
+        if np.isfinite(it.get("r2", np.nan)) and it["r2"] < 0.6:
+            flags.append(f"low_R2={it['r2']:.3f}")
+        if flags:
+            print(f"Frame {it['frame']}: " + ", ".join(flags))
+            count += 1
+    if count == 0:
+        print("No issues flagged in the first pass.")
 
 
 # ------------------------------
@@ -512,35 +531,36 @@ def plot_scatter_map(tracking):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fit Gaussian peaks (linear background) at specified q-positions"
+        description="Independent per-frame Gaussian peak fits (linear background) and map aggregation"
     )
     parser.add_argument("h5", help="HDF5 file with 'q' or 'tth' and 'int' datasets")
     parser.add_argument("peaks", type=float, nargs='+',
                         help="Peak q-positions (e.g., 3.025 3.012)")
     parser.add_argument("--frame", type=int, help="Fit a single frame and show plot")
     parser.add_argument("--map", action="store_true",
-                        help="Sequential tracking across all frames (seed-only; anchors peak 0 every frame)")
+                        help="Run independent fits on all frames and plot the map (no inter-frame constraints)")
+    parser.add_argument("--show-all", action="store_true",
+                        help="In map plot, show all points (ignore height_min filtering)")
 
     args = parser.parse_args()
     peak_positions = sorted(args.peaks)
 
     print(f"Peaks: {peak_positions}")
     print(f"Window: {WINDOW} q | Anchor tol (peak 0 each frame): {ANCHOR_TOL} q")
-    print(f"R2_MIN: {R2_MIN} | height_min: {HEIGHT_MIN}")
+    print(f"height_min: {HEIGHT_MIN}")
     print(f"Sigma bounds: [{MIN_SIGMA_ABS}, {min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)}] q (data-informed)")
     print(f"Background: BASELINE_QUANTILE={BASELINE_QUANTILE}, EXCLUDE_RADIUS={BKG_EXCLUDE_RADIUS}, "
           f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_TOL={BKG_SLOPE_TOL}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
 
     if args.frame is not None:
-        # Single-frame fit uses the same seed-only logic
-        fit_peaks(args.h5, args.frame, peak_positions, plot=True,
-                  prev_solution=None, seed_only=True, anchor_each_frame=True)
+        fit_one_frame(args.h5, args.frame, peak_positions, plot=True, init_from=None, anchor_each_frame=True)
     elif args.map:
-        tr = track_sequential(args.h5, peak_positions, anchor_every_frame=True)
-        plot_scatter_map(tr)
+        tr = run_map_independent(args.h5, peak_positions, anchor_each_frame=True)
+        print_issue_summary(tr, max_rows=20)
+        plot_scatter_map(tr, show_all=args.show_all)
     else:
-        print("Specify --frame N to fit a single frame, or --map for sequential tracking across all frames.")
+        print("Specify --frame N to fit a single frame, or --map for independent fits across all frames.")
 
 if __name__ == "__main__":
     main()
