@@ -9,6 +9,8 @@ import tifffile as tiff
 import yaml
 from scipy.ndimage import median_filter
 import concurrent.futures
+import threading
+import queue
 import gc
 
 from hexrd import instrument
@@ -48,14 +50,9 @@ def load_tiff_files(tiff_folder: str) -> Tuple[List[str], str]:
         f for f in os.listdir(tiff_folder)
         if f.lower().endswith(('.tiff', '.tif'))
     ])
-
     if not tiff_files:
         raise ValueError(f"No TIFF files found in {tiff_folder}")
-
-    experiment_name = os.path.commonprefix(tiff_files).rstrip('_-')
-    if not experiment_name:
-        experiment_name = "experiment"
-
+    experiment_name = os.path.commonprefix(tiff_files).rstrip('_-') or "experiment"
     return tiff_files, experiment_name
 
 
@@ -64,51 +61,58 @@ def tth_to_q(tth_degrees: np.ndarray, wavelength_angstrom: float) -> np.ndarray:
     return (4 * np.pi * np.sin(theta_radians)) / wavelength_angstrom
 
 
-def process_frame_path(path: str,
-                       pv: PolarView,
-                       det_keys: List[str]) -> np.ndarray:
-    # Read frame from disk
-    img = tiff.imread(path)
-    image = img.astype(np.float32, copy=False)
+def process_frame_array(image: np.ndarray,
+                        pv: PolarView,
+                        det_keys: List[str]) -> np.ndarray:
+    # Work on float32 array
+    image = image.astype(np.float32, copy=False)
 
     # Boolean mask for bad pixels/background
     mask = (image == SATURATION_VALUE) | (image <= 0)
     for val in BACKGROUND_VALUES:
         mask |= (np.abs(image - val) <= BACKGROUND_TOLERANCE)
 
-    # Background subtraction (creates a new array)
+    # Background subtraction
     background = median_filter(image, size=MEDIAN_FILTER_SIZE)
-
-    # In-place subtract to avoid creating another large array
+    # In-place subtract to limit temporaries
     np.subtract(image, background, out=image)
-    background = None  # let GC reclaim
-    # Apply mask
+    background = None
     image[mask] = 0.0
 
-    # In-place thresholding/inflation to minimize temporaries
-    # First zero everything <= threshold
+    # Threshold + inflate
     idx_low = image <= INTENSITY_THRESHOLD
     image[idx_low] = 0.0
-    # Inflate the remaining positives
     np.multiply(image, INFLATE_FACTOR, out=image, where=image > 0)
 
-    # Map to detector(s); adjust if you truly have multiple distinct detectors
+    # Polar warp
     local_imsd = {det_key: image for det_key in det_keys}
-
-    # Polar warp (original behavior with padding and interpolation)
     polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
 
-    # Average over full azimuthal (eta) to get 1D intensity
+    # Integrate over full azimuthal (eta)
     if np.ma.isMaskedArray(polar_image):
         integrated_intensity = np.array(np.ma.average(polar_image, axis=0), dtype=np.float32)
     else:
         integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
 
-    # Help GC
-    del img, image, local_imsd, polar_image
+    # Cleanup
+    del local_imsd, polar_image
     gc.collect()
 
     return integrated_intensity
+
+
+def reader_thread(paths: List[str], q: "queue.Queue[tuple[int, np.ndarray]]", dtype=np.float32):
+    try:
+        for i, p in enumerate(paths):
+            # Sequential read to keep I/O linear
+            img = tiff.imread(p)
+            arr = img.astype(dtype, copy=False)
+            q.put((i, arr))
+        # Sentinel
+        q.put((-1, None))
+    except Exception as e:
+        print(f"Reader error: {e}")
+        q.put((-1, None))
 
 
 def integrate_em(tiff_folder: str,
@@ -116,7 +120,6 @@ def integrate_em(tiff_folder: str,
                  output_dir: str = DEFAULT_OUTPUT_DIR,
                  plot: bool = False,
                  max_workers: Optional[int] = None) -> str:
-    start_time = time.time()
 
     print("=" * 70)
     print("POLAR INTEGRATION WORKFLOW")
@@ -174,7 +177,7 @@ def integrate_em(tiff_folder: str,
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
 
-        # Concurrency: modest default; override via CLI
+        # Concurrency controls
         if max_workers is None:
             max_workers = min(16, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
@@ -183,42 +186,50 @@ def integrate_em(tiff_folder: str,
         processing_start = time.time()
         completed = 0
 
-        # Limit the number of in-flight tasks tightly to avoid memory spikes
-        max_pending = max_workers  # not 2x; keep ≤ workers alive
-        future_to_idx = {}
-        pending = set()
+        # Small prefetch queue to overlap I/O with compute without ballooning RAM
+        prefetch = max(2, min(4, max_workers))  # 2–4 frames prefetched
+        q: "queue.Queue[tuple[int, np.ndarray]]" = queue.Queue(maxsize=prefetch)
+
+        # Start reader
+        rt = threading.Thread(target=reader_thread, args=(paths, q), daemon=True)
+        rt.start()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for i, p in enumerate(paths):
-                fut = executor.submit(process_frame_path, p, pv, det_keys)
-                future_to_idx[fut] = i
-                pending.add(fut)
+            future_to_idx = {}
+            in_flight = 0
+            reader_done = False
 
-                # Keep at most max_pending in-flight
-                if len(pending) >= max_pending:
-                    done, pending = concurrent.futures.wait(
-                        pending, return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-                    for f in done:
-                        idx = future_to_idx.pop(f)
-                        intensity = f.result()
-                        d_int[idx, :] = intensity
-                        completed += 1
-                        if completed % 100 == 0 or completed == nframes:
-                            elapsed = time.time() - processing_start
-                            rate = completed / max(elapsed, 1e-6)
-                            print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
+            while True:
+                # Fill up to max_workers in-flight tasks
+                while in_flight < max_workers and not reader_done:
+                    idx, arr = q.get()
+                    if idx == -1:
+                        reader_done = True
+                        break
+                    fut = executor.submit(process_frame_array, arr, pv, det_keys)
+                    future_to_idx[fut] = idx
+                    in_flight += 1
 
-            # Drain remaining futures
-            for f in concurrent.futures.as_completed(pending):
-                idx = future_to_idx.pop(f)
-                intensity = f.result()
-                d_int[idx, :] = intensity
-                completed += 1
-                if completed % 100 == 0 or completed == nframes:
-                    elapsed = time.time() - processing_start
-                    rate = completed / max(elapsed, 1e-6)
-                    print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
+                if not future_to_idx and reader_done:
+                    break
+
+                done, _ = concurrent.futures.wait(
+                    future_to_idx.keys(),
+                    return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for f in done:
+                    idx = future_to_idx.pop(f)
+                    intensity = f.result()
+                    d_int[idx, :] = intensity
+                    completed += 1
+                    in_flight -= 1
+
+                    if completed % 100 == 0 or completed == nframes:
+                        elapsed = time.time() - processing_start
+                        rate = completed / max(elapsed, 1e-6)
+                        print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
+
+        rt.join()
 
     if plot:
         import matplotlib.pyplot as plt
@@ -252,3 +263,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
+Why this helps
