@@ -26,7 +26,7 @@ TTH_MIN = 1.0
 TTH_MAX = 14.0
 ETA_MIN = -180.0
 ETA_MAX = 180.0
-NDIV = 3
+NDIV = 4
 CAKE_WIDTH = 10.0
 
 SATURATION_VALUE = 2**32 - 1
@@ -240,4 +240,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot, args.max_workers)
+
 
