@@ -25,7 +25,7 @@ TTH_MIN = 1.0
 TTH_MAX = 14.0
 ETA_MIN = -180.0
 ETA_MAX = 180.0
-NDIV = 3
+NDIV = 4
 CAKE_WIDTH = 10.0
 
 SATURATION_VALUE = 2**32 - 1
@@ -74,7 +74,7 @@ def process_frame_path(path: str,
                        pv: PolarView,
                        det_keys: List[str],
                        cake_slices: Optional[List[Tuple[float, float]]] = None) -> Tuple[np.ndarray, Optional[List[np.ndarray]]]:
-    # Read frame from disk; stream, do not preload
+    # Read frame from disk
     img = tiff.imread(path)
     image = img.astype(np.float32, copy=False)
 
@@ -98,7 +98,7 @@ def process_frame_path(path: str,
     # Map to detector(s); adjust if you truly have multiple, distinct detector images
     local_imsd = {det_key: image_processed for det_key in det_keys}
 
-    # Polar warp (keep interpolation/padding to match original behavior)
+    # Polar warp (match original behavior with padding and interpolation)
     polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True).astype(np.float32, copy=False)
 
     # Average over eta to get 1D intensity
@@ -195,9 +195,9 @@ def integrate_em(tiff_folder: str,
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
 
-        # Concurrency: keep modest to avoid OOM
+        # Concurrency: default to 16 workers (override via CLI)
         if max_workers is None:
-            max_workers = min(4, os.cpu_count() or 1)
+            max_workers = min(16, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
 
         processing_start = time.time()
