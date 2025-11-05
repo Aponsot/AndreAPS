@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
@@ -212,17 +213,10 @@ def _local_argmax(xw, yw, cx, span):
 # ------------------------------
 
 def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline, noise):
-    """
-    Greedy residual-add:
-      1) fit background only
-      2) add Gaussians one-by-one near supplied guesses (largest seed first)
-      3) accept addition only if ΔAIC >= _AIC_IMPROVE and height >= noise-aware threshold
-    """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
     min_sigma_global = max(0.75 * dx, MIN_SIGMA_ABS)
     max_sigma_global = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
 
-    # background-only init (no exclusions)
     init_slope, init_intercept = _background_init(xw, yw, [], BKG_EXCLUDE_RADIUS, sigma_seeds=None)
     model = LinearModel(prefix="bkg_")
     params = model.make_params(slope=init_slope, intercept=init_intercept)
@@ -237,7 +231,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
     peak_positions = list(sorted(peak_positions))
     center_bounds_guess = _make_center_bounds(xmin, xmax, peak_positions, anchor_peak0, ANCHOR_TOL, CENTER_TOL)
 
-    # order additions by local seed height near guesses
     seeds = []
     for cx in peak_positions:
         sig0, h0 = _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010)
@@ -255,7 +248,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
                     continue
                 cx_new = _local_argmax(xw, resid + baseline, cx, span=max(_RESIDUAL_PICK_SPAN, 2*np.mean(np.diff(xw))))
                 return cx, cx_new, h0, s0
-        # fallback: global residual max
         j = int(np.argmax(resid))
         cx_new = float(xw[j])
         sig0, h0 = _local_height_sigma_seeds(xw, yw, baseline, cx_new, w=0.010)
@@ -266,7 +258,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
         resid = yw - best_res.best_fit
         guess_cx, place_cx, h0, s0 = _place_next_center(resid)
 
-        # bounds for the new peak
         if guess_cx in peak_positions:
             i_guess = peak_positions.index(guess_cx)
             cmin, cmax = center_bounds_guess[i_guess]
@@ -292,28 +283,18 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
         trial_res = new_model.fit(yw, new_params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
         dAIC = best_aic - trial_res.aic
 
-        # ensure the *new* peak is substantive
         trial_peaks = extract_peaks(trial_res)
         this_peak = next((p for p in trial_peaks if p["index"] == n_added), None)
         too_small = (this_peak is None) or (this_peak["height"] < height_thresh)
 
-        if _VERBOSE:
-            print(f"[add#{n_added}] guess={guess_cx:.6f} -> place={place_cx:.6f}  ΔAIC={dAIC:.3f}  "
-                  f"h0~{h0:.3g}  σ0~{s0:.4f}  too_small={too_small}")
-
         if (dAIC < _AIC_IMPROVE) or too_small:
-            if _VERBOSE:
-                print(f"[stop] reason={'ΔAIC too small' if dAIC < _AIC_IMPROVE else 'height too small'}")
             break
 
         best_res = trial_res
         best_aic = trial_res.aic
         used_positions.append(guess_cx)
         n_added += 1
-        if _VERBOSE:
-            print(f"  accepted peak#{n_added}  current_AIC={best_aic:.3f}")
 
-    # Optional pruning refit (existing logic)
     final_res = best_res
     if PRUNE_SMALL:
         peaks_now = extract_peaks(final_res)
@@ -333,7 +314,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
 # ------------------------------
 
 def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANCHOR_PEAK0):
-    # Load data
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
         yfull = f["int"][frame, :]
@@ -341,7 +321,6 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     x = np.asarray(x, float)
     yfull = np.asarray(yfull, float)
 
-    # ascending safeguard
     if x[0] > x[-1]:
         x = x[::-1]
         yfull = yfull[::-1]
@@ -352,7 +331,6 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     baseline = np.quantile(yw, BASELINE_QUANTILE)
     noise = robust_sigma(yw)
 
-    # bounds (for rescue bound-check only; main fit is sequential)
     center_bounds = []
     for i, cx in enumerate(peak_positions):
         if anchor_peak0 and i == 0:
@@ -365,14 +343,10 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             cmin, cmax = min(cmin, cmax), max(cmin, cmax)
         center_bounds.append((cmin, cmax))
 
-    # Sequential residual-add
     result = _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline, noise)
     r2 = compute_r2(yw, result.best_fit)
-
-    # Extract peaks
     peaks = extract_peaks(result)
 
-    # Rescue if needed
     did_rescue = False
     if RESCUE_ENABLED:
         kept_now = [p for p in peaks if p["height"] >= max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)]
@@ -410,7 +384,6 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     bkg_slope = result.params["bkg_slope"].value
     bkg_intercept = result.params["bkg_intercept"].value
 
-    # Kept peaks & table
     thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
     kept = [p for p in peaks if p["height"] >= thresh]
     rows = [[p["index"], p["center"], p["height"], p["fwhm"], p["amplitude"]] for p in kept]
@@ -446,7 +419,6 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
         ax.grid(alpha=0.3)
         ax.set_xlim(center - half, center + half)
 
-        # residual overlay
         resid = yw - result.best_fit
         ax2 = ax.twinx()
         ax2.plot(xw, resid, lw=1.0, alpha=0.35)
@@ -530,19 +502,35 @@ def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
     }
 
 # ------------------------------
-# NEW: Peak mapping over frames (plasma colormap)
+# NEW: Peak mapping over all frames (plasma colormap) + progress bar
 # ------------------------------
 
-def map_peaks_over_frames(h5_path, frames, peak_positions, *, anchor_peak0=ANCHOR_PEAK0):
+def _progress_bar(i, total, *, width=28, prefix="Mapping"):
+    i = min(i, total)
+    frac = 0 if total == 0 else i / total
+    filled = int(width * frac)
+    bar = "█" * filled + "·" * (width - filled)
+    msg = f"\r{prefix} [{bar}] {i}/{total}"
+    sys.stdout.write(msg)
+    sys.stdout.flush()
+    if i == total:
+        sys.stdout.write("\n")
+
+def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0):
     """
-    Map all kept peaks across frames and plot:
+    Map all kept peaks across *all* frames in the HDF5 and plot:
       x = frame index
       y = peak center (q)
       color = peak height (a.u.), colormap='plasma'
     """
+    # Determine total frames
+    with h5py.File(h5_path, "r") as f:
+        nframes = int(f["int"].shape[0])
+
     frames_list, centers, heights, fwhms, r2s = [], [], [], [], []
 
-    for fr in frames:
+    _progress_bar(0, nframes)
+    for fr in range(nframes):
         res = fit_single_frame(h5_path, fr, peak_positions, plot=False, anchor_peak0=anchor_peak0)
         for idx, ctr, hgt, fwhm, amp in res["rows"]:
             frames_list.append(fr)
@@ -550,9 +538,10 @@ def map_peaks_over_frames(h5_path, frames, peak_positions, *, anchor_peak0=ANCHO
             heights.append(hgt)
             fwhms.append(fwhm)
             r2s.append(res["r2"])
+        _progress_bar(fr + 1, nframes)
 
     if len(frames_list) == 0:
-        print("No peaks kept over the requested frames.")
+        print("No peaks kept over the dataset.")
         return None
 
     frames_arr = np.array(frames_list, dtype=float)
@@ -589,24 +578,9 @@ def map_peaks_over_frames(h5_path, frames, peak_positions, *, anchor_peak0=ANCHO
 # CLI
 # ------------------------------
 
-def _parse_map_range(rng: str):
-    """
-    Parse START:END[:STEP] -> range(start, end, step)
-    END is exclusive (like Python). STEP defaults to 1.
-    Examples: '0:400', '10:201:5'
-    """
-    parts = rng.split(":")
-    if len(parts) not in (2, 3):
-        raise ValueError("Use START:END or START:END:STEP")
-    start = int(parts[0]); end = int(parts[1])
-    step = int(parts[2]) if len(parts) == 3 else 1
-    if step == 0:
-        raise ValueError("STEP cannot be 0")
-    return range(start, end, step)
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Fit Gaussian peaks (linear background) in a single frame or map across frames"
+        description="Fit Gaussian peaks (linear background) in a single frame or map across ALL frames"
     )
     parser.add_argument("h5", help="HDF5 file with 'q' or 'tth' and 'int' datasets")
     parser.add_argument("peaks", type=float, nargs='+',
@@ -615,8 +589,8 @@ def main():
     grp = parser.add_mutually_exclusive_group(required=True)
     grp.add_argument("--frame", type=int,
                      help="Frame index to fit and show per-frame plot")
-    grp.add_argument("--map", type=str,
-                     help="Map peaks over frames: START:END[:STEP] (END exclusive)")
+    grp.add_argument("--map", action="store_true",
+                     help="Map kept peaks across ALL frames (with a progress bar)")
 
     parser.add_argument("--no-anchor", action="store_true",
                         help="Do not anchor peak 0; let all centers float within the window")
@@ -635,13 +609,10 @@ def main():
     print(f"Center tol (non-anchored peaks): ±{CENTER_TOL} q")
 
     if args.frame is not None:
-        # Original behavior
         _ = fit_single_frame(args.h5, args.frame, peak_positions, plot=True, anchor_peak0=anchor)
     else:
-        # New map behavior
-        frames = _parse_map_range(args.map)
-        print(f"Mapping frames: start={frames.start}, end={frames.stop}, step={frames.step}")
-        _ = map_peaks_over_frames(args.h5, frames, peak_positions, anchor_peak0=anchor)
+        # Map across ALL frames
+        _ = map_peaks_over_frames(args.h5, peak_positions, anchor_peak0=anchor)
 
 if __name__ == "__main__":
     main()
