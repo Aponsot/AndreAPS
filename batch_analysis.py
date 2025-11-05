@@ -541,32 +541,45 @@ _HEAT_TRIG_R2_DROP = 0.05     # if R² drops by this from baseline, consider "he
 _HEAT_HYSTERESIS   = 3        # frames: require persistence to flip states
 
 def _estimate_small_shift_xcorr(xw, y_curr, y_ref, max_bins=6):
-    """Return small dq shift aligning y_curr to y_ref via lagged xcorr (bins -> q using mean dx)."""
-    if y_ref is None or len(xw) < 3:
+    """
+    Return small dq shift aligning y_curr to y_ref via lagged xcorr.
+    Robust to unequal lengths by trimming to a common overlap for each lag.
+    """
+    if y_ref is None or len(xw) < 3 or len(y_curr) < 5 or len(y_ref) < 5:
         return 0.0
+
     dx = float(np.mean(np.diff(xw)))
     best_lag = 0
     best_corr = -1e9
-    for lag in range(-max_bins, max_bins + 1):
-        if lag < 0:
-            a = y_curr[:lag]
-            b = y_ref[-lag:]
-        elif lag > 0:
-            a = y_curr[lag:]
-            b = y_ref[:-lag]
+
+    def lagged_pair(a, b, lag):
+        # Create aligned same-length slices for a given lag.
+        if lag >= 0:
+            a2 = a[lag:]
+            n = min(len(a2), len(b))
+            if n < 5:
+                return None, None
+            return a2[:n], b[:n]
         else:
-            a = y_curr
-            b = y_ref
-        if len(a) < 5:
+            b2 = b[-lag:]  # since lag<0, -lag>0
+            n = min(len(b2), len(a))
+            if n < 5:
+                return None, None
+            return a[:n], b2[:n]
+
+    for lag in range(-max_bins, max_bins + 1):
+        a, b = lagged_pair(y_curr, y_ref, lag)
+        if a is None:
             continue
+        # zero-mean normalized correlation proxy
         ca = a - np.mean(a); cb = b - np.mean(b)
         denom = (np.linalg.norm(ca) * np.linalg.norm(cb) + 1e-12)
         c = float(np.dot(ca, cb) / denom)
         if c > best_corr:
             best_corr = c
             best_lag = lag
-    return best_lag * dx
 
+    return best_lag * dx
 # ------------------------------
 # NEW: Progress bar + temporally-stabilized mapping over ALL frames
 # ------------------------------
@@ -747,3 +760,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
