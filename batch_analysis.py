@@ -26,7 +26,6 @@ CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 # Pruning threshold: remove peaks (set amplitude to 0) if height < threshold
 HEIGHT_MIN = 5.0           # absolute floor (kept)
 HEIGHT_MIN_SIGMA = 3.0     # AND relative floor: K * robust_sigma(y)
-
 PRUNE_SMALL = True
 
 # Background controls (robust linear background)
@@ -41,6 +40,15 @@ USE_ROBUST_LOSS = True
 # Optional: per-peak sigma bounds (leave None to use global logic)
 PEAK_SIGMA_MIN = None  # e.g., [0.001, 0.002]
 PEAK_SIGMA_MAX = None  # e.g., [0.030, 0.060]
+
+# --- Rescue (fallback) settings for post-solidification frames ---
+RESCUE_ENABLED = True
+RESCUE_R2_MIN = 0.85          # if first fit R² is below this, try rescue once
+RESCUE_MIN_KEPT = 1           # or if kept peaks < this
+RESCUE_EXPAND_WINDOW = 1.6    # multiply WINDOW during rescue (e.g., 0.25 -> 0.40)
+RESCUE_CENTER_TOL = 0.050     # temporarily allow centers to drift farther
+RESCUE_MAX_SIGMA_FRAC = 0.30  # slightly looser broadening for the retry
+RESEED_SPAN = 0.060           # search ± this (q) around each guess for local max
 
 
 # ------------------------------
@@ -74,7 +82,6 @@ def _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010):
     """
     m = np.abs(xw - cx) <= w
     if not np.any(m):
-        # fallback to grid scale
         sigma0 = max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
         height0 = max(np.max(yw) - baseline, robust_sigma(yw))
         return sigma0, height0
@@ -85,7 +92,6 @@ def _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010):
     height0 = max(ypk - baseline, robust_sigma(yw))
 
     half = baseline + 0.5 * (ypk - baseline)
-    # points above half
     above = yloc >= half
     if np.any(above):
         xl = np.min(xloc[above])
@@ -202,6 +208,78 @@ def extract_peaks(result):
         i += 1
     return peaks
 
+def _local_argmax(xw, yw, cx, span):
+    """Return x position of the max intensity within ±span of cx; fall back to cx."""
+    m = (xw >= cx - span) & (xw <= cx + span)
+    if not np.any(m):
+        return float(cx)
+    idx = np.argmax(yw[m])
+    return float(xw[m][idx])
+
+def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
+                       window, center_tol, max_sigma_frac):
+    """
+    One-shot rescue: expand window, reseed centers to nearest local maxima,
+    relax center/sigma tolerances, and refit.
+    """
+    center = float(np.mean(peak_positions))
+    half = (window / 2.0)
+    m = (x >= center - half) & (x <= center + half)
+    xw, yw = x[m], yfull[m]
+    mfin = np.isfinite(xw) & np.isfinite(yw)
+    xw, yw = xw[mfin], yw[mfin]
+    if xw.size < 5:
+        return None  # can't rescue
+
+    xmin, xmax = float(np.min(xw)), float(np.max(xw))
+    baseline = np.quantile(yw, BASELINE_QUANTILE)
+    noise = robust_sigma(yw)
+
+    # Reseed centers to nearest local maxima within ±RESEED_SPAN
+    reseeded = []
+    for cx in peak_positions:
+        cx_new = _local_argmax(xw, yw, cx, RESEED_SPAN)
+        reseeded.append(cx_new)
+    reseeded = sorted(reseeded)
+
+    # New (looser) center bounds
+    center_bounds = []
+    for i, cx in enumerate(reseeded):
+        if anchor_peak0 and i == 0:
+            cmin = max(xmin, cx - max(ANCHOR_TOL, min(RESEED_SPAN, center_tol)))
+            cmax = min(xmax, cx + max(ANCHOR_TOL, min(RESEED_SPAN, center_tol)))
+        else:
+            cmin = max(xmin, cx - center_tol)
+            cmax = min(xmax, cx + center_tol)
+        if cmin > cmax:
+            cmin, cmax = min(cmin, cmax), max(cmin, cmax)
+        center_bounds.append((cmin, cmax))
+
+    # Robust loss params
+    loss_kwargs = {"loss": "soft_l1", "f_scale": noise} if USE_ROBUST_LOSS else {}
+
+    # Temporarily relax MAX_SIGMA_FRAC
+    global MAX_SIGMA_FRAC
+    old_max_sigma_frac = MAX_SIGMA_FRAC
+    MAX_SIGMA_FRAC = max_sigma_frac
+    try:
+        model, params = build_model(xw, yw, reseeded, baseline, center_bounds)
+        result = model.fit(yw, params, x=xw, calc_covar=False,
+                           method="least_squares", max_nfev=800, **loss_kwargs)
+        r2 = compute_r2(yw, result.best_fit)
+    finally:
+        MAX_SIGMA_FRAC = old_max_sigma_frac  # restore
+
+    peaks = extract_peaks(result)
+    thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
+    kept = [p for p in peaks if p["height"] >= thresh]
+
+    return {
+        "xw": xw, "yw": yw, "result": result, "r2": r2, "peaks": peaks,
+        "kept": kept, "baseline": baseline, "noise": noise,
+        "center": center, "half": half, "reseeded": reseeded
+    }
+
 
 # ------------------------------
 # Fit a single frame (and plot)
@@ -255,8 +333,8 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     peaks = extract_peaks(result)
     pruned_indices = []
     if PRUNE_SMALL:
-        thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
-        pruned_indices = [p["index"] for p in peaks if p["height"] < thresh]
+        thresh0 = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
+        pruned_indices = [p["index"] for p in peaks if p["height"] < thresh0]
         if len(pruned_indices) > 0:
             params_refit = result.params.copy()
             for i in pruned_indices:
@@ -267,10 +345,46 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             r2 = compute_r2(yw, result.best_fit)
             peaks = extract_peaks(result)
 
+    # --- Rescue path if the initial fit likely failed ---
+    did_rescue = False
+    if RESCUE_ENABLED:
+        kept_now = [p for p in peaks if p["height"] >= max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)]
+        need_rescue = (r2 < RESCUE_R2_MIN) or (len(kept_now) < RESCUE_MIN_KEPT)
+
+        # also rescue if many centers slammed to their bounds
+        if not need_rescue:
+            hit_bounds = 0
+            for i, (cmin, cmax) in enumerate(center_bounds):
+                cval = result.params.get(f"g{i}_center", None)
+                if cval is not None:
+                    v = cval.value
+                    if abs(v - cmin) < 1e-6 or abs(v - cmax) < 1e-6:
+                        hit_bounds += 1
+            need_rescue = hit_bounds >= max(1, len(peak_positions)//2)
+
+        if need_rescue:
+            did_rescue = True
+            expanded_window = WINDOW * RESCUE_EXPAND_WINDOW
+            rescue = _refit_with_rescue(
+                x, yfull,
+                peak_positions=peak_positions,
+                frame=frame,
+                anchor_peak0=anchor_peak0,
+                window=expanded_window,
+                center_tol=RESCUE_CENTER_TOL,
+                max_sigma_frac=RESCUE_MAX_SIGMA_FRAC
+            )
+            if rescue is not None:
+                xw = rescue["xw"]; yw = rescue["yw"]
+                result = rescue["result"]; r2 = rescue["r2"]
+                peaks = rescue["peaks"]
+                baseline = rescue["baseline"]; noise = rescue["noise"]
+                center = rescue["center"]; half = rescue["half"]
+
     bkg_slope = result.params["bkg_slope"].value
     bkg_intercept = result.params["bkg_intercept"].value
 
-    # Kept peaks for table
+    # Kept peaks & table rows based on (possibly rescued) result
     thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
     kept = [p for p in peaks if p["height"] >= thresh]
     rows = [[p["index"], p["center"], p["height"], p["fwhm"], p["amplitude"]] for p in kept]
@@ -297,9 +411,10 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
                 ax.plot(xw, comps[key], ls=":", alpha=0.8, label=f"Peak {i+1}")
             ax.axvline(result.params[f"g{i}_center"].value, alpha=0.25, ls="--")
 
+        rescue_tag = " | rescue" if did_rescue else ""
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity")
-        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f} | height_min=max({HEIGHT_MIN}, {HEIGHT_MIN_SIGMA}·σ)")
+        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f}{rescue_tag} | height_min=max({HEIGHT_MIN}, {HEIGHT_MIN_SIGMA}·σ)")
         ax.legend(loc="best")
         ax.grid(alpha=0.3)
         ax.set_xlim(center - half, center + half)
@@ -355,6 +470,9 @@ def main():
           f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
     print(f"Center tol (non-anchored peaks): ±{CENTER_TOL} q")
+    if RESCUE_ENABLED:
+        print(f"Rescue: R2<{RESCUE_R2_MIN} or kept<{RESCUE_MIN_KEPT} -> expand_window×{RESCUE_EXPAND_WINDOW}, "
+              f"center_tol=±{RESCUE_CENTER_TOL}, MAX_SIGMA_FRAC={RESCUE_MAX_SIGMA_FRAC}, reseed±{RESEED_SPAN}")
 
     fit_single_frame(
         args.h5, args.frame, peak_positions,
