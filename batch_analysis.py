@@ -22,7 +22,7 @@ ANCHOR_PEAK0 = True        # set False to let all centers float freely
 CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 
 HEIGHT_MIN = 5.0           # absolute floor (kept)
-HEIGHT_MIN_SIGMA = 1     # AND relative floor: K * robust_sigma(y)
+HEIGHT_MIN_SIGMA = 1       # AND relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
 BASELINE_QUANTILE = 0.20
@@ -213,17 +213,10 @@ def _local_argmax(xw, yw, cx, span):
 # ------------------------------
 
 def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline, noise):
-    """
-    Greedy residual-add:
-      1) fit background only
-      2) add Gaussians one-by-one near supplied guesses (largest seed first)
-      3) accept addition only if ΔAIC >= _AIC_IMPROVE and height >= noise-aware threshold
-    """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
     min_sigma_global = max(0.75 * dx, MIN_SIGMA_ABS)
     max_sigma_global = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
 
-    # background-only init (no exclusions)
     init_slope, init_intercept = _background_init(xw, yw, [], BKG_EXCLUDE_RADIUS, sigma_seeds=None)
     model = LinearModel(prefix="bkg_")
     params = model.make_params(slope=init_slope, intercept=init_intercept)
@@ -238,7 +231,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
     peak_positions = list(sorted(peak_positions))
     center_bounds_guess = _make_center_bounds(xmin, xmax, peak_positions, anchor_peak0, ANCHOR_TOL, CENTER_TOL)
 
-    # order additions by local seed height near guesses
     seeds = []
     for cx in peak_positions:
         sig0, h0 = _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010)
@@ -254,9 +246,9 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
             for cx, h0, s0 in seeds:
                 if cx in used_positions:
                     continue
-                cx_new = _local_argmax(xw, resid + baseline, cx, span=max(_RESIDUAL_PICK_SPAN, 2*np.mean(np.diff(xw))))
+                cx_new = _local_argmax(xw, resid + baseline, cx,
+                                       span=max(_RESIDUAL_PICK_SPAN, 2*np.mean(np.diff(xw))))
                 return cx, cx_new, h0, s0
-        # fallback: global residual max
         j = int(np.argmax(resid))
         cx_new = float(xw[j])
         sig0, h0 = _local_height_sigma_seeds(xw, yw, baseline, cx_new, w=0.010)
@@ -267,7 +259,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
         resid = yw - best_res.best_fit
         guess_cx, place_cx, h0, s0 = _place_next_center(resid)
 
-        # bounds for the new peak
         if guess_cx in peak_positions:
             i_guess = peak_positions.index(guess_cx)
             cmin, cmax = center_bounds_guess[i_guess]
@@ -290,10 +281,10 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
         new_params[f"g{n_added}_sigma"].set(min=min_sigma_global, max=max_sigma_global)
         new_params[f"g{n_added}_amplitude"].set(min=0.0)
 
-        trial_res = new_model.fit(yw, new_params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
+        trial_res = new_model.fit(yw, new_params, x=xw, calc_covar=False,
+                                  method="least_squares", max_nfev=800, **loss_kwargs)
         dAIC = best_aic - trial_res.aic
 
-        # ensure the *new* peak is substantive
         trial_peaks = extract_peaks(trial_res)
         this_peak = next((p for p in trial_peaks if p["index"] == n_added), None)
         too_small = (this_peak is None) or (this_peak["height"] < height_thresh)
@@ -314,7 +305,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
         if _VERBOSE:
             print(f"  accepted peak#{n_added}  current_AIC={best_aic:.3f}")
 
-    # Optional pruning refit (existing logic)
     final_res = best_res
     if PRUNE_SMALL:
         peaks_now = extract_peaks(final_res)
@@ -325,7 +315,8 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
                 refit_params[f"g{i}_amplitude"].set(value=0.0, vary=False)
                 refit_params[f"g{i}_center"].set(vary=False)
                 refit_params[f"g{i}_sigma"].set(vary=False)
-            final_res = final_res.model.fit(yw, refit_params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
+            final_res = final_res.model.fit(yw, refit_params, x=xw, calc_covar=False,
+                                            method="least_squares", max_nfev=800, **loss_kwargs)
 
     return final_res
 
@@ -334,7 +325,6 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
 # ------------------------------
 
 def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANCHOR_PEAK0):
-    # Load data
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
         yfull = f["int"][frame, :]
@@ -342,10 +332,8 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     x = np.asarray(x, float)
     yfull = np.asarray(yfull, float)
 
-    # ascending safeguard
     if x[0] > x[-1]:
-        x = x[::-1]
-        yfull = yfull[::-1]
+        x = x[::-1]; yfull = yfull[::-1]
 
     center, half, xw, yw = _window_data(x, yfull, peak_positions)
     xmin, xmax = float(np.min(xw)), float(np.max(xw))
@@ -353,7 +341,6 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     baseline = np.quantile(yw, BASELINE_QUANTILE)
     noise = robust_sigma(yw)
 
-    # bounds (for rescue bound-check only; main fit is sequential)
     center_bounds = []
     for i, cx in enumerate(peak_positions):
         if anchor_peak0 and i == 0:
@@ -366,14 +353,11 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             cmin, cmax = min(cmin, cmax), max(cmin, cmax)
         center_bounds.append((cmin, cmax))
 
-    # Sequential residual-add
     result = _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline, noise)
     r2 = compute_r2(yw, result.best_fit)
 
-    # Extract peaks
     peaks = extract_peaks(result)
 
-    # Rescue if needed
     did_rescue = False
     if RESCUE_ENABLED:
         kept_now = [p for p in peaks if p["height"] >= max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)]
@@ -411,7 +395,6 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     bkg_slope = result.params["bkg_slope"].value
     bkg_intercept = result.params["bkg_intercept"].value
 
-    # Kept peaks & table
     thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
     kept = [p for p in peaks if p["height"] >= thresh]
     rows = [[p["index"], p["center"], p["height"], p["fwhm"], p["amplitude"]] for p in kept]
@@ -422,7 +405,8 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             "font.size": 16, "axes.labelsize": 18, "axes.titlesize": 20,
             "xtick.labelsize": 14, "ytick.labelsize": 14,
         })
-        fig, (ax, ax_tbl) = plt.subplots(2, 1, figsize=(10, 6.8), gridspec_kw={"height_ratios": [3, 1]})
+        fig, (ax, ax_tbl) = plt.subplots(2, 1, figsize=(10, 6.8),
+                                         gridspec_kw={"height_ratios": [3, 1]})
 
         ax.plot(xw, yw, lw=1.8, label="Data")
         ax.plot(xw, result.best_fit, lw=2.2, label="Fit")
@@ -447,7 +431,6 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
         ax.grid(alpha=0.3)
         ax.set_xlim(center - half, center + half)
 
-        # residual overlay
         resid = yw - result.best_fit
         ax2 = ax.twinx()
         ax2.plot(xw, resid, lw=1.0, alpha=0.35)
@@ -531,18 +514,18 @@ def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
     }
 
 # ------------------------------
-# NEW: Temporal helpers for stable mapping (no CLI knobs)
+# NEW: Temporal helpers for mapping
 # ------------------------------
 
-_STABLE_CENTER_TOL = 0.004    # tight drift allowance (q) when stable
-_HOT_CENTER_TOL    = CENTER_TOL  # fall back to your global when motion starts
-_HEAT_TRIG_SHIFT   = 0.006    # q-units: if median |Δcenter| exceeds this, consider "heating"
-_HEAT_TRIG_R2_DROP = 0.05     # if R² drops by this from baseline, consider "heating"
-_HEAT_HYSTERESIS   = 3        # frames: require persistence to flip states
+_STABLE_CENTER_TOL = 0.004
+_HOT_CENTER_TOL    = CENTER_TOL
+_HEAT_TRIG_SHIFT   = 0.006
+_HEAT_TRIG_R2_DROP = 0.05
+_HEAT_HYSTERESIS   = 3
 
 def _estimate_small_shift_xcorr(xw, y_curr, y_ref, max_bins=6):
     """Return small dq shift aligning y_curr to y_ref via lagged xcorr (bins -> q using mean dx).
-       (Patched) Safely handles different-length windows by truncating to the shorter length.
+       (Patched) Handles different-length windows by truncating to the shorter length.
     """
     if y_ref is None or len(xw) < 3:
         return 0.0
@@ -551,23 +534,15 @@ def _estimate_small_shift_xcorr(xw, y_curr, y_ref, max_bins=6):
     best_corr = -1e9
     for lag in range(-max_bins, max_bins + 1):
         if lag < 0:
-            a = y_curr[:lag]
-            b = y_ref[-lag:]
+            a = y_curr[:lag]; b = y_ref[-lag:]
         elif lag > 0:
-            a = y_curr[lag:]
-            b = y_ref[:-lag]
+            a = y_curr[lag:]; b = y_ref[:-lag]
         else:
-            a = y_curr
-            b = y_ref
-
-        # --- PATCH: equalize lengths before correlation ---
+            a = y_curr; b = y_ref
         n = min(len(a), len(b))
         if n < 5:
             continue
-        a = a[:n]
-        b = b[:n]
-        # --------------------------------------------------
-
+        a = a[:n]; b = b[:n]
         ca = a - np.mean(a); cb = b - np.mean(b)
         denom = (np.linalg.norm(ca) * np.linalg.norm(cb) + 1e-12)
         c = float(np.dot(ca, cb) / denom)
@@ -577,7 +552,7 @@ def _estimate_small_shift_xcorr(xw, y_curr, y_ref, max_bins=6):
     return best_lag * dx
 
 # ------------------------------
-# NEW: Progress bar + temporally-stabilized mapping over ALL frames
+# Progress bar + mapping over ALL frames
 # ------------------------------
 
 def _progress_bar(i, total, *, width=28, prefix="Mapping"):
@@ -591,60 +566,90 @@ def _progress_bar(i, total, *, width=28, prefix="Mapping"):
     if i == total:
         sys.stdout.write("\n")
 
-def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0):
+def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0, strict=False):
     """
-    Map all kept peaks across *all* frames with temporal stabilization:
-      - warm-start seeds from previous frame
-      - tighten center bounds when stable; relax when heating/change detected
-      - color by peak height; colormap='plasma'
+    Map peaks across frames.
+
+    strict=False (default): stabilized mode (warm-start seeds, xcorr shift, adaptive tol)
+    strict=True:  exact per-frame equivalence to single-frame fit
+                  (uses original peak_positions, same anchor flag, no xcorr, no tol changes)
     """
-    # Determine total frames + x
     with h5py.File(h5_path, "r") as f:
         nframes = int(f["int"].shape[0])
         x_full = f["q"][:] if "q" in f else f["tth"][:]
 
     frames_list, centers, heights, fwhms, r2s = [], [], [], [], []
 
-    prev_rows = None   # last frame's kept peaks (for centers)
-    prev_yw   = None   # last frame's windowed spectrum (for xcorr)
+    prev_rows = None
+    prev_yw   = None
     heating_votes = 0
     is_hot = False
 
     _progress_bar(0, nframes)
+
     for fr in range(nframes):
-        # seeds: previous centers if available, else nominal peaks
-        if prev_rows and len(prev_rows) > 0:
-            seeds = sorted([c for (_, c, _, _, _) in prev_rows])
+        if strict:
+            # EXACTLY mirror single-frame behavior
+            res = fit_single_frame(h5_path, fr, peak_positions, plot=False, anchor_peak0=anchor_peak0)
         else:
-            seeds = sorted(peak_positions)
+            # Stabilized mode (previous behavior)
+            if prev_rows and len(prev_rows) > 0:
+                seeds = sorted([c for (_, c, _, _, _) in prev_rows])
+            else:
+                seeds = sorted(peak_positions)
 
-        # window current frame to estimate tiny shift
-        with h5py.File(h5_path, "r") as f:
-            yfull = f["int"][fr, :]
-        x = np.asarray(x_full, float)
-        yfull = np.asarray(yfull, float)
-        if x[0] > x[-1]:
-            x = x[::-1]; yfull = yfull[::-1]
-        center = float(np.mean(seeds)); half = WINDOW / 2.0
-        m = (x >= center - half) & (x <= center + half)
-        xw, yw = x[m], yfull[m]
-        if xw.size < 5:
-            _progress_bar(fr + 1, nframes); continue
+            with h5py.File(h5_path, "r") as f:
+                yfull = f["int"][fr, :]
+            x = np.asarray(x_full, float)
+            yfull = np.asarray(yfull, float)
+            if x[0] > x[-1]:
+                x = x[::-1]; yfull = yfull[::-1]
+            center = float(np.mean(seeds)); half = WINDOW / 2.0
+            m = (x >= center - half) & (x <= center + half)
+            xw, yw = x[m], yfull[m]
+            if xw.size < 5:
+                _progress_bar(fr + 1, nframes); continue
 
-        dq = _estimate_small_shift_xcorr(xw, yw, prev_yw, max_bins=6)
-        seeds_shifted = [s + dq for s in seeds]
+            dq = _estimate_small_shift_xcorr(xw, yw, prev_yw, max_bins=6)
+            seeds_shifted = [s + dq for s in seeds]
 
-        # choose tight vs relaxed center tol
-        center_tol_now = _HOT_CENTER_TOL if is_hot else _STABLE_CENTER_TOL
+            center_tol_now = _HOT_CENTER_TOL if is_hot else _STABLE_CENTER_TOL
 
-        # temporarily swap CENTER_TOL only for this fit in map
-        global CENTER_TOL
-        _orig_center_tol = CENTER_TOL
-        try:
-            CENTER_TOL = center_tol_now
-            res = fit_single_frame(h5_path, fr, seeds_shifted, plot=False, anchor_peak0=False)
-        finally:
-            CENTER_TOL = _orig_center_tol
+            # temporarily swap CENTER_TOL only for this fit in map (stabilized mode only)
+            global CENTER_TOL
+            _orig_center_tol = CENTER_TOL
+            try:
+                CENTER_TOL = center_tol_now
+                res = fit_single_frame(h5_path, fr, seeds_shifted, plot=False, anchor_peak0=False)
+            finally:
+                CENTER_TOL = _orig_center_tol
+
+            # update heating state
+            if prev_rows and len(prev_rows) > 0 and len(res["rows"]) > 0:
+                prev_ctrs = np.array([c for (_, c, _, _, _) in prev_rows])
+                curr_ctrs = np.array([c for (_, c, _, _, _) in res["rows"]])
+                k = min(len(prev_ctrs), len(curr_ctrs))
+                if k > 0:
+                    d = float(np.median(np.abs(curr_ctrs[:k] - prev_ctrs[:k])))
+                else:
+                    d = 0.0
+
+                r2_drop = 0.0
+                if len(r2s) >= 2:
+                    baseline_r2 = np.percentile(np.array(r2s), 80)
+                    r2_drop = max(0.0, baseline_r2 - res["r2"])
+
+                vote_hot = (d > _HEAT_TRIG_SHIFT) or (r2_drop > _HEAT_TRIG_R2_DROP)
+                if vote_hot:
+                    heating_votes = min(_HEAT_HYSTERESIS, heating_votes + 1)
+                else:
+                    heating_votes = max(0, heating_votes - 1)
+                if heating_votes >= _HEAT_HYSTERESIS:
+                    is_hot = True
+                elif heating_votes == 0:
+                    is_hot = False
+
+            prev_yw = yw.copy()
 
         # collect kept peaks
         for idx, ctr, hgt, f, amp in res["rows"]:
@@ -654,35 +659,7 @@ def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0)
             fwhms.append(f)
             r2s.append(res["r2"])
 
-        # update stability state (heating detection) using center motion + R² drop
-        if prev_rows and len(prev_rows) > 0 and len(res["rows"]) > 0:
-            prev_ctrs = np.array([c for (_, c, _, _, _) in prev_rows])
-            curr_ctrs = np.array([c for (_, c, _, _, _) in res["rows"]])
-            k = min(len(prev_ctrs), len(curr_ctrs))
-            if k > 0:
-                # --- PATCH: align lengths before subtraction ---
-                d = float(np.median(np.abs(curr_ctrs[:k] - prev_ctrs[:k])))
-            else:
-                d = 0.0
-
-            r2_drop = 0.0
-            if len(r2s) >= 2:
-                baseline_r2 = np.percentile(np.array(r2s), 80)
-                r2_drop = max(0.0, baseline_r2 - res["r2"])
-
-            vote_hot = (d > _HEAT_TRIG_SHIFT) or (r2_drop > _HEAT_TRIG_R2_DROP)
-            if vote_hot:
-                heating_votes = min(_HEAT_HYSTERESIS, heating_votes + 1)
-            else:
-                heating_votes = max(0, heating_votes - 1)
-
-            if heating_votes >= _HEAT_HYSTERESIS:
-                is_hot = True
-            elif heating_votes == 0:
-                is_hot = False
-
         prev_rows = res["rows"]
-        prev_yw = yw.copy()
         _progress_bar(fr + 1, nframes)
 
     if len(frames_list) == 0:
@@ -693,7 +670,6 @@ def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0)
     centers_arr = np.array(centers, dtype=float)
     heights_arr = np.array(heights, dtype=float)
 
-    # Plot with plasma colormap
     plt.rcParams.update({
         "figure.dpi": 160, "savefig.dpi": 300,
         "font.size": 16, "axes.labelsize": 18, "axes.titlesize": 20,
@@ -706,7 +682,8 @@ def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0)
 
     ax.set_xlabel("Frame")
     ax.set_ylabel("Peak center q (1/Å)")
-    ax.set_title("Mapped peaks over frames (temporal-stabilized; color = height)")
+    mode = "strict (matches single-frame)" if strict else "temporal-stabilized"
+    ax.set_title(f"Mapped peaks over frames — {mode}")
     ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()
@@ -735,7 +712,10 @@ def main():
     grp.add_argument("--frame", type=int,
                      help="Frame index to fit and show per-frame plot")
     grp.add_argument("--map", action="store_true",
-                     help="Map kept peaks across ALL frames (with temporal stabilization + progress bar)")
+                     help="Map kept peaks across ALL frames")
+
+    parser.add_argument("--map-strict", action="store_true",
+                        help="Make map results identical to single-frame fits (no xcorr, no tol tweaks, preserve anchoring)")
 
     parser.add_argument("--no-anchor", action="store_true",
                         help="Do not anchor peak 0; let all centers float within the window")
@@ -756,7 +736,7 @@ def main():
     if args.frame is not None:
         _ = fit_single_frame(args.h5, args.frame, peak_positions, plot=True, anchor_peak0=anchor)
     else:
-        _ = map_peaks_over_frames(args.h5, peak_positions, anchor_peak0=anchor)
+        _ = map_peaks_over_frames(args.h5, peak_positions, anchor_peak0=anchor, strict=args.map_strict)
 
 if __name__ == "__main__":
     main()
