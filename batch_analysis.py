@@ -19,7 +19,7 @@ MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW
 ANCHOR_TOL = 0.015        # q units around the first specified peak position
 ANCHOR_PEAK0 = True        # set False to let all centers float freely
 
-CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
+CENTER_TOL = 0.15         # q units allowed drift from each guess for peaks i>0
 
 HEIGHT_MIN = 5.0           # absolute floor (kept)
 HEIGHT_MIN_SIGMA = 1       # AND relative floor: K * robust_sigma(y)
@@ -758,3 +758,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
