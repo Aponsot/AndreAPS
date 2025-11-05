@@ -13,7 +13,7 @@ from lmfit.models import GaussianModel, LinearModel
 WINDOW = 0.35              # width of the fitting/plot window (q-units)
 GRAPH_CENTER = 3       # if None, defaults to mean(peaks). Set to a float to fix center for all frames.
 
-MIN_SIGMA_ABS = 0.001
+MIN_SIGMA_ABS = 0.0005
 MAX_SIGMA_ABS = 0.027
 MAX_SIGMA_FRAC = 0.25
 
@@ -657,4 +657,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
