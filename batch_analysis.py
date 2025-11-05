@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 import argparse
 import sys
@@ -24,7 +22,7 @@ ANCHOR_PEAK0 = True        # set False to let all centers float freely
 CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 
 HEIGHT_MIN = 5.0           # absolute floor (kept)
-HEIGHT_MIN_SIGMA = 1     # AND relative floor: K * robust_sigma(y)
+HEIGHT_MIN_SIGMA = 1       # AND relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
 BASELINE_QUANTILE = 0.20
@@ -543,24 +541,31 @@ _HEAT_TRIG_R2_DROP = 0.05     # if R² drops by this from baseline, consider "he
 _HEAT_HYSTERESIS   = 3        # frames: require persistence to flip states
 
 def _estimate_small_shift_xcorr(xw, y_curr, y_ref, max_bins=6):
-    """Return small dq shift aligning y_curr to y_ref via lagged xcorr (bins -> q using mean dx)."""
+    """Return small dq shift aligning y_curr to y_ref via lagged xcorr (bins -> q using mean dx).
+       Handles different-length vectors by cropping to the common length.  # [FIX]
+    """
     if y_ref is None or len(xw) < 3:
         return 0.0
+    y_curr = np.asarray(y_curr, float)
+    y_ref  = np.asarray(y_ref, float)
     dx = float(np.mean(np.diff(xw)))
     best_lag = 0
     best_corr = -1e9
     for lag in range(-max_bins, max_bins + 1):
         if lag < 0:
-            a = y_curr[:lag]
-            b = y_ref[-lag:]
+            a = y_curr[:lag]     # drop last -lag
+            b = y_ref[-lag:]     # drop first -lag
         elif lag > 0:
-            a = y_curr[lag:]
-            b = y_ref[:-lag]
+            a = y_curr[lag:]     # drop first +lag
+            b = y_ref[:-lag]     # drop last +lag
         else:
             a = y_curr
             b = y_ref
-        if len(a) < 5:
+        n = min(len(a), len(b))  # [FIX] ensure same length
+        if n < 5:
             continue
+        a = a[:n]
+        b = b[:n]
         ca = a - np.mean(a); cb = b - np.mean(b)
         denom = (np.linalg.norm(ca) * np.linalg.norm(cb) + 1e-12)
         c = float(np.dot(ca, cb) / denom)
@@ -652,7 +657,11 @@ def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0)
             prev_ctrs = np.array([c for (_, c, _, _, _) in prev_rows])
             curr_ctrs = np.array([c for (_, c, _, _, _) in res["rows"]])
             k = min(len(prev_ctrs), len(curr_ctrs))
-            d = np.median(np.sort(np.abs(curr_ctrs - prev_ctrs))[:k])
+            if k > 0:
+                # [FIX] compare only the first k elements to avoid shape mismatch
+                d = float(np.median(np.sort(np.abs(curr_ctrs[:k] - prev_ctrs[:k]))))
+            else:
+                d = 0.0
 
             r2_drop = 0.0
             if len(r2s) >= 2:
@@ -749,6 +758,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
