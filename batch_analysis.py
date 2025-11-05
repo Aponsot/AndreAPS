@@ -3,6 +3,12 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
+import time
+try:
+    from tqdm import tqdm
+    _HAVE_TQDM = True
+except Exception:
+    _HAVE_TQDM = False
 
 # ------------------------------
 # Tunable constants (single-frame)
@@ -14,7 +20,7 @@ WINDOW = 0.25
 # Sigma bounds
 MIN_SIGMA_ABS = 0.0015     # tightened to prevent needle peaks
 MAX_SIGMA_ABS = 0.025
-MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW (was 0.20)
+MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW
 
 # Anchor for peak 0 every frame (optional)
 ANCHOR_TOL = 0.005         # q units around the first specified peak position
@@ -29,7 +35,7 @@ MERGE_MIN_SEP_FRAC = 0.8   # for optional post-fit merge step
 
 # Pruning threshold: remove peaks (set amplitude to 0) if height < threshold
 HEIGHT_MIN = 5.0           # absolute floor (kept)
-HEIGHT_MIN_SIGMA = 4.0     # relative floor: K * robust_sigma(y) (was 3.0)
+HEIGHT_MIN_SIGMA = 4.0     # relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
 # Background controls (robust linear background)
@@ -53,7 +59,6 @@ RESCUE_EXPAND_WINDOW = 1.6    # multiply WINDOW during rescue (e.g., 0.25 -> 0.4
 RESCUE_CENTER_TOL = 0.050     # temporarily allow centers to drift farther
 RESCUE_MAX_SIGMA_FRAC = 0.30  # slightly looser broadening for the retry
 RESEED_SPAN = 0.060           # search ± this (q) around each guess for local max
-
 
 # ------------------------------
 # Core utilities
@@ -321,6 +326,14 @@ def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
         "center": center, "half": half, "reseeded": reseeded
     }
 
+def _format_eta(sec):
+    if sec is None or sec == float("inf"):
+        return "ETA --:--"
+    m, s = divmod(int(sec), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"ETA {h:d}:{m:02d}:{s:02d}"
+    return f"ETA {m:02d}:{s:02d}"
 
 # ------------------------------
 # Fit a single frame (and plot)
@@ -495,15 +508,15 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
         "pruned_indices": pruned_indices,
     }
 
-
 # ------------------------------
-# Map mode (run all frames, collect kept peaks, scatter plot)
+# Map mode (run all frames, collect kept peaks, scatter plot) + PROGRESS
 # ------------------------------
 
 def map_all_frames(h5_path, peak_positions, anchor_peak0=ANCHOR_PEAK0):
     """
     Runs fit_single_frame() for every frame (plot=False), collects all KEPT peaks,
     and builds a scatter map: frame index vs center (q), colored by height.
+    Shows a progress bar with live ETA.
     """
     with h5py.File(h5_path, "r") as f:
         nframes = f["int"].shape[0]
@@ -514,7 +527,15 @@ def map_all_frames(h5_path, peak_positions, anchor_peak0=ANCHOR_PEAK0):
     per_peak_heights = {i: [] for i in range(len(peak_positions))}
     per_peak_r2 = {i: [] for i in range(len(peak_positions))}
 
-    # Iterate frames
+    start = time.perf_counter()
+
+    if _HAVE_TQDM:
+        pbar = tqdm(total=nframes, desc="Mapping frames", unit="frame")
+        last_update_time = start
+    else:
+        print(f"Mapping {nframes} frames...")
+        last_print_len = 0
+
     for fr in range(nframes):
         out = fit_single_frame(h5_path, fr, peak_positions, plot=False, anchor_peak0=anchor_peak0)
         kept = out["rows"]  # [index, center, height, fwhm, amplitude]
@@ -527,6 +548,32 @@ def map_all_frames(h5_path, peak_positions, anchor_peak0=ANCHOR_PEAK0):
             per_peak_centers[idx].append(center)
             per_peak_heights[idx].append(height)
             per_peak_r2[idx].append(r2)
+
+        # progress UI
+        done = fr + 1
+        now = time.perf_counter()
+        elapsed = now - start
+        rate = done / elapsed if elapsed > 0 else 0.0
+        remain = (nframes - done) / rate if rate > 0 else float("inf")
+
+        if _HAVE_TQDM:
+            if (now - last_update_time) >= 0.2 or done == nframes:
+                pbar.set_postfix_str(_format_eta(remain))
+                last_update_time = now
+            pbar.update(1)
+        else:
+            pct = 100.0 * done / nframes
+            bar_n = 24
+            filled = int(bar_n * done / nframes)
+            bar = "█" * filled + "·" * (bar_n - filled)
+            msg = f"[{bar}] {pct:6.2f}%  {done}/{nframes}  {_format_eta(remain)}"
+            print("\r" + msg + " " * max(0, last_print_len - len(msg)), end="", flush=True)
+            last_print_len = len(msg)
+
+    if _HAVE_TQDM:
+        pbar.close()
+    else:
+        print()  # newline after fallback bar
 
     # --- Plot map ---
     plt.rcParams.update({
@@ -553,7 +600,6 @@ def map_all_frames(h5_path, peak_positions, anchor_peak0=ANCHOR_PEAK0):
     ax.legend(loc="best")
     plt.tight_layout()
     plt.show()
-
 
 # ------------------------------
 # CLI
