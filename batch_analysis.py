@@ -63,7 +63,7 @@ RESCUE_MAX_SIGMA_FRAC = 0.30  # slightly looser broadening for the retry
 RESEED_SPAN = 0.060           # search ± this (q) around each guess for local max
 
 # --- Overlap-aware merge controls (after fit) ---
-OVERLAP_COEF_MIN = 0.55   # consider merge if Gaussian shape overlap >= this
+OVERLAP_COEF_MIN = 0.45   # consider merge if Gaussian shape overlap >= this
 AIC_IMPROVE = 20         # extra peak must improve AIC by > this to be kept
 MERGE_HEIGHT_FRAC = 0.9   # when heights similar, prefer dropping smaller amplitude
 
@@ -685,6 +685,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
