@@ -30,7 +30,7 @@ CENTER_TOL_POS = 0.015     # allowed positive drift from each guess
 RESIDUAL_NEG_WEIGHT = 1.25 # >1 weights residuals to the left of the guess a bit more
 RESIDUAL_POS_WEIGHT = 1.00 # keep as 1.0 (or <1.0) to de-emphasize positive side slightly
 
-HEIGHT_MIN = 2.0           # absolute floor (kept)
+HEIGHT_MIN = 5.0           # absolute floor (kept)
 HEIGHT_MIN_SIGMA = 3.0     # AND relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
@@ -672,3 +672,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
