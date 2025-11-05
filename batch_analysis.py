@@ -64,7 +64,7 @@ RESEED_SPAN = 0.060           # search ± this (q) around each guess for local m
 
 # --- Overlap-aware merge controls (after fit) ---
 OVERLAP_COEF_MIN = 0.55   # consider merge if Gaussian shape overlap >= this
-AIC_IMPROVE = 6.0         # extra peak must improve AIC by > this to be kept
+AIC_IMPROVE = 50         # extra peak must improve AIC by > this to be kept
 MERGE_HEIGHT_FRAC = 0.7   # when heights similar, prefer dropping smaller amplitude
 
 # ------------------------------
@@ -685,3 +685,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
