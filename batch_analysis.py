@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import argparse
 import sys
@@ -542,7 +541,9 @@ _HEAT_TRIG_R2_DROP = 0.05     # if R² drops by this from baseline, consider "he
 _HEAT_HYSTERESIS   = 3        # frames: require persistence to flip states
 
 def _estimate_small_shift_xcorr(xw, y_curr, y_ref, max_bins=6):
-    """Return small dq shift aligning y_curr to y_ref via lagged xcorr (bins -> q using mean dx)."""
+    """Return small dq shift aligning y_curr to y_ref via lagged xcorr (bins -> q using mean dx).
+       (Patched) Safely handles different-length windows by truncating to the shorter length.
+    """
     if y_ref is None or len(xw) < 3:
         return 0.0
     dx = float(np.mean(np.diff(xw)))
@@ -558,8 +559,15 @@ def _estimate_small_shift_xcorr(xw, y_curr, y_ref, max_bins=6):
         else:
             a = y_curr
             b = y_ref
-        if len(a) < 5:
+
+        # --- PATCH: equalize lengths before correlation ---
+        n = min(len(a), len(b))
+        if n < 5:
             continue
+        a = a[:n]
+        b = b[:n]
+        # --------------------------------------------------
+
         ca = a - np.mean(a); cb = b - np.mean(b)
         denom = (np.linalg.norm(ca) * np.linalg.norm(cb) + 1e-12)
         c = float(np.dot(ca, cb) / denom)
@@ -651,7 +659,11 @@ def map_peaks_over_frames(h5_path, peak_positions, *, anchor_peak0=ANCHOR_PEAK0)
             prev_ctrs = np.array([c for (_, c, _, _, _) in prev_rows])
             curr_ctrs = np.array([c for (_, c, _, _, _) in res["rows"]])
             k = min(len(prev_ctrs), len(curr_ctrs))
-            d = np.median(np.sort(np.abs(curr_ctrs - prev_ctrs))[:k])
+            if k > 0:
+                # --- PATCH: align lengths before subtraction ---
+                d = float(np.median(np.abs(curr_ctrs[:k] - prev_ctrs[:k])))
+            else:
+                d = 0.0
 
             r2_drop = 0.0
             if len(r2s) >= 2:
@@ -748,6 +760,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
