@@ -21,7 +21,7 @@ WINDOW = 0.25
 
 # Sigma bounds
 MIN_SIGMA_ABS = 0.0015     # tightened to prevent needle peaks
-MAX_SIGMA_ABS = 0.020
+MAX_SIGMA_ABS = 0.025
 MAX_SIGMA_FRAC = 0.25      # cap sigma to this fraction of WINDOW
 
 # Anchor for peak 0 every frame (optional)
@@ -685,6 +685,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
