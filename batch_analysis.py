@@ -44,13 +44,13 @@ RESCUE_MAX_SIGMA_FRAC = 0.30
 RESEED_SPAN = 0.060
 
 # ------------------------------
-# Internal sequential-fit constants (not exposed via CLI)
+# Internal sequential-fit constants (no new CLI knobs)
 # ------------------------------
-# Greedy residual-add; keep these hard-coded to avoid "new knobs" in the CLI.
 _AIC_IMPROVE = 6.0           # require meaningful AIC gain to add another peak
 _MAX_PEAKS = 16              # hard cap to avoid runaway
 _RESIDUAL_PICK_SPAN = 0.030  # ±q span to snap to local residual max near each guess
 _USE_GUESSES_FIRST = True    # add peaks near supplied guesses in descending seed height
+_VERBOSE = False             # flip True for internal step-by-step prints
 
 # ------------------------------
 # Core utilities
@@ -255,7 +255,7 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
                     continue
                 cx_new = _local_argmax(xw, resid + baseline, cx, span=max(_RESIDUAL_PICK_SPAN, 2*np.mean(np.diff(xw))))
                 return cx, cx_new, h0, s0
-        # fallback: global residual max (rare)
+        # fallback: global residual max
         j = int(np.argmax(resid))
         cx_new = float(xw[j])
         sig0, h0 = _local_height_sigma_seeds(xw, yw, baseline, cx_new, w=0.010)
@@ -297,13 +297,21 @@ def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline,
         this_peak = next((p for p in trial_peaks if p["index"] == n_added), None)
         too_small = (this_peak is None) or (this_peak["height"] < height_thresh)
 
+        if _VERBOSE:
+            print(f"[add#{n_added}] guess={guess_cx:.6f} -> place={place_cx:.6f}  ΔAIC={dAIC:.3f}  "
+                  f"h0~{h0:.3g}  σ0~{s0:.4f}  too_small={too_small}")
+
         if (dAIC < _AIC_IMPROVE) or too_small:
+            if _VERBOSE:
+                print(f"[stop] reason={'ΔAIC too small' if dAIC < _AIC_IMPROVE else 'height too small'}")
             break
 
         best_res = trial_res
         best_aic = trial_res.aic
         used_positions.append(guess_cx)
         n_added += 1
+        if _VERBOSE:
+            print(f"  accepted peak#{n_added}  current_AIC={best_aic:.3f}")
 
     # Optional pruning refit (your existing logic)
     final_res = best_res
@@ -357,14 +365,14 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             cmin, cmax = min(cmin, cmax), max(cmin, cmax)
         center_bounds.append((cmin, cmax))
 
-    # --- Sequential residual-add (replaces the previous "all-at-once") ---
+    # --- Sequential residual-add ---
     result = _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline, noise)
     r2 = compute_r2(yw, result.best_fit)
 
-    # Optional pruning already performed inside; extract peaks
+    # Extract peaks (pruning already handled internally)
     peaks = extract_peaks(result)
 
-    # --- Rescue path if the initial sequential fit likely failed ---
+    # --- Rescue path if needed ---
     did_rescue = False
     if RESCUE_ENABLED:
         kept_now = [p for p in peaks if p["height"] >= max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)]
@@ -432,10 +440,18 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
         rescue_tag = " | rescue" if did_rescue else ""
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity")
-        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f}{rescue_tag} | height_min=max({HEIGHT_MIN}, {HEIGHT_MIN_SIGMA}·σ)")
+        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f}{rescue_tag} | "
+                     f"height_min=max({HEIGHT_MIN}, {HEIGHT_MIN_SIGMA}·σ)")
         ax.legend(loc="best")
         ax.grid(alpha=0.3)
         ax.set_xlim(center - half, center + half)
+
+        # optional residual overlay
+        resid = yw - result.best_fit
+        ax2 = ax.twinx()
+        ax2.plot(xw, resid, lw=1.0, alpha=0.35)
+        ax2.set_ylabel("Residual")
+        ax2.grid(False)
 
         ax_tbl.axis("off")
         cols = ["Peak #", "Center", "Height", "FWHM", "Amplitude"]
@@ -461,7 +477,7 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     }
 
 # ------------------------------
-# Rescue helper (unchanged except factoring)
+# Rescue helper (unchanged)
 # ------------------------------
 
 def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
@@ -541,10 +557,80 @@ def main():
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
     print(f"Center tol (non-anchored peaks): ±{CENTER_TOL} q")
 
-    res = fit_single_frame(
+    _ = fit_single_frame(
         args.h5, args.frame, peak_positions,
         plot=True, anchor_peak0=(not args.no_anchor)
     )
 
 if __name__ == "__main__":
     main()
+
+# ------------------------------
+# NEW: Peak mapping over frames (no CLI changes)
+# ------------------------------
+
+def map_peaks_over_frames(h5_path, frames, peak_positions, *, anchor_peak0=ANCHOR_PEAK0):
+    """
+    Map out all kept peaks across frames and plot:
+      x = frame index
+      y = peak center (q)
+      color = peak height (a.u.), colormap='plasma'
+
+    Parameters
+    ----------
+    h5_path : str
+    frames : Iterable[int]
+    peak_positions : list[float]
+    anchor_peak0 : bool
+
+    Returns
+    -------
+    dict with arrays: {'frame': F, 'center': C, 'height': H, 'fwhm': W, 'r2': R}
+    """
+    frames_list = []
+    centers = []
+    heights = []
+    fwhms = []
+    r2s = []
+
+    for fr in frames:
+        res = fit_single_frame(h5_path, fr, peak_positions, plot=False, anchor_peak0=anchor_peak0)
+        # res['rows'] holds kept peaks: [index, center, height, fwhm, amplitude]
+        for idx, ctr, hgt, fwhm, amp in res["rows"]:
+            frames_list.append(fr)
+            centers.append(ctr)
+            heights.append(hgt)
+            fwhms.append(fwhm)
+            r2s.append(res["r2"])
+
+    frames_arr = np.array(frames_list, dtype=float)
+    centers_arr = np.array(centers, dtype=float)
+    heights_arr = np.array(heights, dtype=float)
+    fwhms_arr = np.array(fwhms, dtype=float)
+    r2_arr = np.array(r2s, dtype=float)
+
+    # --- Plot with plasma colormap ---
+    plt.rcParams.update({
+        "figure.dpi": 160, "savefig.dpi": 300,
+        "font.size": 16, "axes.labelsize": 18, "axes.titlesize": 20,
+        "xtick.labelsize": 14, "ytick.labelsize": 14,
+    })
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sc = ax.scatter(frames_arr, centers_arr, c=heights_arr, cmap="plasma", s=24, alpha=0.9)
+    cb = plt.colorbar(sc, ax=ax)
+    cb.set_label("Peak height (a.u.)")
+
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Peak center q (1/Å)")
+    ax.set_title("Mapped peaks over frames (color = height)")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "frame": frames_arr,
+        "center": centers_arr,
+        "height": heights_arr,
+        "fwhm": fwhms_arr,
+        "r2": r2_arr,
+    }
