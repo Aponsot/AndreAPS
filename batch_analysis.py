@@ -10,7 +10,7 @@ from lmfit.models import GaussianModel, LinearModel
 # Tunable constants (single-frame) — unchanged
 # ------------------------------
 
-WINDOW = 0.25
+WINDOW = 0.35
 
 MIN_SIGMA_ABS = 0.001      # q units
 MAX_SIGMA_ABS = 0.025      # q units
@@ -616,3 +616,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
