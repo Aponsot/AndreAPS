@@ -1,18 +1,8 @@
-#!/usr/bin/env python3
 import argparse
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
-import time
-import os
-from pathlib import Path
-from math import erf, sqrt
-try:
-    from tqdm import tqdm
-    _HAVE_TQDM = True
-except Exception:
-    _HAVE_TQDM = False
 
 # ------------------------------
 # Tunable constants (single-frame)
@@ -22,9 +12,9 @@ except Exception:
 WINDOW = 0.25
 
 # Sigma bounds
-MIN_SIGMA_ABS = 0.0015     # tightened to prevent needle peaks
-MAX_SIGMA_ABS = 0.025
-MAX_SIGMA_FRAC = 0.25      # cap sigma to this fraction of WINDOW
+MIN_SIGMA_ABS = 0.001      # q units
+MAX_SIGMA_ABS = 0.025      # q units
+MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW (was 0.20)
 
 # Anchor for peak 0 every frame (optional)
 ANCHOR_TOL = 0.005         # q units around the first specified peak position
@@ -33,13 +23,10 @@ ANCHOR_PEAK0 = True        # set False to let all centers float freely
 # Additional center drift limit for other peaks (prevents identity swapping)
 CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 
-# Peak separation (discourage duplicate/overlapping solutions)
-MIN_SEP_Q = 0.006          # q units; try 0.004–0.010
-MERGE_MIN_SEP_FRAC = 0.8   # proximity rule in units of mean sigma
+# Pruning threshold: remove peaks (set amplitude to 0) if height < threshold
+HEIGHT_MIN = 5.0           # absolute floor (kept)
+HEIGHT_MIN_SIGMA = 3.0     # AND relative floor: K * robust_sigma(y)
 
-# Pruning threshold: remove peaks (set amplitude to 0) if height/area below thresholds
-HEIGHT_MIN = 5.0           # absolute floor (height)
-HEIGHT_MIN_SIGMA = 4.0     # relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
 # Background controls (robust linear background)
@@ -55,47 +42,6 @@ USE_ROBUST_LOSS = True
 PEAK_SIGMA_MIN = None  # e.g., [0.001, 0.002]
 PEAK_SIGMA_MAX = None  # e.g., [0.030, 0.060]
 
-# --- Rescue (fallback) settings for post-solidification frames ---
-RESCUE_ENABLED = True
-RESCUE_R2_MIN = 0.85          # if first fit R² is below this, try rescue once
-RESCUE_MIN_KEPT = 1           # or if kept peaks < this
-RESCUE_EXPAND_WINDOW = 1.6    # multiply WINDOW during rescue (0.25 -> 0.40)
-RESCUE_CENTER_TOL = 0.050     # temporarily allow centers to drift farther
-RESCUE_MAX_SIGMA_FRAC = 0.30  # slightly looser broadening for the retry
-RESEED_SPAN = 0.060           # search ± this (q) around each guess for local max
-
-# --- Overlap-aware merge controls (after fit) ---
-OVERLAP_COEF_MIN = 0.55   # consider merge if Gaussian shape overlap >= this
-AIC_IMPROVE = 6.0         # extra peak must improve AIC by > this to be kept
-MERGE_HEIGHT_FRAC = 0.7   # when heights similar, prefer dropping smaller amplitude
-
-# --- Debug / safety plotting ---
-PLOT_SAFE = True
-R2_BAD = 0.88
-DEBUG_OUTDIR = "fit_debug"
-
-# ------------------------------
-# NEW: Area-aware guarding for small-but-broad peaks
-# ------------------------------
-
-# Area checks (to keep real small-but-broad peaks)
-AREA_MIN = 25.0             # absolute min area (counts·q) to keep
-AREA_SNR_MIN = 3.0          # or area SNR within local window
-AREA_WIN_SIGMA = 2.0        # integrate ±(AREA_WIN_SIGMA * sigma) window
-
-# Guided seeding near guesses (prevents residual humps from being chosen)
-SEED_SPAN = 0.015           # search ±this around each guess for local max (curvature/SNR gate)
-SEED_SNR_MIN = 1.2          # min height/noise to accept a reseed candidate
-SEED_CURV_Q = 0.60          # quantile of |negative curvature| threshold in window
-SEED_LOCK = 0.006           # if confidently reseeded, lock center within ± this for first pass
-
-# Matched-filter seeding (favors broad peaks when sigma_est is large)
-USE_MATCHED_SEED = True
-SEED_MATCHED_SPAN = 0.018   # matched filter search span
-
-# Merge protection for broad peaks with strong area evidence
-R_SIGMA_PROTECT = 1.8       # broad if sigma_broad >= R_SIGMA_PROTECT * sigma_narrow
-PROTECT_AREA_SNR = 2.2      # protect if area SNR >= this
 
 # ------------------------------
 # Core utilities
@@ -121,38 +67,29 @@ def _window_data(x, yfull, peak_positions):
         raise ValueError("Too few points in window.")
     return center, half, xw, yw
 
-def _finite_diff_second_derivative(y, dx):
-    """Approx second derivative using [-1, 2, -1] kernel with Neumann padding."""
-    y = np.asarray(y, float)
-    if len(y) < 3 or dx <= 0:
-        return np.zeros_like(y)
-    d2 = np.empty_like(y)
-    d2[1:-1] = (y[:-2] - 2.0*y[1:-1] + y[2:]) / (dx*dx)
-    d2[0] = d2[1]
-    d2[-1] = d2[-2]
-    return d2
-
-def _local_maxima_indices(y):
-    """Indices i where y[i-1] < y[i] >= y[i+1]."""
-    if len(y) < 3:
-        return np.array([], dtype=int)
-    return np.where((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:]))[0] + 1
-
 def _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010):
+    """
+    Robust local seeds for sigma and height using a small neighborhood around cx.
+    Uses upper-quantile intensity to avoid single-point noise/shoulders dominating.
+    """
     m = np.abs(xw - cx) <= w
     if not np.any(m):
+        # fallback to grid scale
         sigma0 = max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
         height0 = max(np.max(yw) - baseline, robust_sigma(yw))
         return sigma0, height0
 
-    xloc = xw[m]; yloc = yw[m]
+    xloc = xw[m]
+    yloc = yw[m]
     ypk = np.quantile(yloc, 0.9)
     height0 = max(ypk - baseline, robust_sigma(yw))
 
     half = baseline + 0.5 * (ypk - baseline)
+    # points above half
     above = yloc >= half
     if np.any(above):
-        xl = np.min(xloc[above]); xr = np.max(xloc[above])
+        xl = np.min(xloc[above])
+        xr = np.max(xloc[above])
         fwhm = max(xr - xl, np.mean(np.diff(xw)))
     else:
         fwhm = max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
@@ -161,6 +98,7 @@ def _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010):
     return sigma0, height0
 
 def _robust_line_fit(x, y, max_iter=4, trim_frac=0.30):
+    # Simple trimmed regression: fit, trim largest residuals, refit
     m, b = np.polyfit(x, y, 1)
     for _ in range(max_iter):
         resid = y - (m * x + b)
@@ -172,6 +110,10 @@ def _robust_line_fit(x, y, max_iter=4, trim_frac=0.30):
     return float(m), float(b)
 
 def _background_init(xw, yw, centers, exclude_radius, sigma_seeds=None):
+    """
+    Trimmed linear background seeded from off-peak points.
+    Exclude around each center by max(exclude_radius, 2.5 * sigma_seed) if seeds provided.
+    """
     if sigma_seeds is not None:
         radii = [max(exclude_radius, 2.5 * max(s, MIN_SIGMA_ABS)) for s in sigma_seeds]
     else:
@@ -184,141 +126,34 @@ def _background_init(xw, yw, centers, exclude_radius, sigma_seeds=None):
     if mask.sum() >= max(5, int(0.2 * len(xw))):
         m, b = _robust_line_fit(xw[mask], yw[mask], trim_frac=BKG_TRIM_FRACTION)
     else:
+        # Fallback if not enough off-peak points: use flat baseline near lower envelope
         m = 0.0
         b = np.quantile(yw, BASELINE_QUANTILE)
 
+    # Bound slope reasonably
     m = float(np.clip(m, -BKG_SLOPE_MAX_ABS, BKG_SLOPE_MAX_ABS))
     return m, float(b)
 
-def _enforce_min_separation(params, n_peaks, min_sep):
-    for i in range(1, n_peaks):
-        params[f"g{i}_center"].set(
-            expr=f"max(g{i-1}_center + {min_sep:.8f}, {params[f'g{i}_center'].value})"
-        )
-
-def _gaussian_shape_overlap(mu1, s1, mu2, s2):
-    if not np.isfinite(s1) or not np.isfinite(s2) or s1 <= 0 or s2 <= 0:
-        return 0.0
-    d = abs(mu1 - mu2)
-    sp = sqrt(s1**2 + s2**2)
-    if sp <= 0:
-        return 0.0
-    z = - d / (2.0 * sp)
-    Phi = 0.5 * (1.0 + erf(z / sqrt(2.0)))
-    return max(0.0, min(1.0, 2.0 * Phi))
-
-# ------------------------------
-# Area utilities
-# ------------------------------
-
-def _component_area_and_snr(result, xw, yw, bkg_vec, i, win_sigma=AREA_WIN_SIGMA):
-    """Return (area, area_snr, n_pts) for component g{i}_ within ±win_sigma*sigma_i."""
-    sig = abs(result.params[f"g{i}_sigma"].value)
-    cen = result.params[f"g{i}_center"].value
-    if not np.isfinite(sig) or sig <= 0 or not np.isfinite(cen):
-        return 0.0, 0.0, 0
-    half = win_sigma * sig
-    m = (xw >= cen - half) & (xw <= cen + half)
-    if not np.any(m):
-        return 0.0, 0.0, 0
-
-    comps = result.eval_components(x=xw)
-    key = f"g{i}_"
-    if key not in comps:
-        return 0.0, 0.0, 0
-    y_comp = comps[key][m]
-    y_sig  = (yw[m] - (bkg_vec[m] if bkg_vec is not None else 0.0))
-
-    xm = xw[m]
-    area_comp = float(np.trapz(y_comp, xm))
-    resid_win = y_sig - y_comp
-    sig_noise = robust_sigma(resid_win)
-    n_pts = int(np.count_nonzero(m))
-    area_snr = area_comp / max(sig_noise * (xm[-1] - xm[0] + 1e-12), 1e-12)
-    return area_comp, area_snr, n_pts
-
-# ------------------------------
-# Guided & matched seeding
-# ------------------------------
-
-def _guided_reseed_centers(xw, yw, guesses, baseline, noise):
-    """
-    For each guess cx, look within ±SEED_SPAN for a local maximum that is:
-      - tall enough (SNR),
-      - sharply peaked (negative curvature strong enough).
-    Choose the best by score = height_z * |neg_curv|.
-    """
-    dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
-    d2 = _finite_diff_second_derivative(yw, dx)
-    y0 = yw - baseline
-
-    reseeded = []
-    confident = []
-    neg_curv = np.clip(-d2, 0, None)
-    curv_thr = np.quantile(neg_curv, SEED_CURV_Q) if np.any(neg_curv > 0) else 0.0
-
-    for cx in guesses:
-        m = (xw >= cx - SEED_SPAN) & (xw <= cx + SEED_SPAN)
-        if not np.any(m):
-            reseeded.append(cx); confident.append(False); continue
-
-        xs = xw[m]; ys = y0[m]; d2s = d2[m]
-        idxs = _local_maxima_indices(ys)
-        if idxs.size == 0:
-            reseeded.append(cx); confident.append(False); continue
-
-        best_score = -np.inf
-        best_x = cx
-        accepted = False
-        for ii in idxs:
-            height = ys[ii]
-            snr = height / max(noise, 1e-12)
-            curv = -d2s[ii]
-            if snr >= SEED_SNR_MIN and curv >= curv_thr and height > 0:
-                score = (snr) * (curv)
-                if score > best_score:
-                    best_score = score
-                    best_x = xs[ii]
-                    accepted = True
-        reseeded.append(float(best_x))
-        confident.append(bool(accepted))
-
-    return reseeded, confident
-
-def _matched_filter_center(xw, yw, cx, sigma_est, span):
-    """
-    Matched filter with Gaussian kernel (width ~ expected sigma_est) in ±span of cx.
-    Returns best center (by max correlation). Favors broad peaks when sigma_est is large.
-    """
-    if not np.isfinite(sigma_est) or sigma_est <= 0:
-        return float(cx)
-    m = (xw >= cx - span) & (xw <= cx + span)
-    if not np.any(m):
-        return float(cx)
-    xs = xw[m]
-    ys = yw[m] - np.median(yw[m])
-    # build kernel matrix [n, n] for correlations
-    k = np.exp(-0.5 * ((xs - xs[:, None]) / sigma_est)**2)
-    resp = k @ ys
-    j = int(np.argmax(resp))
-    return float(xs[j])
-
-# ------------------------------
-# Build model
-# ------------------------------
-
 def build_model(xw, yw, centers, baseline, center_bounds):
+    """
+    Build a model with a linear background and Gaussian peaks at given centers.
+    Background slope is initialized robustly and capped to avoid runaway tilt.
+    Seeds for sigma/height are taken locally around each center for stability.
+    """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
-    min_sigma_global = max(1.00 * dx, MIN_SIGMA_ABS)
+    min_sigma_global = max(0.75 * dx, MIN_SIGMA_ABS)
     max_sigma_global = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
 
-    sigma0_list, height0_list = [], []
+    # Precompute local seeds for each center
+    sigma0_list = []
+    height0_list = []
     for cx in centers:
         sigma0_est, height0 = _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010)
         sigma0_clipped = np.clip(sigma0_est, min_sigma_global, max_sigma_global)
         sigma0_list.append(float(sigma0_clipped))
         height0_list.append(float(height0))
 
+    # Robust background init (exclude scaled by sigma seeds)
     init_slope, init_intercept = _background_init(
         xw, yw, centers, BKG_EXCLUDE_RADIUS, sigma_seeds=sigma0_list
     )
@@ -328,9 +163,12 @@ def build_model(xw, yw, centers, baseline, center_bounds):
     params["bkg_slope"].set(min=-BKG_SLOPE_MAX_ABS, max=BKG_SLOPE_MAX_ABS, value=init_slope, vary=True)
     params["bkg_intercept"].set(value=init_intercept, vary=True)
 
+    # Add Gaussians
     for i, (cx, sigma0, height0) in enumerate(zip(centers, sigma0_list, height0_list)):
         gi = GaussianModel(prefix=f"g{i}_")
         model += gi
+
+        # Per-peak sigma bounds if provided, else global
         min_sig_i = min_sigma_global if PEAK_SIGMA_MIN is None else max(min_sigma_global, PEAK_SIGMA_MIN[i])
         max_sig_i = max_sigma_global if PEAK_SIGMA_MAX is None else min(max_sigma_global, PEAK_SIGMA_MAX[i])
 
@@ -345,7 +183,6 @@ def build_model(xw, yw, centers, baseline, center_bounds):
         params[f"g{i}_sigma"].set(min=min_sig_i, max=max_sig_i)
         params[f"g{i}_amplitude"].set(min=0.0)
 
-    _enforce_min_separation(params, n_peaks=len(centers), min_sep=MIN_SEP_Q)
     return model, params
 
 def extract_peaks(result):
@@ -358,165 +195,20 @@ def extract_peaks(result):
         sig_abs = abs(sig) if np.isfinite(sig) else np.nan
         hgt = amp / (sig_abs * np.sqrt(2 * np.pi)) if (sig_abs > 0 and np.isfinite(sig_abs)) else 0.0
         fwhm = 2.354820045 * sig_abs if np.isfinite(sig_abs) else np.nan
-        peaks.append({"index": i, "center": ctr, "height": hgt,
-                      "fwhm": fwhm, "amplitude": amp, "sigma": sig})
+        peaks.append({
+            "index": i, "center": ctr, "height": hgt,
+            "fwhm": fwhm, "amplitude": amp, "sigma": sig
+        })
         i += 1
     return peaks
 
-# ------------------------------
-# Merge logic (overlap + AIC with broad-peak protection)
-# ------------------------------
-
-def _merge_close_peaks_with_aic(xw, yw, model, result, noise,
-                                min_sep_q, merge_min_sep_frac,
-                                overlap_coef_min, aic_improve, height_frac):
-    """
-    Decide which peaks to zero-out using:
-      (1) Proximity (q or sigma scale)
-      (2) Strong shape overlap
-      (3) Broad-peak protection by area evidence
-      (4) AIC fallback
-    Returns: sorted list of peak indices to kill.
-    """
-    peaks = extract_peaks(result)
-    n = len(peaks)
-    to_kill = set()
-
-    pairs = []
-    for i in range(n):
-        for j in range(i+1, n):
-            di = abs(peaks[j]["center"] - peaks[i]["center"])
-            pairs.append((di, i, j))
-    pairs.sort(key=lambda t: t[0])
-
-    for _, i, j in pairs:
-        if i in to_kill or j in to_kill:
-            continue
-        pi, pj = peaks[i], peaks[j]
-        ci, cj = pi["center"], pj["center"]
-        si, sj = abs(pi["sigma"]), abs(pj["sigma"])
-        hi, hj = pi["height"], pj["height"]
-        if not all(np.isfinite([ci, cj, si, sj, hi, hj])) or si <= 0 or sj <= 0:
-            continue
-
-        d = abs(cj - ci)
-        close_by_resolution = (d < min_sep_q)
-        close_by_sigma = (d < merge_min_sep_frac * 0.5 * (si + sj))
-        ovl = _gaussian_shape_overlap(ci, si, cj, sj)
-        candidate = close_by_resolution or close_by_sigma or (ovl >= overlap_coef_min)
-        if not candidate:
-            continue
-
-        # Which to drop (weaker by height, tie by amplitude)
-        drop = i if (hi < hj * height_frac or (abs(hi - hj) < 1e-12 and pi["amplitude"] < pj["amplitude"])) else j
-        keep = j if drop == i else i
-
-        # --- Broad-peak protection by area evidence ---
-        sig_i, sig_j = si, sj
-        broad, narrow = (i, j) if sig_i >= sig_j else (j, i)
-        # If the broader component is much broader and has good area SNR, don't drop it
-        if abs(result.params[f"g{broad}_sigma"].value) >= R_SIGMA_PROTECT * max(abs(result.params[f"g{narrow}_sigma"].value), 1e-12):
-            comps_here = result.eval_components(x=xw)
-            bkg_vec_here = comps_here["bkg_"] if "bkg_" in comps_here else np.zeros_like(xw)
-            area_b, snr_b, _ = _component_area_and_snr(result, xw, yw, bkg_vec_here, broad, win_sigma=AREA_WIN_SIGMA)
-            if snr_b >= PROTECT_AREA_SNR:
-                if drop == broad:
-                    # flip: try dropping the narrow one instead
-                    drop, keep = narrow, broad
-
-        # --- AIC fallback decision ---
-        params_refit = result.params.copy()
-        params_refit[f"g{drop}_amplitude"].set(value=0.0, vary=False)
-        params_refit[f"g{drop}_center"].set(vary=False)
-        params_refit[f"g{drop}_sigma"].set(vary=False)
-        test = model.fit(yw, params_refit, x=xw, calc_covar=False, method="least_squares", max_nfev=600)
-        delta_aic = result.aic - test.aic   # positive => full model better
-        if delta_aic < aic_improve:
-            to_kill.add(drop)
-
-    return sorted(to_kill)
-
-# ------------------------------
-# Rescue helpers
-# ------------------------------
-
-def _local_argmax(xw, yw, cx, span):
-    m = (xw >= cx - span) & (xw <= cx + span)
-    if not np.any(m):
-        return float(cx)
-    idx = np.argmax(yw[m])
-    return float(xw[m][idx])
-
-def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
-                       window, center_tol, max_sigma_frac):
-    center = float(np.mean(peak_positions))
-    half = (window / 2.0)
-    m = (x >= center - half) & (x <= center + half)
-    xw, yw = x[m], yfull[m]
-    mfin = np.isfinite(xw) & np.isfinite(yw)
-    xw, yw = xw[mfin], yw[mfin]
-    if xw.size < 5:
-        return None
-
-    xmin, xmax = float(np.min(xw)), float(np.max(xw))
-    baseline = np.quantile(yw, BASELINE_QUANTILE)
-    noise = robust_sigma(yw)
-
-    reseeded = []
-    for cx in peak_positions:
-        cx_new = _local_argmax(xw, yw, cx, RESEED_SPAN)
-        reseeded.append(cx_new)
-    reseeded = sorted(reseeded)
-
-    center_bounds = []
-    for i, cx in enumerate(reseeded):
-        if anchor_peak0 and i == 0:
-            cmin = max(xmin, cx - max(ANCHOR_TOL, min(RESEED_SPAN, center_tol)))
-            cmax = min(xmax, cx + max(ANCHOR_TOL, min(RESEED_SPAN, center_tol)))
-        else:
-            cmin = max(xmin, cx - center_tol)
-            cmax = min(xmax, cx + center_tol)
-        if cmin > cmax:
-            cmin, cmax = min(cmin, cmax), max(cmin, cmax)
-        center_bounds.append((cmin, cmax))
-
-    loss_kwargs = {"loss": "soft_l1", "f_scale": noise} if USE_ROBUST_LOSS else {}
-
-    global MAX_SIGMA_FRAC
-    old_max_sigma_frac = MAX_SIGMA_FRAC
-    MAX_SIGMA_FRAC = max_sigma_frac
-    try:
-        model, params = build_model(xw, yw, reseeded, baseline, center_bounds)
-        result = model.fit(yw, params, x=xw, calc_covar=False,
-                           method="least_squares", max_nfev=800, **loss_kwargs)
-        r2 = compute_r2(yw, result.best_fit)
-    finally:
-        MAX_SIGMA_FRAC = old_max_sigma_frac
-
-    peaks = extract_peaks(result)
-    thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
-    kept = [p for p in peaks if p["height"] >= thresh]
-
-    return {
-        "xw": xw, "yw": yw, "result": result, "r2": r2, "peaks": peaks,
-        "kept": kept, "baseline": baseline, "noise": noise,
-        "center": center, "half": half, "reseeded": reseeded
-    }
-
-def _format_eta(sec):
-    if sec is None or sec == float("inf"):
-        return "ETA --:--"
-    m, s = divmod(int(sec), 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"ETA {h:d}:{m:02d}:{s:02d}"
-    return f"ETA {m:02d}:{s:02d}"
 
 # ------------------------------
 # Fit a single frame (and plot)
 # ------------------------------
 
 def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANCHOR_PEAK0):
+    # Load data directly (assume int is [nframes, nq] and x ascending)
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
         yfull = f["int"][frame, :]
@@ -524,67 +216,48 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     x = np.asarray(x, float)
     yfull = np.asarray(yfull, float)
 
+    # Simple ascending-q safeguard (no orientation detection)
     if x[0] > x[-1]:
-        x = x[::-1]; yfull = yfull[::-1]
+        x = x[::-1]
+        yfull = yfull[::-1]
 
     center, half, xw, yw = _window_data(x, yfull, peak_positions)
     xmin, xmax = float(np.min(xw)), float(np.max(xw))
 
+    # Lower-quantile baseline for robust sigma/height seeding
     baseline = np.quantile(yw, BASELINE_QUANTILE)
     noise = robust_sigma(yw)
 
-    # --- Guided reseed (curvature/SNR) + matched-filter refinement for broad peaks
-    reseeded, confident = _guided_reseed_centers(xw, yw, peak_positions, baseline, noise)
-
-    if USE_MATCHED_SEED:
-        dx = float(np.mean(np.diff(xw))) if len(xw) > 1 else WINDOW
-        compsigma_est = []
-        for cx in reseeded:
-            s_est, _h = _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010)
-            s_est = float(np.clip(s_est, max(1.00 * dx, MIN_SIGMA_ABS), min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)))
-            compsigma_est.append(s_est)
-        reseeded2 = []
-        for cx, s_est in zip(reseeded, compsigma_est):
-            reseeded2.append(_matched_filter_center(xw, yw, cx, s_est, SEED_MATCHED_SPAN))
-        seed_centers = reseeded2
-    else:
-        seed_centers = reseeded
-
-    # Center bounds using seed lock if confident reseed
+    # Center bounds: anchor peak 0 tightly; others near their guesses to avoid identity swaps
     center_bounds = []
-    for i, cx in enumerate(seed_centers):
+    for i, cx in enumerate(peak_positions):
         if anchor_peak0 and i == 0:
-            cmin = max(xmin, cx - min(ANCHOR_TOL, SEED_LOCK))
-            cmax = min(xmax, cx + min(ANCHOR_TOL, SEED_LOCK))
+            cmin = max(xmin, cx - ANCHOR_TOL)
+            cmax = min(xmax, cx + ANCHOR_TOL)
         else:
-            tol = SEED_LOCK if confident[i] else CENTER_TOL
-            cmin = max(xmin, cx - tol); cmax = min(xmax, cx + tol)
+            cmin = max(xmin, cx - CENTER_TOL)
+            cmax = min(xmax, cx + CENTER_TOL)
         if cmin > cmax:
             cmin, cmax = min(cmin, cmax), max(cmin, cmax)
         center_bounds.append((cmin, cmax))
 
-    loss_kwargs = {"loss": "soft_l1", "f_scale": noise} if USE_ROBUST_LOSS else {}
+    # Robust loss config
+    loss_kwargs = {}
+    if USE_ROBUST_LOSS:
+        loss_kwargs = {"loss": "soft_l1", "f_scale": noise}
 
-    model, params = build_model(xw, yw, seed_centers, baseline, center_bounds)
+    # Build and fit
+    model, params = build_model(xw, yw, peak_positions, baseline, center_bounds)
     result = model.fit(yw, params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
     r2 = compute_r2(yw, result.best_fit)
 
+    # Optional pruning and refit (noise-aware threshold)
     peaks = extract_peaks(result)
     pruned_indices = []
     if PRUNE_SMALL:
-        thresh0 = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
-        comps_tmp = result.eval_components(x=xw)
-        bkg_vec = comps_tmp["bkg_"] if "bkg_" in comps_tmp else np.zeros_like(xw)
-        # prune only if BOTH height & area evidence are weak
-        pruned_indices = []
-        for p in peaks:
-            i = p["index"]
-            height_ok = (p["height"] >= thresh0)
-            area_i, area_snr_i, _ = _component_area_and_snr(result, xw, yw, bkg_vec, i, win_sigma=AREA_WIN_SIGMA)
-            area_ok = (area_i >= AREA_MIN) or (area_snr_i >= AREA_SNR_MIN)
-            if not (height_ok or area_ok):
-                pruned_indices.append(i)
-        if pruned_indices:
+        thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
+        pruned_indices = [p["index"] for p in peaks if p["height"] < thresh]
+        if len(pruned_indices) > 0:
             params_refit = result.params.copy()
             for i in pruned_indices:
                 params_refit[f"g{i}_amplitude"].set(value=0.0, vary=False)
@@ -594,94 +267,10 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             r2 = compute_r2(yw, result.best_fit)
             peaks = extract_peaks(result)
 
-    # --- Area-dominance check (integrated, not point height)
-    comps = result.eval_components(x=xw)
-    bkg_vec = comps["bkg_"] if "bkg_" in comps else np.zeros_like(xw)
-
-    kill_by_dom = []
-    for p in peaks:
-        i = p["index"]
-        area_i, _snr_i, _ = _component_area_and_snr(result, xw, yw, bkg_vec, i, win_sigma=AREA_WIN_SIGMA)
-        sig_i = abs(result.params[f"g{i}_sigma"].value)
-        cen_i = result.params[f"g{i}_center"].value
-        if not (np.isfinite(sig_i) and sig_i > 0 and np.isfinite(cen_i)):
-            continue
-        half = AREA_WIN_SIGMA * sig_i
-        mloc = (xw >= cen_i - half) & (xw <= cen_i + half)
-        if not np.any(mloc):
-            continue
-        area_tot = float(np.trapz((result.best_fit[mloc] - bkg_vec[mloc]), xw[mloc]))
-        frac = area_i / max(area_tot, 1e-12)
-        if frac < 0.40:  # forgiving for broad peaks
-            kill_by_dom.append(i)
-
-    if kill_by_dom:
-        params_refit = result.params.copy()
-        for i_drop in kill_by_dom:
-            params_refit[f"g{i_drop}_amplitude"].set(value=0.0, vary=False)
-            params_refit[f"g{i_drop}_center"].set(vary=False)
-            params_refit[f"g{i_drop}_sigma"].set(vary=False)
-        result = model.fit(yw, params_refit, x=xw, calc_covar=False,
-                           method="least_squares", max_nfev=800, **loss_kwargs)
-        r2 = compute_r2(yw, result.best_fit)
-        peaks = extract_peaks(result)
-
-    # Overlap + proximity + (broad-protect) + AIC merge, then refit
-    to_kill = _merge_close_peaks_with_aic(
-        xw, yw, model, result, noise,
-        min_sep_q=MIN_SEP_Q,
-        merge_min_sep_frac=MERGE_MIN_SEP_FRAC,
-        overlap_coef_min=OVERLAP_COEF_MIN,
-        aic_improve=AIC_IMPROVE,
-        height_frac=MERGE_HEIGHT_FRAC
-    )
-    if to_kill:
-        params_refit = result.params.copy()
-        for i_drop in to_kill:
-            params_refit[f"g{i_drop}_amplitude"].set(value=0.0, vary=False)
-            params_refit[f"g{i_drop}_center"].set(vary=False)
-            params_refit[f"g{i_drop}_sigma"].set(vary=False)
-        result = model.fit(yw, params_refit, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
-        r2 = compute_r2(yw, result.best_fit)
-        peaks = extract_peaks(result)
-
-    # Rescue if needed
-    did_rescue = False
-    if RESCUE_ENABLED:
-        kept_now = [p for p in peaks if p["height"] >= max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)]
-        need_rescue = (r2 < RESCUE_R2_MIN) or (len(kept_now) < RESCUE_MIN_KEPT)
-        if not need_rescue:
-            hit_bounds = 0
-            for i, (cmin, cmax) in enumerate(center_bounds):
-                cval = result.params.get(f"g{i}_center", None)
-                if cval is not None:
-                    v = cval.value
-                    if abs(v - cmin) < 1e-6 or abs(v - cmax) < 1e-6:
-                        hit_bounds += 1
-            need_rescue = hit_bounds >= max(1, len(seed_centers)//2)
-
-        if need_rescue:
-            did_rescue = True
-            expanded_window = WINDOW * RESCUE_EXPAND_WINDOW
-            rescue = _refit_with_rescue(
-                x, yfull,
-                peak_positions=peak_positions,
-                frame=frame,
-                anchor_peak0=anchor_peak0,
-                window=expanded_window,
-                center_tol=RESCUE_CENTER_TOL,
-                max_sigma_frac=RESCUE_MAX_SIGMA_FRAC
-            )
-            if rescue is not None:
-                xw = rescue["xw"]; yw = rescue["yw"]
-                result = rescue["result"]; r2 = rescue["r2"]
-                peaks = rescue["peaks"]
-                baseline = rescue["baseline"]; noise = rescue["noise"]
-                center = rescue["center"]; half = rescue["half"]
-
     bkg_slope = result.params["bkg_slope"].value
     bkg_intercept = result.params["bkg_intercept"].value
 
+    # Kept peaks for table
     thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
     kept = [p for p in peaks if p["height"] >= thresh]
     rows = [[p["index"], p["center"], p["height"], p["fwhm"], p["amplitude"]] for p in kept]
@@ -702,24 +291,16 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             ax.plot(xw, comps["bkg_"], ls="--", label="Background")
 
         for p in kept:
-            i = p["index"]; key = f"g{i}_"
+            i = p["index"]
+            key = f"g{i}_"
             if key in comps:
-                ax.plot(xw, comps[key], ls=":", alpha=0.9, label=f"Peak {i+1}")
+                ax.plot(xw, comps[key], ls=":", alpha=0.8, label=f"Peak {i+1}")
             ax.axvline(result.params[f"g{i}_center"].value, alpha=0.25, ls="--")
 
-        rescue_tag = " | rescue" if did_rescue else ""
-        ax.set_xlabel("q (1/Å)"); ax.set_ylabel("Intensity")
-        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f}{rescue_tag} | height_min=max({HEIGHT_MIN}, {HEIGHT_MIN_SIGMA}·σ)")
-        if PLOT_SAFE:
-            handles, labels = ax.get_legend_handles_labels()
-            if len(handles) > 12:
-                ax.legend().remove()
-                ax.text(0.01, 0.97, f"{len(handles)} items", transform=ax.transAxes,
-                        va="top", ha="left", fontsize=12, alpha=0.8)
-            else:
-                ax.legend(loc="best")
-        else:
-            ax.legend(loc="best")
+        ax.set_xlabel("q (1/Å)")
+        ax.set_ylabel("Intensity")
+        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f} | height_min=max({HEIGHT_MIN}, {HEIGHT_MIN_SIGMA}·σ)")
+        ax.legend(loc="best")
         ax.grid(alpha=0.3)
         ax.set_xlim(center - half, center + half)
 
@@ -729,12 +310,11 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             cellText=[[f"{r[0]}", f"{r[1]:.6g}", f"{r[2]:.6g}", f"{r[3]:.6g}", f"{r[4]:.6g}"] for r in rows],
             colLabels=cols, loc="center"
         )
-        table.auto_set_font_size(False); table.set_fontsize(12); table.scale(1, 1.25)
-        plt.tight_layout()
+        table.auto_set_font_size(False)
+        table.set_fontsize(12)
+        table.scale(1, 1.25)
 
-        if r2 < R2_BAD:
-            Path(DEBUG_OUTDIR).mkdir(parents=True, exist_ok=True)
-            plt.savefig(os.path.join(DEBUG_OUTDIR, f"frame_{frame:05d}_r2_{r2:.3f}.png"), bbox_inches="tight")
+        plt.tight_layout()
         plt.show()
 
     return {
@@ -747,98 +327,20 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
         "pruned_indices": pruned_indices,
     }
 
-# ------------------------------
-# Map mode (run all frames, collect kept peaks, scatter plot) + PROGRESS
-# ------------------------------
-
-def map_all_frames(h5_path, peak_positions, anchor_peak0=ANCHOR_PEAK0):
-    with h5py.File(h5_path, "r") as f:
-        nframes = f["int"].shape[0]
-
-    per_peak_frames = {i: [] for i in range(len(peak_positions))}
-    per_peak_centers = {i: [] for i in range(len(peak_positions))}
-    per_peak_heights = {i: [] for i in range(len(peak_positions))}
-    per_peak_r2 = {i: [] for i in range(len(peak_positions))}
-
-    start = time.perf_counter()
-
-    if _HAVE_TQDM:
-        pbar = tqdm(total=nframes, desc="Mapping frames", unit="frame")
-        last_update_time = start
-    else:
-        print(f"Mapping {nframes} frames...")
-        last_print_len = 0
-
-    for fr in range(nframes):
-        out = fit_single_frame(h5_path, fr, peak_positions, plot=False, anchor_peak0=anchor_peak0)
-        kept = out["rows"]; r2 = out["r2"]
-
-        for (idx, center, height, _, _) in kept:
-            idx = int(idx)
-            per_peak_frames[idx].append(fr)
-            per_peak_centers[idx].append(center)
-            per_peak_heights[idx].append(height)
-            per_peak_r2[idx].append(r2)
-
-        done = fr + 1
-        now = time.perf_counter()
-        elapsed = now - start
-        rate = done / elapsed if elapsed > 0 else 0.0
-        remain = (nframes - done) / rate if rate > 0 else float("inf")
-
-        if _HAVE_TQDM:
-            if (now - last_update_time) >= 0.2 or done == nframes:
-                pbar.set_postfix_str(_format_eta(remain)); last_update_time = now
-            pbar.update(1)
-        else:
-            pct = 100.0 * done / nframes
-            bar_n = 24; filled = int(bar_n * done / nframes)
-            bar = "█" * filled + "·" * (bar_n - filled)
-            msg = f"[{bar}] {pct:6.2f}%  {done}/{nframes}  {_format_eta(remain)}"
-            print("\r" + msg + " " * max(0, last_print_len - len(msg)), end="", flush=True)
-            last_print_len = len(msg)
-
-    if _HAVE_TQDM: pbar.close()
-    else: print()
-
-    plt.rcParams.update({
-        "figure.dpi": 160, "savefig.dpi": 300,
-        "font.size": 16, "axes.labelsize": 18, "axes.titlesize": 20,
-        "xtick.labelsize": 14, "ytick.labelsize": 14,
-    })
-    fig, ax = plt.subplots(figsize=(10.5, 6.2))
-
-    any_points = False
-    for i in range(len(peak_positions)):
-        if len(per_peak_frames[i]) == 0: continue
-        any_points = True
-        sc = ax.scatter(per_peak_frames[i], per_peak_centers[i],
-                        c=per_peak_heights[i], s=16, alpha=0.9, label=f"Peak {i+1}")
-    if any_points:
-        cbar = plt.colorbar(sc, ax=ax); cbar.set_label("Peak height (a.u.)")
-    ax.set_xlabel("Frame"); ax.set_ylabel("Center q (1/Å)")
-    ax.set_title("Peak Map: center vs frame (color = height)")
-    ax.grid(alpha=0.3); ax.legend(loc="best")
-    plt.tight_layout(); plt.show()
 
 # ------------------------------
-# CLI
+# Minimal CLI (single-frame only)
 # ------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fit Gaussian peaks (linear background) for a single frame or build a map across frames"
+        description="Fit Gaussian peaks (linear background) in a single frame"
     )
     parser.add_argument("h5", help="HDF5 file with 'q' or 'tth' and 'int' datasets")
     parser.add_argument("peaks", type=float, nargs='+',
                         help="Peak q-positions (e.g., 3.025 3.012)")
-
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--frame", type=int,
-                      help="Frame index to fit and show plot (single-frame mode)")
-    mode.add_argument("--map", action="store_true",
-                      help="Run over all frames and plot a scatter map (center vs frame, color=height)")
-
+    parser.add_argument("--frame", type=int, required=True,
+                        help="Frame index to fit and show plot")
     parser.add_argument("--no-anchor", action="store_true",
                         help="Do not anchor peak 0; let all centers float within the window")
 
@@ -849,21 +351,15 @@ def main():
     print(f"Window: {WINDOW} q | Anchor tol (peak 0): {ANCHOR_TOL} q | anchor={'off' if args.no_anchor else 'on'}")
     print(f"height_min: {HEIGHT_MIN} | height_min_sigma: {HEIGHT_MIN_SIGMA}*robust_sigma")
     print(f"Sigma bounds: [{MIN_SIGMA_ABS}, {min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)}] q")
-    print(f"Min peak separation: {MIN_SEP_Q} q")
     print(f"Background: BASELINE_QUANTILE={BASELINE_QUANTILE}, EXCLUDE_RADIUS={BKG_EXCLUDE_RADIUS}, "
           f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
-    print(f"Area-aware: AREA_MIN={AREA_MIN}, AREA_SNR_MIN={AREA_SNR_MIN}, AREA_WIN_SIGMA={AREA_WIN_SIGMA}")
-    print(f"Seeding: SEED_SPAN={SEED_SPAN}, SNR_MIN={SEED_SNR_MIN}, CURV_Q={SEED_CURV_Q}, MATCHED={'on' if USE_MATCHED_SEED else 'off'}")
-    print(f"Broad protect: R_SIGMA_PROTECT={R_SIGMA_PROTECT}, PROTECT_AREA_SNR={PROTECT_AREA_SNR}")
+    print(f"Center tol (non-anchored peaks): ±{CENTER_TOL} q")
 
-    if args.map:
-        map_all_frames(args.h5, peak_positions, anchor_peak0=(not args.no_anchor))
-    else:
-        fit_single_frame(
-            args.h5, args.frame, peak_positions,
-            plot=True, anchor_peak0=(not args.no_anchor)
-        )
+    fit_single_frame(
+        args.h5, args.frame, peak_positions,
+        plot=True, anchor_peak0=(not args.no_anchor)
+    )
 
 if __name__ == "__main__":
     main()
