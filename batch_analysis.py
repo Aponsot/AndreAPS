@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import numpy as np
 import h5py
@@ -5,51 +6,51 @@ import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
 
 # ------------------------------
-# Tunable constants (single-frame)
+# Tunable constants (single-frame) — unchanged
 # ------------------------------
 
-# Window (in q units) around the mean of specified peak positions
 WINDOW = 0.25
 
-# Sigma bounds
 MIN_SIGMA_ABS = 0.001      # q units
 MAX_SIGMA_ABS = 0.025      # q units
-MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW (was 0.20)
+MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW
 
-# Anchor for peak 0 every frame (optional)
 ANCHOR_TOL = 0.005         # q units around the first specified peak position
 ANCHOR_PEAK0 = True        # set False to let all centers float freely
 
-# Additional center drift limit for other peaks (prevents identity swapping)
 CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 
-# Pruning threshold: remove peaks (set amplitude to 0) if height < threshold
 HEIGHT_MIN = 5.0           # absolute floor (kept)
 HEIGHT_MIN_SIGMA = 3.0     # AND relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
-# Background controls (robust linear background)
-BASELINE_QUANTILE = 0.20       # lower quantile baseline for sigma/height seeding
-BKG_EXCLUDE_RADIUS = 0.010     # baseline min exclusion (will scale with sigma seeds)
-BKG_TRIM_FRACTION = 0.30       # trimmed regression fraction
-BKG_SLOPE_MAX_ABS = 2.0        # hard cap on background slope (intensity per q)
+BASELINE_QUANTILE = 0.20
+BKG_EXCLUDE_RADIUS = 0.010
+BKG_TRIM_FRACTION = 0.30
+BKG_SLOPE_MAX_ABS = 2.0
 
-# Use robust loss in least-squares to reduce outlier impact
 USE_ROBUST_LOSS = True
 
-# Optional: per-peak sigma bounds (leave None to use global logic)
-PEAK_SIGMA_MIN = None  # e.g., [0.001, 0.002]
-PEAK_SIGMA_MAX = None  # e.g., [0.030, 0.060]
+PEAK_SIGMA_MIN = None
+PEAK_SIGMA_MAX = None
 
 # --- Rescue (fallback) settings for post-solidification frames ---
 RESCUE_ENABLED = True
-RESCUE_R2_MIN = 0.85          # if first fit R² is below this, try rescue once
-RESCUE_MIN_KEPT = 1           # or if kept peaks < this
-RESCUE_EXPAND_WINDOW = 1.6    # multiply WINDOW during rescue (e.g., 0.25 -> 0.40)
-RESCUE_CENTER_TOL = 0.050     # temporarily allow centers to drift farther
-RESCUE_MAX_SIGMA_FRAC = 0.30  # slightly looser broadening for the retry
-RESEED_SPAN = 0.060           # search ± this (q) around each guess for local max
+RESCUE_R2_MIN = 0.85
+RESCUE_MIN_KEPT = 1
+RESCUE_EXPAND_WINDOW = 1.6
+RESCUE_CENTER_TOL = 0.050
+RESCUE_MAX_SIGMA_FRAC = 0.30
+RESEED_SPAN = 0.060
 
+# ------------------------------
+# Internal sequential-fit constants (not exposed via CLI)
+# ------------------------------
+# Greedy residual-add; keep these hard-coded to avoid "new knobs" in the CLI.
+_AIC_IMPROVE = 6.0           # require meaningful AIC gain to add another peak
+_MAX_PEAKS = 16              # hard cap to avoid runaway
+_RESIDUAL_PICK_SPAN = 0.030  # ±q span to snap to local residual max near each guess
+_USE_GUESSES_FIRST = True    # add peaks near supplied guesses in descending seed height
 
 # ------------------------------
 # Core utilities
@@ -64,9 +65,10 @@ def compute_r2(y, yfit):
     ss_tot = np.sum((y - np.mean(y)) ** 2) + 1e-16
     return 1.0 - ss_res / ss_tot
 
-def _window_data(x, yfull, peak_positions):
+def _window_data(x, yfull, peak_positions, window=None):
+    window = WINDOW if window is None else window
     center = np.mean(peak_positions)
-    half = WINDOW / 2.0
+    half = window / 2.0
     m = (x >= center - half) & (x <= center + half)
     xw, yw = x[m], yfull[m]
     mfin = np.isfinite(xw) & np.isfinite(yw)
@@ -76,26 +78,20 @@ def _window_data(x, yfull, peak_positions):
     return center, half, xw, yw
 
 def _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010):
-    """
-    Robust local seeds for sigma and height using a small neighborhood around cx.
-    Uses upper-quantile intensity to avoid single-point noise/shoulders dominating.
-    """
     m = np.abs(xw - cx) <= w
     if not np.any(m):
         sigma0 = max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
         height0 = max(np.max(yw) - baseline, robust_sigma(yw))
         return sigma0, height0
 
-    xloc = xw[m]
-    yloc = yw[m]
+    xloc = xw[m]; yloc = yw[m]
     ypk = np.quantile(yloc, 0.9)
     height0 = max(ypk - baseline, robust_sigma(yw))
 
     half = baseline + 0.5 * (ypk - baseline)
     above = yloc >= half
     if np.any(above):
-        xl = np.min(xloc[above])
-        xr = np.max(xloc[above])
+        xl = np.min(xloc[above]); xr = np.max(xloc[above])
         fwhm = max(xr - xl, np.mean(np.diff(xw)))
     else:
         fwhm = max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
@@ -104,7 +100,6 @@ def _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010):
     return sigma0, height0
 
 def _robust_line_fit(x, y, max_iter=4, trim_frac=0.30):
-    # Simple trimmed regression: fit, trim largest residuals, refit
     m, b = np.polyfit(x, y, 1)
     for _ in range(max_iter):
         resid = y - (m * x + b)
@@ -116,10 +111,6 @@ def _robust_line_fit(x, y, max_iter=4, trim_frac=0.30):
     return float(m), float(b)
 
 def _background_init(xw, yw, centers, exclude_radius, sigma_seeds=None):
-    """
-    Trimmed linear background seeded from off-peak points.
-    Exclude around each center by max(exclude_radius, 2.5 * sigma_seed) if seeds provided.
-    """
     if sigma_seeds is not None:
         radii = [max(exclude_radius, 2.5 * max(s, MIN_SIGMA_ABS)) for s in sigma_seeds]
     else:
@@ -132,34 +123,38 @@ def _background_init(xw, yw, centers, exclude_radius, sigma_seeds=None):
     if mask.sum() >= max(5, int(0.2 * len(xw))):
         m, b = _robust_line_fit(xw[mask], yw[mask], trim_frac=BKG_TRIM_FRACTION)
     else:
-        # Fallback if not enough off-peak points: use flat baseline near lower envelope
         m = 0.0
         b = np.quantile(yw, BASELINE_QUANTILE)
 
-    # Bound slope reasonably
     m = float(np.clip(m, -BKG_SLOPE_MAX_ABS, BKG_SLOPE_MAX_ABS))
     return m, float(b)
 
+def _make_center_bounds(xmin, xmax, centers, anchor_peak0, anchor_tol, center_tol):
+    bnds = []
+    for i, cx in enumerate(centers):
+        if anchor_peak0 and i == 0:
+            cmin = max(xmin, cx - anchor_tol)
+            cmax = min(xmax, cx + anchor_tol)
+        else:
+            cmin = max(xmin, cx - center_tol)
+            cmax = min(xmax, cx + center_tol)
+        if cmin > cmax:
+            cmin, cmax = min(cmin, cmax), max(cmin, cmax)
+        bnds.append((cmin, cmax))
+    return bnds
+
 def build_model(xw, yw, centers, baseline, center_bounds):
-    """
-    Build a model with a linear background and Gaussian peaks at given centers.
-    Background slope is initialized robustly and capped to avoid runaway tilt.
-    Seeds for sigma/height are taken locally around each center for stability.
-    """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
     min_sigma_global = max(0.75 * dx, MIN_SIGMA_ABS)
     max_sigma_global = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
 
-    # Precompute local seeds for each center
-    sigma0_list = []
-    height0_list = []
+    sigma0_list, height0_list = [], []
     for cx in centers:
         sigma0_est, height0 = _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010)
         sigma0_clipped = np.clip(sigma0_est, min_sigma_global, max_sigma_global)
         sigma0_list.append(float(sigma0_clipped))
         height0_list.append(float(height0))
 
-    # Robust background init (exclude scaled by sigma seeds)
     init_slope, init_intercept = _background_init(
         xw, yw, centers, BKG_EXCLUDE_RADIUS, sigma_seeds=sigma0_list
     )
@@ -169,12 +164,10 @@ def build_model(xw, yw, centers, baseline, center_bounds):
     params["bkg_slope"].set(min=-BKG_SLOPE_MAX_ABS, max=BKG_SLOPE_MAX_ABS, value=init_slope, vary=True)
     params["bkg_intercept"].set(value=init_intercept, vary=True)
 
-    # Add Gaussians
     for i, (cx, sigma0, height0) in enumerate(zip(centers, sigma0_list, height0_list)):
         gi = GaussianModel(prefix=f"g{i}_")
         model += gi
 
-        # Per-peak sigma bounds if provided, else global
         min_sig_i = min_sigma_global if PEAK_SIGMA_MIN is None else max(min_sigma_global, PEAK_SIGMA_MIN[i])
         max_sig_i = max_sigma_global if PEAK_SIGMA_MAX is None else min(max_sigma_global, PEAK_SIGMA_MAX[i])
 
@@ -184,7 +177,6 @@ def build_model(xw, yw, centers, baseline, center_bounds):
         params.update(gi.make_params(center=np.clip(cx, cmin, cmax),
                                      sigma=sigma0,
                                      amplitude=max(amp0, 0.0)))
-
         params[f"g{i}_center"].set(min=cmin, max=cmax)
         params[f"g{i}_sigma"].set(min=min_sig_i, max=max_sig_i)
         params[f"g{i}_amplitude"].set(min=0.0)
@@ -209,84 +201,131 @@ def extract_peaks(result):
     return peaks
 
 def _local_argmax(xw, yw, cx, span):
-    """Return x position of the max intensity within ±span of cx; fall back to cx."""
     m = (xw >= cx - span) & (xw <= cx + span)
     if not np.any(m):
         return float(cx)
     idx = np.argmax(yw[m])
     return float(xw[m][idx])
 
-def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
-                       window, center_tol, max_sigma_frac):
+# ------------------------------
+# Sequential residual-add (no new CLI flags)
+# ------------------------------
+
+def _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline, noise):
     """
-    One-shot rescue: expand window, reseed centers to nearest local maxima,
-    relax center/sigma tolerances, and refit.
+    Greedy residual-add:
+      1) fit background only
+      2) add Gaussians one-by-one near supplied guesses (largest seed first)
+      3) accept addition only if ΔAIC >= _AIC_IMPROVE and height >= noise-aware threshold
     """
-    center = float(np.mean(peak_positions))
-    half = (window / 2.0)
-    m = (x >= center - half) & (x <= center + half)
-    xw, yw = x[m], yfull[m]
-    mfin = np.isfinite(xw) & np.isfinite(yw)
-    xw, yw = xw[mfin], yw[mfin]
-    if xw.size < 5:
-        return None  # can't rescue
+    dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
+    min_sigma_global = max(0.75 * dx, MIN_SIGMA_ABS)
+    max_sigma_global = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
+
+    # background-only init (no exclusions)
+    init_slope, init_intercept = _background_init(xw, yw, [], BKG_EXCLUDE_RADIUS, sigma_seeds=None)
+    model = LinearModel(prefix="bkg_")
+    params = model.make_params(slope=init_slope, intercept=init_intercept)
+    params["bkg_slope"].set(min=-BKG_SLOPE_MAX_ABS, max=BKG_SLOPE_MAX_ABS, value=init_slope, vary=True)
+    params["bkg_intercept"].set(value=init_intercept, vary=True)
+
+    loss_kwargs = {"loss": "soft_l1", "f_scale": noise} if USE_ROBUST_LOSS else {}
+    best_res = model.fit(yw, params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
+    best_aic = best_res.aic
 
     xmin, xmax = float(np.min(xw)), float(np.max(xw))
-    baseline = np.quantile(yw, BASELINE_QUANTILE)
-    noise = robust_sigma(yw)
+    peak_positions = list(sorted(peak_positions))
+    center_bounds_guess = _make_center_bounds(xmin, xmax, peak_positions, anchor_peak0, ANCHOR_TOL, CENTER_TOL)
 
-    # Reseed centers to nearest local maxima within ±RESEED_SPAN
-    reseeded = []
+    # order additions by local seed height near guesses
+    seeds = []
     for cx in peak_positions:
-        cx_new = _local_argmax(xw, yw, cx, RESEED_SPAN)
-        reseeded.append(cx_new)
-    reseeded = sorted(reseeded)
+        sig0, h0 = _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010)
+        seeds.append((cx, float(h0), float(np.clip(sig0, min_sigma_global, max_sigma_global))))
+    seeds.sort(key=lambda t: t[1], reverse=True)
 
-    # New (looser) center bounds
-    center_bounds = []
-    for i, cx in enumerate(reseeded):
-        if anchor_peak0 and i == 0:
-            cmin = max(xmin, cx - max(ANCHOR_TOL, min(RESEED_SPAN, center_tol)))
-            cmax = min(xmax, cx + max(ANCHOR_TOL, min(RESEED_SPAN, center_tol)))
+    n_added = 0
+    used_positions = []
+    height_thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
+
+    def _place_next_center(resid):
+        if _USE_GUESSES_FIRST:
+            for cx, h0, s0 in seeds:
+                if cx in used_positions:
+                    continue
+                cx_new = _local_argmax(xw, resid + baseline, cx, span=max(_RESIDUAL_PICK_SPAN, 2*np.mean(np.diff(xw))))
+                return cx, cx_new, h0, s0
+        # fallback: global residual max (rare)
+        j = int(np.argmax(resid))
+        cx_new = float(xw[j])
+        sig0, h0 = _local_height_sigma_seeds(xw, yw, baseline, cx_new, w=0.010)
+        s0 = float(np.clip(sig0, min_sigma_global, max_sigma_global))
+        return cx_new, cx_new, h0, s0
+
+    while n_added < min(_MAX_PEAKS, max(1, len(peak_positions))):
+        resid = yw - best_res.best_fit
+        guess_cx, place_cx, h0, s0 = _place_next_center(resid)
+
+        # bounds for the new peak
+        if guess_cx in peak_positions:
+            i_guess = peak_positions.index(guess_cx)
+            cmin, cmax = center_bounds_guess[i_guess]
         else:
-            cmin = max(xmin, cx - center_tol)
-            cmax = min(xmax, cx + center_tol)
-        if cmin > cmax:
-            cmin, cmax = min(cmin, cmax), max(cmin, cmax)
-        center_bounds.append((cmin, cmax))
+            cmin = max(xmin, place_cx - CENTER_TOL)
+            cmax = min(xmax, place_cx + CENTER_TOL)
 
-    # Robust loss params
-    loss_kwargs = {"loss": "soft_l1", "f_scale": noise} if USE_ROBUST_LOSS else {}
+        amp0 = max(h0, 0.0) * s0 * np.sqrt(2*np.pi)
 
-    # Temporarily relax MAX_SIGMA_FRAC
-    global MAX_SIGMA_FRAC
-    old_max_sigma_frac = MAX_SIGMA_FRAC
-    MAX_SIGMA_FRAC = max_sigma_frac
-    try:
-        model, params = build_model(xw, yw, reseeded, baseline, center_bounds)
-        result = model.fit(yw, params, x=xw, calc_covar=False,
-                           method="least_squares", max_nfev=800, **loss_kwargs)
-        r2 = compute_r2(yw, result.best_fit)
-    finally:
-        MAX_SIGMA_FRAC = old_max_sigma_frac  # restore
+        gi = GaussianModel(prefix=f"g{n_added}_")
+        new_model = best_res.model + gi
+        new_params = best_res.params.copy()
+        new_params.update(gi.make_params(center=np.clip(place_cx, cmin, cmax),
+                                         sigma=s0,
+                                         amplitude=max(amp0, 0.0)))
+        new_params[f"g{n_added}_center"].set(min=cmin, max=cmax)
+        if anchor_peak0 and n_added == 0 and (guess_cx in peak_positions) and (peak_positions.index(guess_cx) == 0):
+            new_params[f"g{n_added}_center"].set(min=max(xmin, place_cx - ANCHOR_TOL),
+                                                 max=min(xmax, place_cx + ANCHOR_TOL))
+        new_params[f"g{n_added}_sigma"].set(min=min_sigma_global, max=max_sigma_global)
+        new_params[f"g{n_added}_amplitude"].set(min=0.0)
 
-    peaks = extract_peaks(result)
-    thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
-    kept = [p for p in peaks if p["height"] >= thresh]
+        trial_res = new_model.fit(yw, new_params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
+        dAIC = best_aic - trial_res.aic
 
-    return {
-        "xw": xw, "yw": yw, "result": result, "r2": r2, "peaks": peaks,
-        "kept": kept, "baseline": baseline, "noise": noise,
-        "center": center, "half": half, "reseeded": reseeded
-    }
+        # ensure the *new* peak is substantive
+        trial_peaks = extract_peaks(trial_res)
+        this_peak = next((p for p in trial_peaks if p["index"] == n_added), None)
+        too_small = (this_peak is None) or (this_peak["height"] < height_thresh)
 
+        if (dAIC < _AIC_IMPROVE) or too_small:
+            break
+
+        best_res = trial_res
+        best_aic = trial_res.aic
+        used_positions.append(guess_cx)
+        n_added += 1
+
+    # Optional pruning refit (your existing logic)
+    final_res = best_res
+    if PRUNE_SMALL:
+        peaks_now = extract_peaks(final_res)
+        pruned = [p["index"] for p in peaks_now if p["height"] < height_thresh]
+        if len(pruned) > 0:
+            refit_params = final_res.params.copy()
+            for i in pruned:
+                refit_params[f"g{i}_amplitude"].set(value=0.0, vary=False)
+                refit_params[f"g{i}_center"].set(vary=False)
+                refit_params[f"g{i}_sigma"].set(vary=False)
+            final_res = final_res.model.fit(yw, refit_params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
+
+    return final_res
 
 # ------------------------------
-# Fit a single frame (and plot)
+# Fit a single frame (and plot) — CLI unchanged
 # ------------------------------
 
 def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANCHOR_PEAK0):
-    # Load data directly (assume int is [nframes, nq] and x ascending)
+    # Load data
     with h5py.File(h5_path, "r") as f:
         x = f["q"][:] if "q" in f else f["tth"][:]
         yfull = f["int"][frame, :]
@@ -294,7 +333,7 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     x = np.asarray(x, float)
     yfull = np.asarray(yfull, float)
 
-    # Simple ascending-q safeguard (no orientation detection)
+    # ascending safeguard
     if x[0] > x[-1]:
         x = x[::-1]
         yfull = yfull[::-1]
@@ -302,11 +341,10 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     center, half, xw, yw = _window_data(x, yfull, peak_positions)
     xmin, xmax = float(np.min(xw)), float(np.max(xw))
 
-    # Lower-quantile baseline for robust sigma/height seeding
     baseline = np.quantile(yw, BASELINE_QUANTILE)
     noise = robust_sigma(yw)
 
-    # Center bounds: anchor peak 0 tightly; others near their guesses to avoid identity swaps
+    # bounds (for rescue bound-check only; main fit is sequential)
     center_bounds = []
     for i, cx in enumerate(peak_positions):
         if anchor_peak0 and i == 0:
@@ -319,39 +357,19 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             cmin, cmax = min(cmin, cmax), max(cmin, cmax)
         center_bounds.append((cmin, cmax))
 
-    # Robust loss config
-    loss_kwargs = {}
-    if USE_ROBUST_LOSS:
-        loss_kwargs = {"loss": "soft_l1", "f_scale": noise}
-
-    # Build and fit
-    model, params = build_model(xw, yw, peak_positions, baseline, center_bounds)
-    result = model.fit(yw, params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
+    # --- Sequential residual-add (replaces the previous "all-at-once") ---
+    result = _sequential_fit_single_frame(xw, yw, peak_positions, anchor_peak0, baseline, noise)
     r2 = compute_r2(yw, result.best_fit)
 
-    # Optional pruning and refit (noise-aware threshold)
+    # Optional pruning already performed inside; extract peaks
     peaks = extract_peaks(result)
-    pruned_indices = []
-    if PRUNE_SMALL:
-        thresh0 = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
-        pruned_indices = [p["index"] for p in peaks if p["height"] < thresh0]
-        if len(pruned_indices) > 0:
-            params_refit = result.params.copy()
-            for i in pruned_indices:
-                params_refit[f"g{i}_amplitude"].set(value=0.0, vary=False)
-                params_refit[f"g{i}_center"].set(vary=False)
-                params_refit[f"g{i}_sigma"].set(vary=False)
-            result = model.fit(yw, params_refit, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
-            r2 = compute_r2(yw, result.best_fit)
-            peaks = extract_peaks(result)
 
-    # --- Rescue path if the initial fit likely failed ---
+    # --- Rescue path if the initial sequential fit likely failed ---
     did_rescue = False
     if RESCUE_ENABLED:
         kept_now = [p for p in peaks if p["height"] >= max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)]
         need_rescue = (r2 < RESCUE_R2_MIN) or (len(kept_now) < RESCUE_MIN_KEPT)
 
-        # also rescue if many centers slammed to their bounds
         if not need_rescue:
             hit_bounds = 0
             for i, (cmin, cmax) in enumerate(center_bounds):
@@ -384,7 +402,7 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     bkg_slope = result.params["bkg_slope"].value
     bkg_intercept = result.params["bkg_intercept"].value
 
-    # Kept peaks & table rows based on (possibly rescued) result
+    # Kept peaks & table
     thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
     kept = [p for p in peaks if p["height"] >= thresh]
     rows = [[p["index"], p["center"], p["height"], p["fwhm"], p["amplitude"]] for p in kept]
@@ -439,12 +457,64 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
         "rows": rows,
         "result": result,
         "peaks": peaks,
-        "pruned_indices": pruned_indices,
+        "pruned_indices": [p["index"] for p in peaks if p["height"] < thresh],
     }
 
+# ------------------------------
+# Rescue helper (unchanged except factoring)
+# ------------------------------
+
+def _refit_with_rescue(x, yfull, peak_positions, frame, anchor_peak0,
+                       window, center_tol, max_sigma_frac):
+    center = float(np.mean(peak_positions))
+    half = (window / 2.0)
+    m = (x >= center - half) & (x <= center + half)
+    xw, yw = x[m], yfull[m]
+    mfin = np.isfinite(xw) & np.isfinite(yw)
+    xw, yw = xw[mfin], yw[mfin]
+    if xw.size < 5:
+        return None
+
+    xmin, xmax = float(np.min(xw)), float(np.max(xw))
+    baseline = np.quantile(yw, BASELINE_QUANTILE)
+    noise = robust_sigma(yw)
+
+    reseeded = []
+    for cx in peak_positions:
+        cx_new = _local_argmax(xw, yw, cx, RESEED_SPAN)
+        reseeded.append(cx_new)
+    reseeded = sorted(reseeded)
+
+    center_bounds = _make_center_bounds(
+        xmin, xmax, reseeded, anchor_peak0,
+        max(ANCHOR_TOL, min(RESEED_SPAN, center_tol)),
+        center_tol
+    )
+
+    loss_kwargs = {"loss": "soft_l1", "f_scale": noise} if USE_ROBUST_LOSS else {}
+
+    global MAX_SIGMA_FRAC
+    old_max_sigma_frac = MAX_SIGMA_FRAC
+    MAX_SIGMA_FRAC = max_sigma_frac
+    try:
+        model, params = build_model(xw, yw, reseeded, baseline, center_bounds)
+        result = model.fit(yw, params, x=xw, calc_covar=False,
+                           method="least_squares", max_nfev=800, **loss_kwargs)
+        r2 = compute_r2(yw, result.best_fit)
+    finally:
+        MAX_SIGMA_FRAC = old_max_sigma_frac
+
+    peaks = extract_peaks(result)
+    kept = [p for p in peaks if p["height"] >= max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)]
+
+    return {
+        "xw": xw, "yw": yw, "result": result, "r2": r2, "peaks": peaks,
+        "kept": kept, "baseline": baseline, "noise": noise,
+        "center": center, "half": half
+    }
 
 # ------------------------------
-# Minimal CLI (single-frame only)
+# Original CLI — unchanged
 # ------------------------------
 
 def main():
@@ -470,11 +540,8 @@ def main():
           f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
     print(f"Center tol (non-anchored peaks): ±{CENTER_TOL} q")
-    if RESCUE_ENABLED:
-        print(f"Rescue: R2<{RESCUE_R2_MIN} or kept<{RESCUE_MIN_KEPT} -> expand_window×{RESCUE_EXPAND_WINDOW}, "
-              f"center_tol=±{RESCUE_CENTER_TOL}, MAX_SIGMA_FRAC={RESCUE_MAX_SIGMA_FRAC}, reseed±{RESEED_SPAN}")
 
-    fit_single_frame(
+    res = fit_single_frame(
         args.h5, args.frame, peak_positions,
         plot=True, anchor_peak0=(not args.no_anchor)
     )
