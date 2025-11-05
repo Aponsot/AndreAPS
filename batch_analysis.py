@@ -16,7 +16,7 @@ GRAPH_CENTER = 3.0            # if None uses mean(peaks). Set float to lock for 
 
 # Peak width caps
 MIN_SIGMA_ABS = 0.001
-MAX_SIGMA_ABS = 0.040
+MAX_SIGMA_ABS = 0.050
 MAX_SIGMA_FRAC = 0.40         # also cap sigma to this fraction of WINDOW
 
 # Anchoring
@@ -61,7 +61,7 @@ RESIDUAL_POS_WEIGHT = 1.00
 
 # Sequential fit internals
 _AIC_IMPROVE = 6.0
-_MAX_PEAKS = 16
+_MAX_PEAKS = 4
 _RESIDUAL_PICK_SPAN = 0.030
 _USE_GUESSES_FIRST = True
 _VERBOSE = False
@@ -922,6 +922,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
