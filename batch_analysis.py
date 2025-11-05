@@ -12,7 +12,7 @@ from lmfit.models import GaussianModel, LinearModel
 WINDOW = 0.25
 
 # Sigma bounds
-MIN_SIGMA_ABS = 0.0015      # q units
+MIN_SIGMA_ABS = 0.002      # q units
 MAX_SIGMA_ABS = 0.025      # q units
 MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW (was 0.20)
 
@@ -481,4 +481,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
