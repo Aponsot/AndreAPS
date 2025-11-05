@@ -14,7 +14,7 @@ WINDOW = 0.35              # width of the fitting/plot window (q-units)
 GRAPH_CENTER = 3       # if None, defaults to mean(peaks). Set to a float to fix center for all frames.
 
 MIN_SIGMA_ABS = 0.001
-MAX_SIGMA_ABS = 0.025
+MAX_SIGMA_ABS = 0.027
 MAX_SIGMA_FRAC = 0.25
 
 ANCHOR_TOL = 0.005
@@ -657,3 +657,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
