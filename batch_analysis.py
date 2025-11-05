@@ -49,7 +49,7 @@ RESEED_SPAN = 0.060
 # ------------------------------
 # Internal sequential-fit constants (no new CLI knobs)
 # ------------------------------
-_AIC_IMPROVE = 6.0           # require meaningful AIC gain to add another peak
+_AIC_IMPROVE = 15           # require meaningful AIC gain to add another peak
 _MAX_PEAKS = 16              # hard cap to avoid runaway
 _RESIDUAL_PICK_SPAN = 0.030  # ±q span to snap to local residual max near each guess
 _USE_GUESSES_FIRST = True    # add peaks near supplied guesses in descending seed height
@@ -749,4 +749,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
