@@ -17,7 +17,7 @@ except Exception:
 # ------------------------------
 
 # Window (in q units) around the mean of specified peak positions
-WINDOW = 0.30
+WINDOW = 0.25
 
 # Sigma bounds
 MIN_SIGMA_ABS = 0.0015     # tightened to prevent needle peaks
@@ -685,6 +685,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
