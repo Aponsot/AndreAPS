@@ -21,7 +21,7 @@ ANCHOR_PEAK0 = True        # set False to let all centers float freely
 
 CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 
-HEIGHT_MIN = 5.0           # absolute floor (kept)
+HEIGHT_MIN = 2.0           # absolute floor (kept)
 HEIGHT_MIN_SIGMA = 3.0     # AND relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
@@ -616,3 +616,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
