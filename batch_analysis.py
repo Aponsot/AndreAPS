@@ -16,7 +16,7 @@ GRAPH_CENTER = 3.0            # if None uses mean(peaks). Set float to lock for 
 
 # Peak width caps
 MIN_SIGMA_ABS = 0.001
-MAX_SIGMA_ABS = 0.025
+MAX_SIGMA_ABS = 0.030
 MAX_SIGMA_FRAC = 0.25         # also cap sigma to this fraction of WINDOW
 
 # Anchoring
@@ -922,3 +922,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
