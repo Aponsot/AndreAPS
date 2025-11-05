@@ -18,13 +18,13 @@ MIN_SIGMA_ABS = 0.001      # q units
 MAX_SIGMA_ABS = 0.025      # q units
 MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW
 
-ANCHOR_TOL = 0.005         # q units around the first specified peak position
+ANCHOR_TOL = 0.015        # q units around the first specified peak position
 ANCHOR_PEAK0 = True        # set False to let all centers float freely
 
 CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 
 HEIGHT_MIN = 5.0           # absolute floor (kept)
-HEIGHT_MIN_SIGMA = 10     # AND relative floor: K * robust_sigma(y)
+HEIGHT_MIN_SIGMA = 1     # AND relative floor: K * robust_sigma(y)
 PRUNE_SMALL = True
 
 BASELINE_QUANTILE = 0.20
@@ -49,7 +49,7 @@ RESEED_SPAN = 0.060
 # ------------------------------
 # Internal sequential-fit constants (no new CLI knobs)
 # ------------------------------
-_AIC_IMPROVE = 15           # require meaningful AIC gain to add another peak
+_AIC_IMPROVE = 6.0           # require meaningful AIC gain to add another peak
 _MAX_PEAKS = 16              # hard cap to avoid runaway
 _RESIDUAL_PICK_SPAN = 0.030  # ±q span to snap to local residual max near each guess
 _USE_GUESSES_FIRST = True    # add peaks near supplied guesses in descending seed height
@@ -749,5 +749,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
