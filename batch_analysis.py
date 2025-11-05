@@ -12,8 +12,8 @@ from lmfit.models import GaussianModel, LinearModel
 WINDOW = 0.25
 
 # Sigma bounds
-MIN_SIGMA_ABS = 0.002      # q units
-MAX_SIGMA_ABS = 0.025      # q units
+MIN_SIGMA_ABS = 0.0015     # tightened to prevent needle peaks
+MAX_SIGMA_ABS = 0.025
 MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW (was 0.20)
 
 # Anchor for peak 0 every frame (optional)
@@ -23,9 +23,13 @@ ANCHOR_PEAK0 = True        # set False to let all centers float freely
 # Additional center drift limit for other peaks (prevents identity swapping)
 CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
 
+# Peak separation (discourage duplicate/overlapping solutions)
+MIN_SEP_Q = 0.006          # q units; try 0.004–0.010
+MERGE_MIN_SEP_FRAC = 0.8   # for optional post-fit merge step
+
 # Pruning threshold: remove peaks (set amplitude to 0) if height < threshold
 HEIGHT_MIN = 5.0           # absolute floor (kept)
-HEIGHT_MIN_SIGMA = 3.0     # AND relative floor: K * robust_sigma(y)
+HEIGHT_MIN_SIGMA = 4.0     # relative floor: K * robust_sigma(y) (was 3.0)
 PRUNE_SMALL = True
 
 # Background controls (robust linear background)
@@ -140,6 +144,13 @@ def _background_init(xw, yw, centers, exclude_radius, sigma_seeds=None):
     m = float(np.clip(m, -BKG_SLOPE_MAX_ABS, BKG_SLOPE_MAX_ABS))
     return m, float(b)
 
+def _enforce_min_separation(params, n_peaks, min_sep):
+    # keep ordering g0 <= g1 <= ... and enforce g(i) >= g(i-1) + min_sep
+    for i in range(1, n_peaks):
+        params[f"g{i}_center"].set(
+            expr=f"max(g{i-1}_center + {min_sep:.8f}, {params[f'g{i}_center'].value})"
+        )
+
 def build_model(xw, yw, centers, baseline, center_bounds):
     """
     Build a model with a linear background and Gaussian peaks at given centers.
@@ -147,7 +158,7 @@ def build_model(xw, yw, centers, baseline, center_bounds):
     Seeds for sigma/height are taken locally around each center for stability.
     """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
-    min_sigma_global = max(0.75 * dx, MIN_SIGMA_ABS)
+    min_sigma_global = max(1.00 * dx, MIN_SIGMA_ABS)  # tightened from 0.75*dx
     max_sigma_global = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
 
     # Precompute local seeds for each center
@@ -189,6 +200,9 @@ def build_model(xw, yw, centers, baseline, center_bounds):
         params[f"g{i}_sigma"].set(min=min_sig_i, max=max_sig_i)
         params[f"g{i}_amplitude"].set(min=0.0)
 
+    # Enforce a minimum separation between peak centers
+    _enforce_min_separation(params, n_peaks=len(centers), min_sep=MIN_SEP_Q)
+
     return model, params
 
 def extract_peaks(result):
@@ -207,6 +221,33 @@ def extract_peaks(result):
         })
         i += 1
     return peaks
+
+def _merge_close_peaks(peaks, min_sep_q, merge_min_sep_frac=0.8):
+    """
+    Return indices to zero-out based on proximity:
+    - if center distance < min_sep_q, drop smaller-height peak
+    - also drop if distance < merge_min_sep_frac * 0.5*(sigma_i + sigma_j)
+    """
+    n = len(peaks)
+    kill = set()
+    for i in range(n):
+        if i in kill:
+            continue
+        ci, si, hi = peaks[i]["center"], abs(peaks[i]["sigma"]), peaks[i]["height"]
+        for j in range(i+1, n):
+            if j in kill:
+                continue
+            cj, sj, hj = peaks[j]["center"], abs(peaks[j]["sigma"]), peaks[j]["height"]
+            d = abs(cj - ci)
+            close_by_resolution = (d < min_sep_q)
+            close_by_sigma = (d < merge_min_sep_frac * 0.5 * (si + sj))
+            if close_by_resolution or close_by_sigma:
+                if hi < hj or (hi == hj and peaks[i]["amplitude"] < peaks[j]["amplitude"]):
+                    kill.add(i)
+                    break
+                else:
+                    kill.add(j)
+    return sorted(kill)
 
 def _local_argmax(xw, yw, cx, span):
     """Return x position of the max intensity within ±span of cx; fall back to cx."""
@@ -345,6 +386,18 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
             r2 = compute_r2(yw, result.best_fit)
             peaks = extract_peaks(result)
 
+    # Optional proximity-merge & refit once (to kill duplicates)
+    to_kill = _merge_close_peaks(peaks, min_sep_q=MIN_SEP_Q, merge_min_sep_frac=MERGE_MIN_SEP_FRAC)
+    if to_kill:
+        params_refit = result.params.copy()
+        for i in to_kill:
+            params_refit[f"g{i}_amplitude"].set(value=0.0, vary=False)
+            params_refit[f"g{i}_center"].set(vary=False)
+            params_refit[f"g{i}_sigma"].set(vary=False)
+        result = model.fit(yw, params_refit, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
+        r2 = compute_r2(yw, result.best_fit)
+        peaks = extract_peaks(result)
+
     # --- Rescue path if the initial fit likely failed ---
     did_rescue = False
     if RESCUE_ENABLED:
@@ -444,18 +497,82 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
 
 
 # ------------------------------
-# Minimal CLI (single-frame only)
+# Map mode (run all frames, collect kept peaks, scatter plot)
+# ------------------------------
+
+def map_all_frames(h5_path, peak_positions, anchor_peak0=ANCHOR_PEAK0):
+    """
+    Runs fit_single_frame() for every frame (plot=False), collects all KEPT peaks,
+    and builds a scatter map: frame index vs center (q), colored by height.
+    """
+    with h5py.File(h5_path, "r") as f:
+        nframes = f["int"].shape[0]
+
+    # Per-peak storage
+    per_peak_frames = {i: [] for i in range(len(peak_positions))}
+    per_peak_centers = {i: [] for i in range(len(peak_positions))}
+    per_peak_heights = {i: [] for i in range(len(peak_positions))}
+    per_peak_r2 = {i: [] for i in range(len(peak_positions))}
+
+    # Iterate frames
+    for fr in range(nframes):
+        out = fit_single_frame(h5_path, fr, peak_positions, plot=False, anchor_peak0=anchor_peak0)
+        kept = out["rows"]  # [index, center, height, fwhm, amplitude]
+        r2 = out["r2"]
+
+        # Record kept peaks by their index
+        for (idx, center, height, _, _) in kept:
+            idx = int(idx)
+            per_peak_frames[idx].append(fr)
+            per_peak_centers[idx].append(center)
+            per_peak_heights[idx].append(height)
+            per_peak_r2[idx].append(r2)
+
+    # --- Plot map ---
+    plt.rcParams.update({
+        "figure.dpi": 160, "savefig.dpi": 300,
+        "font.size": 16, "axes.labelsize": 18, "axes.titlesize": 20,
+        "xtick.labelsize": 14, "ytick.labelsize": 14,
+    })
+    fig, ax = plt.subplots(figsize=(10.5, 6.2))
+
+    any_points = False
+    for i in range(len(peak_positions)):
+        if len(per_peak_frames[i]) == 0:
+            continue
+        any_points = True
+        sc = ax.scatter(per_peak_frames[i], per_peak_centers[i],
+                        c=per_peak_heights[i], s=16, alpha=0.9, label=f"Peak {i+1}")
+    if any_points:
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label("Peak height (a.u.)")
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Center q (1/Å)")
+    ax.set_title("Peak Map: center vs frame (color = height)")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="best")
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------------------
+# CLI
 # ------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fit Gaussian peaks (linear background) in a single frame"
+        description="Fit Gaussian peaks (linear background) for a single frame or build a map across frames"
     )
     parser.add_argument("h5", help="HDF5 file with 'q' or 'tth' and 'int' datasets")
     parser.add_argument("peaks", type=float, nargs='+',
                         help="Peak q-positions (e.g., 3.025 3.012)")
-    parser.add_argument("--frame", type=int, required=True,
-                        help="Frame index to fit and show plot")
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--frame", type=int,
+                      help="Frame index to fit and show plot (single-frame mode)")
+    mode.add_argument("--map", action="store_true",
+                      help="Run over all frames and plot a scatter map (center vs frame, color=height)")
+
     parser.add_argument("--no-anchor", action="store_true",
                         help="Do not anchor peak 0; let all centers float within the window")
 
@@ -466,20 +583,21 @@ def main():
     print(f"Window: {WINDOW} q | Anchor tol (peak 0): {ANCHOR_TOL} q | anchor={'off' if args.no_anchor else 'on'}")
     print(f"height_min: {HEIGHT_MIN} | height_min_sigma: {HEIGHT_MIN_SIGMA}*robust_sigma")
     print(f"Sigma bounds: [{MIN_SIGMA_ABS}, {min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)}] q")
+    print(f"Min peak separation: {MIN_SEP_Q} q")
     print(f"Background: BASELINE_QUANTILE={BASELINE_QUANTILE}, EXCLUDE_RADIUS={BKG_EXCLUDE_RADIUS}, "
           f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
-    print(f"Center tol (non-anchored peaks): ±{CENTER_TOL} q")
     if RESCUE_ENABLED:
         print(f"Rescue: R2<{RESCUE_R2_MIN} or kept<{RESCUE_MIN_KEPT} -> expand_window×{RESCUE_EXPAND_WINDOW}, "
               f"center_tol=±{RESCUE_CENTER_TOL}, MAX_SIGMA_FRAC={RESCUE_MAX_SIGMA_FRAC}, reseed±{RESEED_SPAN}")
 
-    fit_single_frame(
-        args.h5, args.frame, peak_positions,
-        plot=True, anchor_peak0=(not args.no_anchor)
-    )
+    if args.map:
+        map_all_frames(args.h5, peak_positions, anchor_peak0=(not args.no_anchor))
+    else:
+        fit_single_frame(
+            args.h5, args.frame, peak_positions,
+            plot=True, anchor_peak0=(not args.no_anchor)
+        )
 
 if __name__ == "__main__":
     main()
-
-
