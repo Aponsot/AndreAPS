@@ -14,24 +14,33 @@ WINDOW = 0.25
 # Sigma bounds
 MIN_SIGMA_ABS = 0.001      # q units
 MAX_SIGMA_ABS = 0.025      # q units
-MAX_SIGMA_FRAC = 0.20      # also cap sigma to this fraction of WINDOW
+MAX_SIGMA_FRAC = 0.25      # also cap sigma to this fraction of WINDOW (was 0.20)
 
 # Anchor for peak 0 every frame (optional)
 ANCHOR_TOL = 0.005         # q units around the first specified peak position
 ANCHOR_PEAK0 = True        # set False to let all centers float freely
 
-# Pruning threshold: remove peaks (set amplitude to 0) if height < HEIGHT_MIN
-HEIGHT_MIN = 5.0
+# Additional center drift limit for other peaks (prevents identity swapping)
+CENTER_TOL = 0.020         # q units allowed drift from each guess for peaks i>0
+
+# Pruning threshold: remove peaks (set amplitude to 0) if height < threshold
+HEIGHT_MIN = 5.0           # absolute floor (kept)
+HEIGHT_MIN_SIGMA = 3.0     # AND relative floor: K * robust_sigma(y)
+
 PRUNE_SMALL = True
 
 # Background controls (robust linear background)
 BASELINE_QUANTILE = 0.20       # lower quantile baseline for sigma/height seeding
-BKG_EXCLUDE_RADIUS = 0.010     # exclude q around each peak when estimating background
+BKG_EXCLUDE_RADIUS = 0.010     # baseline min exclusion (will scale with sigma seeds)
 BKG_TRIM_FRACTION = 0.30       # trimmed regression fraction
 BKG_SLOPE_MAX_ABS = 2.0        # hard cap on background slope (intensity per q)
 
 # Use robust loss in least-squares to reduce outlier impact
 USE_ROBUST_LOSS = True
+
+# Optional: per-peak sigma bounds (leave None to use global logic)
+PEAK_SIGMA_MIN = None  # e.g., [0.001, 0.002]
+PEAK_SIGMA_MAX = None  # e.g., [0.030, 0.060]
 
 
 # ------------------------------
@@ -58,30 +67,35 @@ def _window_data(x, yfull, peak_positions):
         raise ValueError("Too few points in window.")
     return center, half, xw, yw
 
-def _estimate_sigma0(xw, yw, baseline, cx):
-    # Estimate initial sigma from a local FWHM around cx using half-maximum
-    if xw.size < 3:
-        return max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
-    p = np.argmin(np.abs(xw - cx))
-    ypk = yw[p]
-    h = max(ypk - baseline, robust_sigma(yw))
-    half_level = baseline + 0.5 * h
-    # search left
-    xl = xw[0]
-    for i in range(p, 0, -1):
-        if yw[i] <= half_level and yw[i-1] > half_level:
-            t = (half_level - yw[i]) / (yw[i-1] - yw[i] + 1e-16)
-            xl = xw[i] + t * (xw[i-1] - xw[i])
-            break
-    # search right
-    xr = xw[-1]
-    for i in range(p, len(xw)-1):
-        if yw[i] > half_level and yw[i+1] <= half_level:
-            t = (half_level - yw[i+1]) / (yw[i] - yw[i+1] + 1e-16)
-            xr = xw[i+1] + t * (xw[i] - xw[i+1])
-            break
-    fwhm = max(xr - xl, np.mean(np.diff(xw)))
-    return max(fwhm / 2.354820045, MIN_SIGMA_ABS)
+def _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010):
+    """
+    Robust local seeds for sigma and height using a small neighborhood around cx.
+    Uses upper-quantile intensity to avoid single-point noise/shoulders dominating.
+    """
+    m = np.abs(xw - cx) <= w
+    if not np.any(m):
+        # fallback to grid scale
+        sigma0 = max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
+        height0 = max(np.max(yw) - baseline, robust_sigma(yw))
+        return sigma0, height0
+
+    xloc = xw[m]
+    yloc = yw[m]
+    ypk = np.quantile(yloc, 0.9)
+    height0 = max(ypk - baseline, robust_sigma(yw))
+
+    half = baseline + 0.5 * (ypk - baseline)
+    # points above half
+    above = yloc >= half
+    if np.any(above):
+        xl = np.min(xloc[above])
+        xr = np.max(xloc[above])
+        fwhm = max(xr - xl, np.mean(np.diff(xw)))
+    else:
+        fwhm = max(np.mean(np.diff(xw)), MIN_SIGMA_ABS)
+
+    sigma0 = max(fwhm / 2.354820045, MIN_SIGMA_ABS)
+    return sigma0, height0
 
 def _robust_line_fit(x, y, max_iter=4, trim_frac=0.30):
     # Simple trimmed regression: fit, trim largest residuals, refit
@@ -95,16 +109,27 @@ def _robust_line_fit(x, y, max_iter=4, trim_frac=0.30):
         m, b = np.polyfit(x[keep], y[keep], 1)
     return float(m), float(b)
 
-def _background_init(xw, yw, centers, exclude_radius):
+def _background_init(xw, yw, centers, exclude_radius, sigma_seeds=None):
+    """
+    Trimmed linear background seeded from off-peak points.
+    Exclude around each center by max(exclude_radius, 2.5 * sigma_seed) if seeds provided.
+    """
+    if sigma_seeds is not None:
+        radii = [max(exclude_radius, 2.5 * max(s, MIN_SIGMA_ABS)) for s in sigma_seeds]
+    else:
+        radii = [exclude_radius] * len(centers)
+
     mask = np.ones_like(xw, dtype=bool)
-    for cx in centers:
-        mask &= (np.abs(xw - cx) > exclude_radius)
+    for cx, rad in zip(centers, radii):
+        mask &= (np.abs(xw - cx) > rad)
+
     if mask.sum() >= max(5, int(0.2 * len(xw))):
         m, b = _robust_line_fit(xw[mask], yw[mask], trim_frac=BKG_TRIM_FRACTION)
     else:
         # Fallback if not enough off-peak points: use flat baseline near lower envelope
         m = 0.0
         b = np.quantile(yw, BASELINE_QUANTILE)
+
     # Bound slope reasonably
     m = float(np.clip(m, -BKG_SLOPE_MAX_ABS, BKG_SLOPE_MAX_ABS))
     return m, float(b)
@@ -113,38 +138,49 @@ def build_model(xw, yw, centers, baseline, center_bounds):
     """
     Build a model with a linear background and Gaussian peaks at given centers.
     Background slope is initialized robustly and capped to avoid runaway tilt.
+    Seeds for sigma/height are taken locally around each center for stability.
     """
     dx = np.mean(np.diff(xw)) if len(xw) > 1 else WINDOW
-    min_sigma = max(0.75 * dx, MIN_SIGMA_ABS)
-    max_sigma = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
+    min_sigma_global = max(0.75 * dx, MIN_SIGMA_ABS)
+    max_sigma_global = min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)
 
-    # Robust background init
-    init_slope, init_intercept = _background_init(xw, yw, centers, BKG_EXCLUDE_RADIUS)
+    # Precompute local seeds for each center
+    sigma0_list = []
+    height0_list = []
+    for cx in centers:
+        sigma0_est, height0 = _local_height_sigma_seeds(xw, yw, baseline, cx, w=0.010)
+        sigma0_clipped = np.clip(sigma0_est, min_sigma_global, max_sigma_global)
+        sigma0_list.append(float(sigma0_clipped))
+        height0_list.append(float(height0))
+
+    # Robust background init (exclude scaled by sigma seeds)
+    init_slope, init_intercept = _background_init(
+        xw, yw, centers, BKG_EXCLUDE_RADIUS, sigma_seeds=sigma0_list
+    )
     bkg = LinearModel(prefix="bkg_")
     model = bkg
     params = bkg.make_params(slope=init_slope, intercept=init_intercept)
     params["bkg_slope"].set(min=-BKG_SLOPE_MAX_ABS, max=BKG_SLOPE_MAX_ABS, value=init_slope, vary=True)
     params["bkg_intercept"].set(value=init_intercept, vary=True)
 
-    for i, cx in enumerate(centers):
+    # Add Gaussians
+    for i, (cx, sigma0, height0) in enumerate(zip(centers, sigma0_list, height0_list)):
         gi = GaussianModel(prefix=f"g{i}_")
         model += gi
 
-        # Initial estimates
-        sigma0_est = _estimate_sigma0(xw, yw, baseline, cx)
-        sigma0 = np.clip(sigma0_est, min_sigma, max_sigma)
+        # Per-peak sigma bounds if provided, else global
+        min_sig_i = min_sigma_global if PEAK_SIGMA_MIN is None else max(min_sigma_global, PEAK_SIGMA_MIN[i])
+        max_sig_i = max_sigma_global if PEAK_SIGMA_MAX is None else min(max_sigma_global, PEAK_SIGMA_MAX[i])
 
-        # Height/amplitude from initial sigma
-        p = np.argmin(np.abs(xw - cx))
-        ypk = yw[p]
-        height0 = max(ypk - baseline, robust_sigma(yw))
-        amp0 = height0 * sigma0 * np.sqrt(2 * np.pi)
-
+        amp0 = max(height0, 0.0) * sigma0 * np.sqrt(2 * np.pi)
         cmin, cmax = center_bounds[i]
-        params.update(gi.make_params(center=np.clip(cx, cmin, cmax), sigma=sigma0, amplitude=max(amp0, 0.0)))
+
+        params.update(gi.make_params(center=np.clip(cx, cmin, cmax),
+                                     sigma=sigma0,
+                                     amplitude=max(amp0, 0.0)))
 
         params[f"g{i}_center"].set(min=cmin, max=cmax)
-        params[f"g{i}_sigma"].set(min=min_sigma, max=max_sigma)
+        params[f"g{i}_sigma"].set(min=min_sig_i, max=max_sig_i)
         params[f"g{i}_amplitude"].set(min=0.0)
 
     return model, params
@@ -190,15 +226,17 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
 
     # Lower-quantile baseline for robust sigma/height seeding
     baseline = np.quantile(yw, BASELINE_QUANTILE)
+    noise = robust_sigma(yw)
 
-    # Center bounds: free within window; optionally anchor peak 0
+    # Center bounds: anchor peak 0 tightly; others near their guesses to avoid identity swaps
     center_bounds = []
     for i, cx in enumerate(peak_positions):
         if anchor_peak0 and i == 0:
             cmin = max(xmin, cx - ANCHOR_TOL)
             cmax = min(xmax, cx + ANCHOR_TOL)
         else:
-            cmin, cmax = xmin, xmax
+            cmin = max(xmin, cx - CENTER_TOL)
+            cmax = min(xmax, cx + CENTER_TOL)
         if cmin > cmax:
             cmin, cmax = min(cmin, cmax), max(cmin, cmax)
         center_bounds.append((cmin, cmax))
@@ -206,18 +244,19 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     # Robust loss config
     loss_kwargs = {}
     if USE_ROBUST_LOSS:
-        loss_kwargs = {"loss": "soft_l1", "f_scale": robust_sigma(yw)}
+        loss_kwargs = {"loss": "soft_l1", "f_scale": noise}
 
     # Build and fit
     model, params = build_model(xw, yw, peak_positions, baseline, center_bounds)
     result = model.fit(yw, params, x=xw, calc_covar=False, method="least_squares", max_nfev=800, **loss_kwargs)
     r2 = compute_r2(yw, result.best_fit)
 
-    # Optional pruning and refit
+    # Optional pruning and refit (noise-aware threshold)
     peaks = extract_peaks(result)
     pruned_indices = []
     if PRUNE_SMALL:
-        pruned_indices = [p["index"] for p in peaks if p["height"] < HEIGHT_MIN]
+        thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
+        pruned_indices = [p["index"] for p in peaks if p["height"] < thresh]
         if len(pruned_indices) > 0:
             params_refit = result.params.copy()
             for i in pruned_indices:
@@ -232,7 +271,8 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
     bkg_intercept = result.params["bkg_intercept"].value
 
     # Kept peaks for table
-    kept = [p for p in peaks if p["height"] >= HEIGHT_MIN]
+    thresh = max(HEIGHT_MIN, HEIGHT_MIN_SIGMA * noise)
+    kept = [p for p in peaks if p["height"] >= thresh]
     rows = [[p["index"], p["center"], p["height"], p["fwhm"], p["amplitude"]] for p in kept]
 
     if plot:
@@ -259,7 +299,7 @@ def fit_single_frame(h5_path, frame, peak_positions, plot=True, anchor_peak0=ANC
 
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity")
-        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f} | height_min={HEIGHT_MIN}")
+        ax.set_title(f"Frame {frame} | {len(kept)} kept peaks | R²={r2:.4f} | height_min=max({HEIGHT_MIN}, {HEIGHT_MIN_SIGMA}·σ)")
         ax.legend(loc="best")
         ax.grid(alpha=0.3)
         ax.set_xlim(center - half, center + half)
@@ -309,11 +349,12 @@ def main():
 
     print(f"Peaks: {peak_positions}")
     print(f"Window: {WINDOW} q | Anchor tol (peak 0): {ANCHOR_TOL} q | anchor={'off' if args.no_anchor else 'on'}")
-    print(f"height_min: {HEIGHT_MIN}")
+    print(f"height_min: {HEIGHT_MIN} | height_min_sigma: {HEIGHT_MIN_SIGMA}*robust_sigma")
     print(f"Sigma bounds: [{MIN_SIGMA_ABS}, {min(MAX_SIGMA_ABS, MAX_SIGMA_FRAC * WINDOW)}] q")
     print(f"Background: BASELINE_QUANTILE={BASELINE_QUANTILE}, EXCLUDE_RADIUS={BKG_EXCLUDE_RADIUS}, "
           f"TRIM_FRAC={BKG_TRIM_FRACTION}, SLOPE_CAP={BKG_SLOPE_MAX_ABS}, "
           f"ROBUST_LOSS={'on' if USE_ROBUST_LOSS else 'off'}")
+    print(f"Center tol (non-anchored peaks): ±{CENTER_TOL} q")
 
     fit_single_frame(
         args.h5, args.frame, peak_positions,
@@ -322,4 +363,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
