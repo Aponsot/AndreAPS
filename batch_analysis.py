@@ -11,7 +11,7 @@ from lmfit.models import GaussianModel, LinearModel
 # ==============================
 
 # Windowing / view
-WINDOW = 0.35                 # width of fitting+plot window (q-units)
+WINDOW = 0.25                 # width of fitting+plot window (q-units)
 GRAPH_CENTER = 3.0            # if None uses mean(peaks). Set float to lock for all frames.
 
 # Peak width caps
@@ -922,6 +922,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
