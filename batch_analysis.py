@@ -15,7 +15,10 @@ from lmfit.models import GaussianModel, LinearModel
 # ------------------------------
 WINDOW = 0.50       # half-width to each side around each seed (q-units)
 MIN_POINTS = 8      # minimum points in the combined window to attempt a fit
-PEAK_HEIGHT_MIN = 5.0  # minimum peak max intensity for reporting/plotting
+
+# Minimum "peak requirement" — interpreted as the **fitted height above background**
+# (NOT raw data). Peaks with fitted height < PEAK_HEIGHT_MIN are omitted.
+PEAK_HEIGHT_MIN = 5.0
 
 # ------------------------------
 # Helpers
@@ -53,63 +56,105 @@ def combined_window_mask(x, centers, halfwidth):
     return (x >= lo) & (x <= hi)
 
 def initial_params_for_frame(xw, yw, centers, halfwidth):
+    # background initial guess
     try:
         bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
     except Exception:
         bkg_slope, bkg_intercept = 0.0, float(np.median(yw))
+
     model = LinearModel(prefix="bkg_")
     params = model.make_params(bkg_slope=bkg_slope, bkg_intercept=bkg_intercept)
+
     span = max(xw[-1] - xw[0], 1e-9)
-    sigma0 = max(span / (7.0 * len(centers)), 1e-6)
+    sigma0 = max(span / (7.0 * len(centers)), 1e-6)  # narrower as #peaks grows
+
+    # Add one Gaussian per peak
     for i, c0 in enumerate(centers):
         g = GaussianModel(prefix=f"g{i}_")
         model = model + g
+
+        # pick a point nearest the seed to estimate amplitude
         idx = np.abs(xw - c0).argmin()
         y_at_seed = yw[idx]
         y_bkg_at_seed = bkg_slope * xw[idx] + bkg_intercept
         height0 = max(y_at_seed - y_bkg_at_seed, np.std(yw) * 0.5)
+
+        # amplitude ~ height * sigma * sqrt(2π)
         amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
+
         params.update(g.make_params(center=c0, sigma=sigma0, amplitude=amp0))
         params[f"g{i}_sigma"].set(min=1e-6, max=max(span, 1.0))
         params[f"g{i}_amplitude"].set(min=0.0)
         params[f"g{i}_center"].set(min=c0 - 0.6*halfwidth, max=c0 + 0.6*halfwidth)
+
     return model, params
 
-def _max_intensity_near_center(xw, yw, center, fwhm):
-    if not np.isfinite(fwhm) or fwhm <= 0:
-        span = max(xw[-1] - xw[0], 1e-12)
-        half = 0.01 * span
-    else:
-        half = 0.5 * fwhm
-    m = (xw >= center - half) & (xw <= center + half)
-    if not np.any(m):
-        idx = np.abs(xw - center).argmin()
-        return float(yw[idx])
-    return float(np.max(yw[m]))
+def _gaussian_y(x, amp, cen, sig):
+    # pure Gaussian (area-normalized amplitude)
+    return amp * np.exp(-(x - cen)**2 / (2.0 * sig**2))
 
 def fit_frame(x, y, centers, halfwidth):
+    """
+    Fit one frame; returns:
+      centers, fwhm, height_fit (above background), peak_fit (background+height at center),
+      component_curves (list of y arrays for bkg + each gaussian), yfit, xw/yw, success, result
+    """
     m = combined_window_mask(x, centers, halfwidth)
     if not np.any(m):
         return {"success": False}
+
     xw, yw = x[m], y[m]
     if xw.size < MIN_POINTS:
         return {"success": False}
+
     model, params = initial_params_for_frame(xw, yw, centers, halfwidth)
     try:
         result = model.fit(yw, params, x=xw, nan_policy="omit")
-        out_centers, out_fwhm, out_maxI = [], [], []
+
+        # background line over xw
+        bkg_slope = result.params.get("bkg_slope").value if "bkg_slope" in result.params else 0.0
+        bkg_intercept = result.params.get("bkg_intercept").value if "bkg_intercept" in result.params else 0.0
+        bkg_line = bkg_slope * xw + bkg_intercept
+
+        out_centers, out_fwhm, out_hfit, out_peakfit = [], [], [], []
+        component_curves = []  # each = bkg_line + that gaussian
+
         for i in range(len(centers)):
-            sigma_i = result.params[f"g{i}_sigma"].value
-            center_i = result.params[f"g{i}_center"].value
-            fwhm_i = sigma_to_fwhm(sigma_i) if np.isfinite(sigma_i) else np.nan
-            out_centers.append(center_i)
+            amp_i = result.params[f"g{i}_amplitude"].value
+            cen_i = result.params[f"g{i}_center"].value
+            sig_i = result.params[f"g{i}_sigma"].value
+
+            # FWHM
+            fwhm_i = sigma_to_fwhm(sig_i) if np.isfinite(sig_i) else np.nan
+
+            # fitted height above bkg at the center: amp = height * sigma * sqrt(2π)
+            if np.isfinite(sig_i) and sig_i > 0:
+                height_fit_i = amp_i / (sig_i * np.sqrt(2.0 * np.pi))
+            else:
+                height_fit_i = np.nan
+
+            # peak value at the center (background + height)
+            peak_fit_i = (bkg_slope * cen_i + bkg_intercept) + (height_fit_i if np.isfinite(height_fit_i) else 0.0)
+
+            out_centers.append(cen_i)
             out_fwhm.append(fwhm_i)
-            out_maxI.append(_max_intensity_near_center(xw, yw, center_i, fwhm_i))
+            out_hfit.append(height_fit_i)
+            out_peakfit.append(peak_fit_i)
+
+            # component curve (bkg + gaussian) to plot as dotted line
+            if np.all(np.isfinite([amp_i, cen_i, sig_i])):
+                comp = bkg_line + _gaussian_y(xw, amp_i, cen_i, sig_i)
+            else:
+                comp = np.full_like(xw, np.nan, dtype=float)
+            component_curves.append(comp)
+
         return {
             "success": True,
             "centers": np.array(out_centers, float),
             "fwhm": np.array(out_fwhm, float),
-            "max_int": np.array(out_maxI, float),
+            "height_fit": np.array(out_hfit, float),   # fitted height above background
+            "peak_fit": np.array(out_peakfit, float),  # fitted peak value at the center (bkg+height)
+            "components": component_curves,            # list of arrays: bkg + that gaussian
             "xw": xw,
             "yw": yw,
             "yfit": result.best_fit,
@@ -158,15 +203,20 @@ def main():
             print("Fit failed for the requested frame.")
             return
 
-        valid = res["max_int"] >= PEAK_HEIGHT_MIN
+        # Omit peaks using **fitted height above background**
+        valid = res["height_fit"] >= PEAK_HEIGHT_MIN
         centers_v = res["centers"][valid]
         fwhm_v = res["fwhm"][valid]
-        maxI_v = res["max_int"][valid]
+        hfit_v = res["height_fit"][valid]
+        pfit_v = res["peak_fit"][valid]
+        comps_v = [res["components"][i] for i, ok in enumerate(valid) if ok]
 
         print(f"# Frame {args.frame}")
-        for i_vis, (c, w, h) in enumerate(zip(centers_v, fwhm_v, maxI_v)):
-            print(f"peak{i_vis}_center={c:.6f}, peak{i_vis}_FWHM={w:.6f}, peak{i_vis}_maxI={h:.6f}")
+        for i_vis, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v)):
+            print(f"peak{i_vis}_center={c:.6f}, peak{i_vis}_FWHM={w:.6f}, "
+                  f"peak{i_vis}_height_fit={h:.6f}, peak{i_vis}_peak_fit={p:.6f}")
 
+        # Plot
         apply_nature_style()
         from matplotlib.gridspec import GridSpec
         fig = plt.figure(figsize=(6.2, 4.6))
@@ -176,16 +226,9 @@ def main():
         ax.plot(res["xw"], res["yw"], lw=1.0, label="data")
         ax.plot(res["xw"], res["yfit"], lw=1.2, label="fit")
 
-        # Plot each individual Gaussian as a faint dotted line
-        for i in range(len(centers0)):
-            prefix = f"g{i}_"
-            if prefix + "amplitude" in res["result"].params:
-                amp = res["result"].params[prefix + "amplitude"].value
-                cen = res["result"].params[prefix + "center"].value
-                sig = res["result"].params[prefix + "sigma"].value
-                if np.isfinite(amp) and np.isfinite(sig) and np.isfinite(cen):
-                    g_curve = amp * np.exp(-(res["xw"] - cen)**2 / (2 * sig**2))
-                    ax.plot(res["xw"], g_curve, ":", lw=0.8, alpha=0.5, label=None)
+        # Plot each valid component as faint dotted (bkg + that Gaussian)
+        for comp in comps_v:
+            ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.6, label=None)
 
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.6, lw=0.9)
@@ -196,12 +239,12 @@ def main():
         ax.minorticks_on()
         ax.legend(fontsize=8, ncol=2)
 
-        # Table axis
+        # Table: fitted values only
         ax_tbl = fig.add_subplot(gs[1])
         ax_tbl.axis("off")
-        table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}"]
-                      for i, (c, w, h) in enumerate(zip(centers_v, fwhm_v, maxI_v))]
-        col_labels = ["Peak", "Center", "FWHM", "Max Intensity"]
+        table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
+                      for i, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v))]
+        col_labels = ["Peak", "Center", "FWHM", "Height (fit)", "Peak@Center (fit)"]
 
         tbl = ax_tbl.table(cellText=table_data, colLabels=col_labels, loc="center")
         tbl.auto_set_font_size(False)
@@ -216,11 +259,12 @@ def main():
         plt.show()
         return
 
-    # otherwise track all frames
+    # otherwise, track all frames
     nuse = nframes
     npeaks = len(centers0)
     centers_trk = np.full((nuse, npeaks), np.nan)
     fwhm_trk = np.full((nuse, npeaks), np.nan)
+
     seeds = centers0.copy()
     for f in range(nuse):
         y = I_full[f]
@@ -228,13 +272,15 @@ def main():
         if not res["success"]:
             res = fit_frame(x, y, seeds, WINDOW)
         if res["success"]:
-            valid = res["max_int"] >= PEAK_HEIGHT_MIN
+            # enforce omission by **fitted height**
+            valid = res["height_fit"] >= PEAK_HEIGHT_MIN
             tmp_c = res["centers"].copy()
             tmp_w = res["fwhm"].copy()
             tmp_c[~valid] = np.nan
             tmp_w[~valid] = np.nan
             centers_trk[f, :] = tmp_c
             fwhm_trk[f, :] = tmp_w
+            # update seeds only for peaks that remained valid; keep prior seeds otherwise
             seeds = np.where(valid, res["centers"], seeds)
 
     base = os.path.splitext(os.path.basename(args.h5))[0]
