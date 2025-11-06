@@ -19,6 +19,10 @@ WINDOW = 0.50       # half-width to each side around each seed (q-units)
 MIN_POINTS = 8      # minimum points in the combined window to attempt a fit
 MAX_FRAMES = 10**9  # effectively "no cap" unless set smaller
 
+# NEW: minimum peak height used for initial guesses (in intensity units, above bkg)
+# Set to 0.0 to keep behavior identical to before.
+PEAK_HEIGHT_MIN = 0.0
+
 # ------------------------------
 # Helpers
 # ------------------------------
@@ -88,7 +92,9 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
         idx = np.abs(xw - c0).argmin()
         y_at_seed = yw[idx]
         y_bkg_at_seed = bkg_slope * xw[idx] + bkg_intercept
-        height0 = max(y_at_seed - y_bkg_at_seed, np.std(yw) * 0.5)
+
+        # NEW: floor the height guess by PEAK_HEIGHT_MIN
+        height0 = max(y_at_seed - y_bkg_at_seed, np.std(yw) * 0.5, PEAK_HEIGHT_MIN)
 
         # crude amplitude guess ~ height * sigma * sqrt(2pi)
         amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
@@ -170,8 +176,8 @@ def main():
         for i, (c, w) in enumerate(zip(res["centers"], res["fwhm"])):
             print(f"peak{i}_center={c:.6f}, peak{i}_FWHM={w:.6f}")
 
-        # Quick plot to visually confirm
-        fig, ax = plt.subplots(figsize=(7,4.2), dpi=160)
+        # Quick plot to visually confirm + table below with center/FWHM
+        fig, ax = plt.subplots(figsize=(7,4.8), dpi=160)
         ax.plot(res["xw"], res["yw"], lw=1.0, label="data")
         ax.plot(res["xw"], res["yfit"], lw=1.5, label="fit")
         for i, c in enumerate(res["centers"]):
@@ -180,6 +186,21 @@ def main():
         ax.set_ylabel("Intensity (a.u.)")
         ax.set_title(f"Frame {args.frame} multi-peak fit")
         ax.legend(fontsize=9)
+
+        # Build a small table of centers & FWHMs below the plot
+        table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}"]
+                      for i, (c, w) in enumerate(zip(res["centers"], res["fwhm"]))]
+        col_labels = ["Peak", "Center", "FWHM"]
+
+        # leave room at bottom for table
+        fig.subplots_adjust(bottom=0.32)
+        the_table = ax.table(cellText=table_data,
+                             colLabels=col_labels,
+                             loc="lower center",
+                             bbox=[0.0, -0.42, 1.0, 0.35])  # [left, bottom, width, height] in axes coords
+        the_table.auto_set_font_size(False)
+        the_table.set_fontsize(8)
+
         fig.tight_layout()
         plt.show()
         return
