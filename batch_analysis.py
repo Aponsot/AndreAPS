@@ -39,9 +39,9 @@ MIN_SEP = 0.010        # min separation from existing peaks (x units)
 AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
 
 # Plotting preferences
-PANEL_LABEL = "a"           # set "" to hide
+PANEL_LABEL = ""           # set "" to hide
 SHOW_SEEDS = True           # show input seeds as light-blue vlines
-SEC_PER_FRAME = None        # e.g., 0.01 -> title "t sec | R²=..."
+SEC_PER_FRAME = .004       # e.g., 0.01 -> title "t sec | R²=..."
 PLOT_ONLY_VALID_COMPONENTS = False  # if True, only components that pass PEAK_HEIGHT_MIN are drawn
 SHOW_COMPONENT_SUM = True   # draw thin black line of (background + sum(components))
 LEGEND_COLS = 3
@@ -368,12 +368,7 @@ def main():
 
         # optional check: background + sum(components) overlays the fit
         if SHOW_COMPONENT_SUM:
-            ax.plot(res["xw"], res["comp_sum"], lw=0.9, color="k", alpha=0.6, label="Bkg + Σ comps")
-
-        # seed guide lines (optional)
-        if SHOW_SEEDS:
-            for s in seeds0:
-                ax.axvline(s, color="#7ec8ff", lw=0.9, alpha=0.7)
+            ax.plot(res["xw"], res["comp_sum"], lw=0.9, color="k", alpha=0.6, label="Idividual Guassian Fit")
 
         # fitted centers (for visible peaks)
         for c in centers_v:
@@ -506,3 +501,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
