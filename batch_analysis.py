@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Multi-peak tracker with residual-added shoulder, global sigma bounds,
 # fitted-height filtering, asymmetric seed-shift limits, polished plotting,
-# and tqdm progress for mapping.
+# component-sum check, tqdm progress, and bound-hit diagnostics.
 
 import argparse, os
 import numpy as np
@@ -28,8 +28,8 @@ SIGMA_MAX_FIT = 0.080  # raise to allow broad shoulders
 
 # Asymmetric per-frame seed shift limits (relative to current seed)
 # center_i ∈ [seed_i - CENTER_SHIFT_NEG, seed_i + CENTER_SHIFT_POS]
-CENTER_SHIFT_NEG = 0.10
-CENTER_SHIFT_POS = 0.0050
+CENTER_SHIFT_NEG = 0.030
+CENTER_SHIFT_POS = 0.010
 
 # Residual-shoulder controls
 ENABLE_RESIDUAL_SHOULDER = True
@@ -37,10 +37,12 @@ RESIDUAL_SNR = 3.0     # residual SNR threshold
 MIN_SEP = 0.010        # min separation from existing peaks (x units)
 AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
 
-# Plotting preferences (Nature-ish)
-PANEL_LABEL = ""      # set "" to hide
-SHOW_SEEDS = True      # show input seeds as light-blue vlines
-SEC_PER_FRAME = .04   # e.g., 0.01 -> title "t sec | R²=..." else "Frame N | R²=..."
+# Plotting preferences
+PANEL_LABEL = ""           # set "" to hide
+SHOW_SEEDS = True           # show input seeds as light-blue vlines
+SEC_PER_FRAME = 0.004        # e.g., 0.01 -> title "t sec | R²=..."
+PLOT_ONLY_VALID_COMPONENTS = False  # if True, only components that pass PEAK_HEIGHT_MIN are drawn
+SHOW_COMPONENT_SUM = True   # draw thin black line of (background + sum(components))
 
 # ------------------------------
 # Helpers
@@ -125,6 +127,7 @@ def initial_params_for_frame(xw, yw, seeds, halfwidth):
     return model, params
 
 def _gaussian_y(x, amp, cen, sig):
+    # pure Gaussian component (no background)
     return amp * np.exp(-(x - cen)**2 / (2.0 * sig**2))
 
 def _compute_fitted_metrics(result, xw):
@@ -153,7 +156,16 @@ def _compute_fitted_metrics(result, xw):
             fwhm[j] = sigma_to_fwhm(sigmas[j])
         peakfit[j] = (bkg_slope * centers[j] + bkg_intercept) + (heights[j] if np.isfinite(heights[j]) else 0.0)
 
-    return bkg_line, centers, sigmas, amps, heights, fwhm, peakfit
+    # component curves (pure Gaussians) and their sum
+    comps = []
+    for a, c, s in zip(amps, centers, sigmas):
+        if np.all(np.isfinite([a, c, s])):
+            comps.append(_gaussian_y(xw, a, c, s))
+        else:
+            comps.append(np.full_like(xw, np.nan, float))
+    comps = comps if len(comps) else []
+
+    return bkg_line, centers, sigmas, amps, heights, fwhm, peakfit, comps
 
 def _try_add_shoulder(xw, yw, model, result):
     resid = yw - result.best_fit
@@ -167,7 +179,7 @@ def _try_add_shoulder(xw, yw, model, result):
         return model, result, False
 
     x0 = xw[idx]
-    _, centers, sigmas, amps, heights, fwhm, peakfit = _compute_fitted_metrics(result, xw)
+    _, centers, sigmas, amps, heights, fwhm, peakfit, _ = _compute_fitted_metrics(result, xw)
     if centers.size and np.min(np.abs(centers - x0)) < MIN_SEP:
         return model, result, False
 
@@ -193,7 +205,7 @@ def _try_add_shoulder(xw, yw, model, result):
     new_result = new_model.fit(yw, new_params, x=xw, nan_policy="omit")
 
     dAIC = new_result.aic - result.aic   # negative is better
-    _, c_new, s_new, a_new, h_new, f_new, p_new = _compute_fitted_metrics(new_result, xw)
+    _, c_new, s_new, a_new, h_new, f_new, p_new, _ = _compute_fitted_metrics(new_result, xw)
     if c_new.size <= new_idx:
         return model, result, False
     new_height = h_new[new_idx]
@@ -201,6 +213,17 @@ def _try_add_shoulder(xw, yw, model, result):
     if (dAIC <= -AIC_IMPROVE) and np.isfinite(new_height) and (new_height >= PEAK_HEIGHT_MIN):
         return new_model, new_result, True
     return model, result, False
+
+def _check_hit_bounds(result, eps=1e-10):
+    """Return list of strings noting params that hit min/max bounds."""
+    hits = []
+    for name, par in result.params.items():
+        if par.vary and par.min is not None and par.max is not None:
+            if abs(par.value - par.min) <= eps:
+                hits.append(f"{name}==min")
+            elif abs(par.value - par.max) <= eps:
+                hits.append(f"{name}==max")
+    return hits
 
 def fit_frame(x, y, seeds, halfwidth):
     m = combined_window_mask(x, seeds, halfwidth)
@@ -221,34 +244,39 @@ def fit_frame(x, y, seeds, halfwidth):
         model_used, result, _ = _try_add_shoulder(xw, yw, model_used, result)
 
     # metrics
-    bkg_line, c_all, s_all, a_all, h_all, w_all, p_all = _compute_fitted_metrics(result, xw)
+    bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps_all = _compute_fitted_metrics(result, xw)
 
-    # filter by fitted height
+    # filter by fitted height (for reporting)
     valid = (h_all >= PEAK_HEIGHT_MIN) & np.isfinite(h_all)
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
     height_out  = h_all.copy(); height_out[~valid]  = np.nan
     peakfit_out = p_all.copy(); peakfit_out[~valid] = np.nan
 
-    # per-peak component curves (background + that gaussian) for valid peaks
-    components = []
-    for i in range(c_all.size):
-        if not valid[i]:
-            continue
-        comp = bkg_line + _gaussian_y(xw, a_all[i], c_all[i], s_all[i])
-        components.append(comp)
+    # choose which components to plot
+    if PLOT_ONLY_VALID_COMPONENTS:
+        comps_plot = [c for j,c in enumerate(comps_all) if valid[j]]
+    else:
+        comps_plot = comps_all
+
+    # component sum (for sanity overlay)
+    if len(comps_all):
+        comp_sum = bkg_line + np.sum(np.vstack(comps_all), axis=0)
+    else:
+        comp_sum = bkg_line.copy()
 
     # R^2 on the window
-    ss_res = np.sum((yw - result.best_fit)**2)
-    ss_tot = np.sum((yw - np.mean(yw))**2) + 1e-12
-    r2 = 1.0 - ss_res/ss_tot
+    r2 = r2_score(yw, result.best_fit)
+
+    # bounds diagnostics
+    hit_bounds = _check_hit_bounds(result)
 
     return {
         "success": True,
         "xw": xw, "yw": yw, "yfit": result.best_fit, "bkg": bkg_line,
         "centers": centers_out, "fwhm": fwhm_out, "height_fit": height_out,
-        "peak_fit": peakfit_out, "components": components, "r2": r2,
-        "result": result
+        "peak_fit": peakfit_out, "components": comps_plot, "comp_sum": comp_sum,
+        "r2": r2, "hit_bounds": hit_bounds, "result": result
     }
 
 def apply_nature_style():
@@ -283,22 +311,26 @@ def main():
         y = I_full[args.frame]
         res = fit_frame(x, y, seeds0, WINDOW/2.0)
         if not res["success"]:
-            # one retry with wider window (same asymmetric shift limits)
+            # one retry with wider window
             res = fit_frame(x, y, seeds0, WINDOW)
             if not res["success"]:
                 print("Fit failed for the requested frame.")
                 return
 
+        # visible (non-NaN) peaks for table
         vis = np.isfinite(res["centers"])
         centers_v = res["centers"][vis]
         fwhm_v    = res["fwhm"][vis]
         hfit_v    = res["height_fit"][vis]
         pfit_v    = res["peak_fit"][vis]
 
+        # numeric results + diagnostics
         print(f"# Frame {args.frame}")
         for i_vis, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v)):
             print(f"peak{i_vis}_center={c:.6f}, peak{i_vis}_FWHM={w:.6f}, "
                   f"peak{i_vis}_height_fit={h:.6f}, peak{i_vis}_peak_fit={p:.6f}")
+        if res["hit_bounds"]:
+            print("HIT_BOUNDS:", "; ".join(res["hit_bounds"]))
 
         # ---- Plot ----
         apply_nature_style()
@@ -311,13 +343,20 @@ def main():
             ax.text(-0.12, 1.02, PANEL_LABEL, transform=ax.transAxes,
                     fontsize=12, fontweight="bold", va="bottom", ha="left")
 
+        # data / fit / background
         ax.plot(res["xw"], res["yw"], lw=1.0, label="Data")
         ax.plot(res["xw"], res["yfit"], lw=1.3, label="Fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Background", color="tab:green")
 
+        # pure Gaussian components (no background) dotted
         for comp in res["components"]:
-            ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.6, color="0.4")
+            ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.65, color="0.4")
 
+        # optional check: background + sum(components) overlays the fit
+        if SHOW_COMPONENT_SUM:
+            ax.plot(res["xw"], res["comp_sum"], lw=0.8, color="k", alpha=0.5, label="Bkg + Σ comps")
+
+        # fitted centers (for visible peaks)
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.5")
 
@@ -332,6 +371,7 @@ def main():
         ax.minorticks_on()
         ax.legend(fontsize=8, ncol=3)
 
+        # table (fitted values)
         ax_tbl = fig.add_subplot(gs[1])
         ax_tbl.axis("off")
         table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
@@ -350,8 +390,7 @@ def main():
     # ---------- Mapping mode (all frames, with tqdm) ----------
     nuse = nframes
     npeaks_seeded = len(seeds0)
-    # allow one optional shoulder peak in the CSV layout (visible peaks only)
-    centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)
+    centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)  # one optional shoulder column
     fwhm_trk    = np.full((nuse, npeaks_seeded + 1), np.nan)
 
     seeds = seeds0.copy()
@@ -371,10 +410,8 @@ def main():
             k = min(cvis.size, centers_trk.shape[1])
             centers_trk[f, :k] = cvis[:k]
             fwhm_trk[f, :k]    = wvis[:k]
-            # update seeds from the first 'npeaks_seeded' visible centers (asymmetric limits will apply next frame)
             if cvis.size >= npeaks_seeded:
                 seeds = cvis[:npeaks_seeded]
-            # else: keep previous seeds (bounds remain around the last good positions)
 
     # Write CSV
     base = os.path.splitext(os.path.basename(args.h5))[0]
@@ -396,4 +433,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
