@@ -17,10 +17,9 @@ from lmfit.models import GaussianModel, LinearModel
 # ------------------------------
 WINDOW = 0.50       # half-width to each side around each seed (q-units)
 MIN_POINTS = 8      # minimum points in the combined window to attempt a fit
-MAX_FRAMES = 10**9  # effectively "no cap" unless set smaller
 
-# NEW: minimum peak height used for initial guesses (in intensity units, above bkg)
-# Set to 0.0 to keep behavior identical to before.
+# Minimum peak height for the initial guess (in intensity units above background).
+# Keep at 0.0 for identical behavior to your previous script.
 PEAK_HEIGHT_MIN = 5.0
 
 # ------------------------------
@@ -93,7 +92,7 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
         y_at_seed = yw[idx]
         y_bkg_at_seed = bkg_slope * xw[idx] + bkg_intercept
 
-        # NEW: floor the height guess by PEAK_HEIGHT_MIN
+        # floor the height guess by PEAK_HEIGHT_MIN
         height0 = max(y_at_seed - y_bkg_at_seed, np.std(yw) * 0.5, PEAK_HEIGHT_MIN)
 
         # crude amplitude guess ~ height * sigma * sqrt(2pi)
@@ -113,7 +112,7 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
     return model, params
 
 def fit_frame(x, y, centers, halfwidth):
-    """Fit one frame; returns dict with centers, fwhm, success, and bestfit y."""
+    """Fit one frame; returns dict with centers, fwhm, height, success, and bestfit y."""
     m = combined_window_mask(x, centers, halfwidth)
     if not np.any(m):
         return {"success": False}
@@ -127,16 +126,25 @@ def fit_frame(x, y, centers, halfwidth):
         result = model.fit(yw, params, x=xw, nan_policy="omit")
         out_centers = []
         out_fwhm = []
+        out_heights = []
         for i in range(len(centers)):
             sigma_i = result.params[f"g{i}_sigma"].value
             center_i = result.params[f"g{i}_center"].value
+            amp_i = result.params[f"g{i}_amplitude"].value
             out_centers.append(center_i)
             out_fwhm.append(sigma_to_fwhm(sigma_i) if np.isfinite(sigma_i) else np.nan)
+            # height above background for a Gaussian: amp = height * sigma * sqrt(2π)
+            if np.isfinite(sigma_i) and sigma_i > 0.0:
+                height_i = amp_i / (sigma_i * np.sqrt(2.0 * np.pi))
+            else:
+                height_i = np.nan
+            out_heights.append(height_i)
 
         return {
             "success": True,
             "centers": np.array(out_centers, float),
             "fwhm": np.array(out_fwhm, float),
+            "height": np.array(out_heights, float),
             "xw": xw,
             "yw": yw,
             "yfit": result.best_fit,
@@ -144,6 +152,28 @@ def fit_frame(x, y, centers, halfwidth):
         }
     except Exception:
         return {"success": False}
+
+# ------------------------------
+# Plot style helper (Nature-like)
+# ------------------------------
+def apply_nature_style():
+    plt.rcParams.update({
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "font.size": 9,
+        "axes.titlesize": 10,
+        "axes.labelsize": 10,
+        "axes.linewidth": 0.8,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 4,
+        "ytick.major.size": 4,
+        "xtick.minor.size": 2,
+        "ytick.minor.size": 2,
+        "legend.frameon": False
+    })
 
 # ------------------------------
 # Main
@@ -173,40 +203,54 @@ def main():
             return
         # Print results
         print(f"# Frame {args.frame}")
-        for i, (c, w) in enumerate(zip(res["centers"], res["fwhm"])):
-            print(f"peak{i}_center={c:.6f}, peak{i}_FWHM={w:.6f}")
+        for i, (c, w, h) in enumerate(zip(res["centers"], res["fwhm"], res["height"])):
+            print(f"peak{i}_center={c:.6f}, peak{i}_FWHM={w:.6f}, peak{i}_height={h:.6f}")
 
-        # Quick plot to visually confirm + table below with center/FWHM
-        fig, ax = plt.subplots(figsize=(7,4.8), dpi=160)
+        # Nicer plot layout + table of Center/FWHM/Height
+        apply_nature_style()
+        from matplotlib.gridspec import GridSpec
+
+        fig = plt.figure(figsize=(6.2, 4.6))  # modest footprint, high DPI
+        gs = GridSpec(2, 1, height_ratios=[3.0, 1.4], hspace=0.15)
+        ax = fig.add_subplot(gs[0])
+
         ax.plot(res["xw"], res["yw"], lw=1.0, label="data")
-        ax.plot(res["xw"], res["yfit"], lw=1.5, label="fit")
+        ax.plot(res["xw"], res["yfit"], lw=1.2, label="fit")
         for i, c in enumerate(res["centers"]):
-            ax.axvline(c, linestyle="--", alpha=0.5, label=f"peak{i} @ {c:.4f}")
+            ax.axvline(c, linestyle="--", alpha=0.6, lw=0.9, label=f"peak{i} @ {c:.4f}")
         ax.set_xlabel("x (q or 2θ)")
         ax.set_ylabel("Intensity (a.u.)")
         ax.set_title(f"Frame {args.frame} multi-peak fit")
-        ax.legend(fontsize=9)
+        ax.minorticks_on()
+        ax.legend(fontsize=8, ncol=2)
 
-        # Build a small table of centers & FWHMs below the plot
-        table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}"]
-                      for i, (c, w) in enumerate(zip(res["centers"], res["fwhm"]))]
-        col_labels = ["Peak", "Center", "FWHM"]
+        # Table axis (clean, no frame)
+        ax_tbl = fig.add_subplot(gs[1])
+        ax_tbl.axis("off")
+        table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}"]
+                      for i, (c, w, h) in enumerate(zip(res["centers"], res["fwhm"], res["height"]))]
+        col_labels = ["Peak", "Center", "FWHM", "Height"]
 
-        # leave room at bottom for table
-        fig.subplots_adjust(bottom=0.32)
-        the_table = ax.table(cellText=table_data,
-                             colLabels=col_labels,
-                             loc="lower center",
-                             bbox=[0.0, -0.42, 1.0, 0.35])  # [left, bottom, width, height] in axes coords
-        the_table.auto_set_font_size(False)
-        the_table.set_fontsize(8)
+        tbl = ax_tbl.table(cellText=table_data,
+                           colLabels=col_labels,
+                           loc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        # make columns a bit wider and center text
+        for key, cell in tbl.get_celld().items():
+            cell.set_edgecolor("0.8")
+            cell.set_linewidth(0.6)
+            cell.set_height(0.18)
+            cell.set_alpha(0.0 if key[0] == 0 else 0.15)  # header clear, body lightly shaded
+            if key[0] == 0:
+                cell.set_alpha(0.0)
 
         fig.tight_layout()
         plt.show()
         return
 
-    # Otherwise: track all frames
-    nuse = min(nframes, MAX_FRAMES)
+    # Otherwise: track all frames (no cap)
+    nuse = nframes
     npeaks = len(centers0)
     centers_trk = np.full((nuse, npeaks), np.nan, float)
     fwhm_trk = np.full((nuse, npeaks), np.nan, float)
@@ -247,4 +291,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
