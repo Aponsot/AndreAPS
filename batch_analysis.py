@@ -18,8 +18,8 @@ from lmfit.models import GaussianModel, LinearModel
 WINDOW = 0.50       # half-width to each side around each seed (q-units)
 MIN_POINTS = 8      # minimum points in the combined window to attempt a fit
 
-# Minimum peak height for the initial guess (in intensity units above background).
-# Keep at 0.0 for identical behavior to your previous script.
+# Minimum "peak requirement" for reporting/plotting:
+# now interpreted as the **minimum max measured intensity** near the fitted center.
 PEAK_HEIGHT_MIN = 5.0
 
 # ------------------------------
@@ -92,8 +92,8 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
         y_at_seed = yw[idx]
         y_bkg_at_seed = bkg_slope * xw[idx] + bkg_intercept
 
-        # floor the height guess by PEAK_HEIGHT_MIN
-        height0 = max(y_at_seed - y_bkg_at_seed, np.std(yw) * 0.5, PEAK_HEIGHT_MIN)
+        # initial height guess (above bkg) with simple floor to stabilize seeding
+        height0 = max(y_at_seed - y_bkg_at_seed, np.std(yw) * 0.5)
 
         # crude amplitude guess ~ height * sigma * sqrt(2pi)
         amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
@@ -111,8 +111,29 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
 
     return model, params
 
+def _max_intensity_near_center(xw, yw, center, fwhm):
+    """
+    Return the maximum measured intensity near 'center'.
+    Uses a symmetric window of half-width = max(fwhm/2, small_eps) in x.
+    Falls back to nearest point if window is empty/NaN.
+    """
+    # small fallback window if FWHM invalid
+    if not np.isfinite(fwhm) or fwhm <= 0:
+        # choose ~1% of x-span as a tiny window
+        span = max(xw[-1] - xw[0], 1e-12)
+        half = 0.01 * span
+    else:
+        half = 0.5 * fwhm
+
+    m = (xw >= center - half) & (xw <= center + half)
+    if not np.any(m):
+        # fallback: just take nearest sample
+        idx = np.abs(xw - center).argmin()
+        return float(yw[idx])
+    return float(np.max(yw[m]))
+
 def fit_frame(x, y, centers, halfwidth):
-    """Fit one frame; returns dict with centers, fwhm, height, success, and bestfit y."""
+    """Fit one frame; returns dict with centers, fwhm, max_int, success, and bestfit y."""
     m = combined_window_mask(x, centers, halfwidth)
     if not np.any(m):
         return {"success": False}
@@ -126,25 +147,20 @@ def fit_frame(x, y, centers, halfwidth):
         result = model.fit(yw, params, x=xw, nan_policy="omit")
         out_centers = []
         out_fwhm = []
-        out_heights = []
+        out_maxI = []
         for i in range(len(centers)):
             sigma_i = result.params[f"g{i}_sigma"].value
             center_i = result.params[f"g{i}_center"].value
-            amp_i = result.params[f"g{i}_amplitude"].value
+            fwhm_i = sigma_to_fwhm(sigma_i) if np.isfinite(sigma_i) else np.nan
             out_centers.append(center_i)
-            out_fwhm.append(sigma_to_fwhm(sigma_i) if np.isfinite(sigma_i) else np.nan)
-            # height above background for a Gaussian: amp = height * sigma * sqrt(2π)
-            if np.isfinite(sigma_i) and sigma_i > 0.0:
-                height_i = amp_i / (sigma_i * np.sqrt(2.0 * np.pi))
-            else:
-                height_i = np.nan
-            out_heights.append(height_i)
+            out_fwhm.append(fwhm_i)
+            out_maxI.append(_max_intensity_near_center(xw, yw, center_i, fwhm_i))
 
         return {
             "success": True,
             "centers": np.array(out_centers, float),
             "fwhm": np.array(out_fwhm, float),
-            "height": np.array(out_heights, float),
+            "max_int": np.array(out_maxI, float),   # <-- max measured intensity
             "xw": xw,
             "yw": yw,
             "yfit": result.best_fit,
@@ -201,24 +217,31 @@ def main():
         if not res["success"]:
             print("Fit failed for the requested frame.")
             return
-        # Print results
-        print(f"# Frame {args.frame}")
-        for i, (c, w, h) in enumerate(zip(res["centers"], res["fwhm"], res["height"])):
-            print(f"peak{i}_center={c:.6f}, peak{i}_FWHM={w:.6f}, peak{i}_height={h:.6f}")
 
-        # Nicer plot layout + table of Center/FWHM/Height
+        # Apply omission by PEAK_HEIGHT_MIN (interpreted as min max intensity)
+        valid = res["max_int"] >= PEAK_HEIGHT_MIN
+        centers_v = res["centers"][valid]
+        fwhm_v = res["fwhm"][valid]
+        maxI_v = res["max_int"][valid]
+
+        # Print results (only valid peaks)
+        print(f"# Frame {args.frame}")
+        for i_vis, (c, w, h) in enumerate(zip(centers_v, fwhm_v, maxI_v)):
+            print(f"peak{i_vis}_center={c:.6f}, peak{i_vis}_FWHM={w:.6f}, peak{i_vis}_maxI={h:.6f}")
+
+        # Nicer plot layout + table of Center/FWHM/MaxI
         apply_nature_style()
         from matplotlib.gridspec import GridSpec
 
-        fig = plt.figure(figsize=(6.2, 4.6))  # modest footprint, high DPI
+        fig = plt.figure(figsize=(6.2, 4.6))
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.4], hspace=0.15)
         ax = fig.add_subplot(gs[0])
 
         ax.plot(res["xw"], res["yw"], lw=1.0, label="data")
         ax.plot(res["xw"], res["yfit"], lw=1.2, label="fit")
-        for i, c in enumerate(res["centers"]):
-            ax.axvline(c, linestyle="--", alpha=0.6, lw=0.9, label=f"peak{i} @ {c:.4f}")
-        ax.set_xlabel("x (q or 2θ)")
+        for c in centers_v:
+            ax.axvline(c, linestyle="--", alpha=0.6, lw=0.9)
+        ax.set_xlabel("q (1/A")
         ax.set_ylabel("Intensity (a.u.)")
         ax.set_title(f"Frame {args.frame} multi-peak fit")
         ax.minorticks_on()
@@ -228,22 +251,19 @@ def main():
         ax_tbl = fig.add_subplot(gs[1])
         ax_tbl.axis("off")
         table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}"]
-                      for i, (c, w, h) in enumerate(zip(res["centers"], res["fwhm"], res["height"]))]
-        col_labels = ["Peak", "Center", "FWHM", "Height"]
+                      for i, (c, w, h) in enumerate(zip(centers_v, fwhm_v, maxI_v))]
+        col_labels = ["Peak", "Center", "FWHM", "Max Intensity"]
 
         tbl = ax_tbl.table(cellText=table_data,
                            colLabels=col_labels,
                            loc="center")
         tbl.auto_set_font_size(False)
         tbl.set_fontsize(8)
-        # make columns a bit wider and center text
         for key, cell in tbl.get_celld().items():
             cell.set_edgecolor("0.8")
             cell.set_linewidth(0.6)
             cell.set_height(0.18)
-            cell.set_alpha(0.0 if key[0] == 0 else 0.15)  # header clear, body lightly shaded
-            if key[0] == 0:
-                cell.set_alpha(0.0)
+            cell.set_alpha(0.0 if key[0] == 0 else 0.15)
 
         fig.tight_layout()
         plt.show()
@@ -264,12 +284,20 @@ def main():
             # one retry with a 2× wider window
             res = fit_frame(x, y, seeds, WINDOW)
         if res["success"]:
-            centers_trk[f, :] = res["centers"]
-            fwhm_trk[f, :] = res["fwhm"]
-            seeds = res["centers"]  # update seeds for tracking
+            # enforce omission rule by max intensity threshold
+            valid = res["max_int"] >= PEAK_HEIGHT_MIN
+            # store only valid peaks; invalid -> NaN
+            tmp_centers = res["centers"].copy()
+            tmp_fwhm = res["fwhm"].copy()
+            tmp_centers[~valid] = np.nan
+            tmp_fwhm[~valid] = np.nan
+            centers_trk[f, :] = tmp_centers
+            fwhm_trk[f, :] = tmp_fwhm
+            # update seeds only for peaks that remained valid; keep prior seeds otherwise
+            seeds = np.where(valid, res["centers"], seeds)
         # else leave NaNs and keep previous seeds
 
-    # Write CSV next to the HDF5
+    # Write CSV next to the HDF5 (centers/FWHM only; invalid peaks remain NaN)
     base = os.path.splitext(os.path.basename(args.h5))[0]
     csv_path = f"{base}_multi_peak_tracking.csv"
     header_cols = ["frame"] + [f"center_{i}" for i in range(npeaks)] + [f"FWHM_{i}" for i in range(npeaks)]
