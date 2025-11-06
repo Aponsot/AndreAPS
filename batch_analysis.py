@@ -24,17 +24,17 @@ MIN_POINTS = 8         # minimum points in window to attempt a fit
 PEAK_HEIGHT_MIN = 5.0  # min *fitted* height above background to report/plot
 
 # Global sigma bounds for ALL components (seeded and residual-added)
-SIGMA_MIN_FIT = 0.002  # raise to avoid needle spikes
+SIGMA_MIN_FIT = 0.0002  # raise to avoid needle spikes
 SIGMA_MAX_FIT = 0.080  # raise to allow broad shoulders
 
 # Asymmetric per-frame seed shift limits (relative to current seed)
 # center_i ∈ [seed_i - CENTER_SHIFT_NEG, seed_i + CENTER_SHIFT_POS]
-CENTER_SHIFT_NEG = 0.030
+CENTER_SHIFT_NEG = 0.10
 CENTER_SHIFT_POS = 0.010
 
 # Residual-shoulder controls
 ENABLE_RESIDUAL_SHOULDER = True
-RESIDUAL_SNR = 1.0     # residual SNR threshold
+RESIDUAL_SNR = 0.5     # residual SNR threshold
 MIN_SEP = 0.0010        # min separation from existing peaks (x units)
 AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
 
@@ -501,6 +501,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
