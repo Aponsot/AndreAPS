@@ -13,17 +13,19 @@ from lmfit.models import GaussianModel, LinearModel
 # ------------------------------
 # Tunables (simple, minimal)
 # ------------------------------
-WINDOW = 0.50       # half-width to each side around each seed (q-units)
-MIN_POINTS = 8      # minimum points in the combined window to attempt a fit
+WINDOW = 0.50        # half-width to each side around each seed (q-units)
+MIN_POINTS = 8       # minimum points in the combined window to attempt a fit
 PEAK_HEIGHT_MIN = 5.0  # min fitted height above background for reporting/plotting
 
+# Global sigma bounds for ALL Gaussian components (seeded and residual-added)
+SIGMA_MIN_FIT = 0.002    # ↑ raise to avoid needle spikes
+SIGMA_MAX_FIT = 0.080    # ↑ raise to allow broad shoulders
+
 # Shoulder (residual-add) controls
-ENABLE_RESIDUAL_SHOULDER = True   # set False to disable auto add
-RESIDUAL_SNR = 3.0                # residual peak must exceed this SNR
-MIN_SEP = 0.010                   # min separation from existing centers (x-units)
-AIC_IMPROVE = 6.0                 # require ΔAIC <= -AIC_IMPROVE to accept added peak
-SIGMA_MIN = 0.001                 # absolute sigma bounds for added peak
-SIGMA_MAX = 0.080
+ENABLE_RESIDUAL_SHOULDER = True
+RESIDUAL_SNR = 3.0       # residual peak must exceed this SNR
+MIN_SEP = 0.010          # min separation from existing centers (x-units)
+AIC_IMPROVE = 6.0        # require ΔAIC <= -AIC_IMPROVE to accept added peak
 
 # ------------------------------
 # Helpers
@@ -76,7 +78,9 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
     params = model.make_params(bkg_slope=bkg_slope, bkg_intercept=bkg_intercept)
 
     span = max(xw[-1] - xw[0], 1e-9)
-    sigma0 = max(span / (7.0 * len(centers)), 1e-6)  # narrower as #peaks grows
+    sigma0_base = max(span / (7.0 * len(centers)), 1e-6)
+    # clip initial guess into global bounds
+    sigma0 = float(np.clip(sigma0_base, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
 
     # Add one Gaussian per peak
     for i, c0 in enumerate(centers):
@@ -91,7 +95,8 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
         amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
 
         params.update(g.make_params(center=c0, sigma=sigma0, amplitude=amp0))
-        params[f"g{i}_sigma"].set(min=1e-6, max=max(span, 1.0))
+        # enforce global sigma bounds
+        params[f"g{i}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
         params[f"g{i}_amplitude"].set(min=0.0)
         params[f"g{i}_center"].set(min=c0 - 0.6*halfwidth, max=c0 + 0.6*halfwidth)
 
@@ -120,7 +125,6 @@ def _compute_fitted_metrics(result, xw):
     sigmas = np.asarray(sigmas, float)
     amps   = np.asarray(amps, float)
 
-    # compute height (above bkg) and peak@center
     heights = np.full_like(centers, np.nan, dtype=float)
     peakfit = np.full_like(centers, np.nan, dtype=float)
     fwhm    = np.full_like(centers, np.nan, dtype=float)
@@ -143,7 +147,7 @@ def _try_add_shoulder(xw, yw, model, result, halfwidth):
     idx = int(np.argmax(resid))
     peak_resid = resid[idx]
     if peak_resid < RESIDUAL_SNR * noise:
-        return model, result, False  # not strong enough
+        return model, result, False
 
     x0 = xw[idx]
 
@@ -153,11 +157,10 @@ def _try_add_shoulder(xw, yw, model, result, halfwidth):
         if np.min(np.abs(centers - x0)) < MIN_SEP:
             return model, result, False
 
-    # Seed amplitude/sigma for the new component
+    # Seed amplitude/sigma for the new component (respect global bounds)
     span = max(xw[-1] - xw[0], 1e-9)
     mean_sigma = np.nanmean(sigmas) if sigmas.size else span / 10.0
-    sigma_seed = np.clip(min(mean_sigma, span / 12.0), SIGMA_MIN, SIGMA_MAX)
-    # Convert residual height to amplitude for initial guess
+    sigma_seed = float(np.clip(min(mean_sigma, span / 12.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
     amp_seed = max(peak_resid * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
 
     # Build a new model with one extra Gaussian and refit
@@ -169,30 +172,25 @@ def _try_add_shoulder(xw, yw, model, result, halfwidth):
     new_model = model + g
     new_params = result.params.copy()
 
-    # initialize new params
     new_params.update(g.make_params(center=float(x0), sigma=sigma_seed, amplitude=amp_seed))
-    new_params[prefix + "sigma"].set(min=SIGMA_MIN, max=SIGMA_MAX)
+    new_params[prefix + "sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
     new_params[prefix + "amplitude"].set(min=0.0)
-    # keep it within the existing combined window
-    lo = xw[0]
-    hi = xw[-1]
+    lo, hi = xw[0], xw[-1]
     new_params[prefix + "center"].set(min=lo, max=hi)
 
-    # Refit with the extra component
     new_result = new_model.fit(yw, new_params, x=xw, nan_policy="omit")
 
     # Model selection: require AIC improvement and height >= threshold
     dAIC = new_result.aic - result.aic  # negative is better
     _, c_new, s_new, a_new, h_new, f_new, p_new = _compute_fitted_metrics(new_result, xw)
-    # new peak is last one (index new_idx)
     if c_new.size <= new_idx:
         return model, result, False
     new_height = h_new[new_idx]
 
     if (dAIC <= -AIC_IMPROVE) and np.isfinite(new_height) and (new_height >= PEAK_HEIGHT_MIN):
-        return new_model, new_result, True  # accept
+        return new_model, new_result, True
     else:
-        return model, result, False        # reject
+        return model, result, False
 
 def fit_frame(x, y, centers, halfwidth):
     """
@@ -220,7 +218,7 @@ def fit_frame(x, y, centers, halfwidth):
 
     # 2) optional one-pass shoulder add via residual peak
     if ENABLE_RESIDUAL_SHOULDER:
-        model_used, result, accepted = _try_add_shoulder(xw, yw, model_used, result, halfwidth)
+        model_used, result, _ = _try_add_shoulder(xw, yw, model_used, result, halfwidth)
 
     # Extract metrics & component curves
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all = _compute_fitted_metrics(result, xw)
@@ -345,10 +343,10 @@ def main():
         plt.show()
         return
 
-    # Track all frames
+    # Track all frames (allow one residual shoulder peak)
     nuse = nframes
     npeaks_seeded = len(centers0)
-    centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)  # +1 in case a shoulder is accepted
+    centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)  # +1 in case shoulder is accepted
     fwhm_trk = np.full((nuse, npeaks_seeded + 1), np.nan)
 
     seeds = centers0.copy()
@@ -358,17 +356,14 @@ def main():
         if not res["success"]:
             res = fit_frame(x, y, seeds, WINDOW)
         if res["success"]:
-            # store up to (seeded+1) peaks that passed threshold
             vis = np.isfinite(res["centers"])
             cvis = res["centers"][vis]
             wvis = res["fwhm"][vis]
             k = min(cvis.size, centers_trk.shape[1])
             centers_trk[f, :k] = cvis[:k]
             fwhm_trk[f, :k] = wvis[:k]
-            # update seeds from visible peaks if available, else keep old seeds
             if cvis.size >= seeds.size:
                 seeds = cvis[:seeds.size]
-        # else keep NaNs & previous seeds
 
     # CSV (fixed number of columns: seeded + one optional)
     base = os.path.splitext(os.path.basename(args.h5))[0]
