@@ -21,7 +21,7 @@ MAX_FRAMES = 10**9  # effectively "no cap" unless set smaller
 
 # NEW: minimum peak height used for initial guesses (in intensity units, above bkg)
 # Set to 0.0 to keep behavior identical to before.
-PEAK_HEIGHT_MIN = 0.0
+PEAK_HEIGHT_MIN = 5.0
 
 # ------------------------------
 # Helpers
@@ -247,3 +247,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
