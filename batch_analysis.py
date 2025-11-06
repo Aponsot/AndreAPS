@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# Multi-peak tracker with residual-added shoulder, global sigma bounds,
+# Multi-peak tracker: residual-added shoulder, global sigma bounds,
 # fitted-height filtering, asymmetric seed-shift limits, polished plotting,
-# component-sum check, tqdm progress, and bound-hit diagnostics.
+# component-sum check, tqdm progress, and a "map" scatter plot of centers vs frame
+# colored by fitted height.
 
 import argparse, os
 import numpy as np
@@ -23,7 +24,7 @@ MIN_POINTS = 8         # minimum points in window to attempt a fit
 PEAK_HEIGHT_MIN = 5.0  # min *fitted* height above background to report/plot
 
 # Global sigma bounds for ALL components (seeded and residual-added)
-SIGMA_MIN_FIT = 0.0002  # raise to avoid needle spikes
+SIGMA_MIN_FIT = 0.002  # raise to avoid needle spikes
 SIGMA_MAX_FIT = 0.080  # raise to allow broad shoulders
 
 # Asymmetric per-frame seed shift limits (relative to current seed)
@@ -38,11 +39,12 @@ MIN_SEP = 0.010        # min separation from existing peaks (x units)
 AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
 
 # Plotting preferences
-PANEL_LABEL = ""           # set "" to hide
+PANEL_LABEL = "a"           # set "" to hide
 SHOW_SEEDS = True           # show input seeds as light-blue vlines
-SEC_PER_FRAME = 0.004        # e.g., 0.01 -> title "t sec | R²=..."
+SEC_PER_FRAME = None        # e.g., 0.01 -> title "t sec | R²=..."
 PLOT_ONLY_VALID_COMPONENTS = False  # if True, only components that pass PEAK_HEIGHT_MIN are drawn
 SHOW_COMPONENT_SUM = True   # draw thin black line of (background + sum(components))
+LEGEND_COLS = 3
 
 # ------------------------------
 # Helpers
@@ -283,10 +285,20 @@ def apply_nature_style():
     plt.rcParams.update({
         "figure.dpi": 300, "savefig.dpi": 300,
         "font.size": 9, "axes.titlesize": 10, "axes.labelsize": 10,
-        "axes.linewidth": 0.8, "xtick.labelsize": 8, "ytick.labelsize": 8,
+        "axes.linewidth": 1.1, "xtick.labelsize": 8, "ytick.labelsize": 8,
         "xtick.direction": "in", "ytick.direction": "in",
-        "legend.frameon": False
+        "xtick.major.size": 4, "ytick.major.size": 4,
+        "xtick.minor.size": 2, "ytick.minor.size": 2,
+        "legend.frameon": True, "legend.edgecolor": "0.7"
     })
+
+def style_axes_box(ax):
+    # full outline + minor ticks + subtle grid
+    for side in ("top", "right", "bottom", "left"):
+        ax.spines[side].set_visible(True)
+        ax.spines[side].set_linewidth(1.1)
+    ax.minorticks_on()
+    ax.grid(True, which="major", alpha=0.12, linestyle="-", linewidth=0.6)
 
 # ------------------------------
 # Main
@@ -335,44 +347,59 @@ def main():
         # ---- Plot ----
         apply_nature_style()
         from matplotlib.gridspec import GridSpec
-        fig = plt.figure(figsize=(6.4, 4.8))
-        gs = GridSpec(2, 1, height_ratios=[3.0, 1.4], hspace=0.15)
+        fig = plt.figure(figsize=(6.6, 4.8))
+        gs = GridSpec(2, 1, height_ratios=[3.0, 1.45], hspace=0.18)
         ax = fig.add_subplot(gs[0])
+
+        style_axes_box(ax)
 
         if PANEL_LABEL:
             ax.text(-0.12, 1.02, PANEL_LABEL, transform=ax.transAxes,
                     fontsize=12, fontweight="bold", va="bottom", ha="left")
 
         # data / fit / background
-        ax.plot(res["xw"], res["yw"], lw=1.0, label="Data")
-        ax.plot(res["xw"], res["yfit"], lw=1.3, label="Fit")
+        ax.plot(res["xw"], res["yw"], lw=1.2, label="Data")
+        ax.plot(res["xw"], res["yfit"], lw=1.4, label="Fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Background", color="tab:green")
 
         # pure Gaussian components (no background) dotted
         for comp in res["components"]:
-            ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.65, color="0.4")
+            ax.plot(res["xw"], comp, ":", lw=1.0, alpha=0.7, color="0.35")
 
         # optional check: background + sum(components) overlays the fit
         if SHOW_COMPONENT_SUM:
-            ax.plot(res["xw"], res["comp_sum"], lw=0.8, color="k", alpha=0.5, label="Bkg + Σ comps")
+            ax.plot(res["xw"], res["comp_sum"], lw=0.9, color="k", alpha=0.6, label="Bkg + Σ comps")
+
+        # seed guide lines (optional)
+        if SHOW_SEEDS:
+            for s in seeds0:
+                ax.axvline(s, color="#7ec8ff", lw=0.9, alpha=0.7)
 
         # fitted centers (for visible peaks)
         for c in centers_v:
-            ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.5")
+            ax.axvline(c, linestyle="--", alpha=0.5, lw=0.95, color="0.5")
 
+        # title with R^2 (and time if provided)
         if SEC_PER_FRAME is not None:
             t = args.frame * float(SEC_PER_FRAME)
-            ax.set_title(f"{t:.1f} sec | R²={res['r2']:.4f}")
+            title = f"{t:.1f} sec | R²={res['r2']:.4f}"
         else:
-            ax.set_title(f"Frame {args.frame} | R²={res['r2']:.4f}")
+            title = f"Frame {args.frame} | R²={res['r2']:.4f}"
+        ax.set_title(title, pad=6)
 
         ax.set_xlabel("q (1/Å)")
-        ax.set_ylabel("Intensity")
-        ax.minorticks_on()
-        ax.legend(fontsize=8, ncol=3)
+        ax.set_ylabel("Intensity (a.u.)")
+
+        # Legend in a boxed panel to the RIGHT of the axes
+        leg = ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                        borderaxespad=0.0, frameon=True, edgecolor="0.7",
+                        facecolor="white", fontsize=8, ncol=LEGEND_COLS)
+        # leave right margin for legend
+        fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
 
         # table (fitted values)
         ax_tbl = fig.add_subplot(gs[1])
+        style_axes_box(ax_tbl)
         ax_tbl.axis("off")
         table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
                       for i, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v))]
@@ -381,17 +408,21 @@ def main():
         tbl.auto_set_font_size(False); tbl.set_fontsize(8)
         for key, cell in tbl.get_celld().items():
             cell.set_edgecolor("0.8"); cell.set_linewidth(0.6)
-            cell.set_height(0.18); cell.set_alpha(0.0 if key[0] == 0 else 0.12)
+            cell.set_height(0.18); cell.set_alpha(0.0 if key[0] == 0 else 0.10)
 
-        fig.tight_layout()
+        fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
         plt.show()
         return
 
     # ---------- Mapping mode (all frames, with tqdm) ----------
     nuse = nframes
     npeaks_seeded = len(seeds0)
-    centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)  # one optional shoulder column
-    fwhm_trk    = np.full((nuse, npeaks_seeded + 1), np.nan)
+    # allow one optional shoulder column
+    ncols = npeaks_seeded + 1
+    centers_trk = np.full((nuse, ncols), np.nan)
+    fwhm_trk    = np.full((nuse, ncols), np.nan)
+    height_trk  = np.full((nuse, ncols), np.nan)   # store fitted heights for coloring
+    # (could also store peak@center if desired)
 
     seeds = seeds0.copy()
     iterator = range(nuse)
@@ -407,17 +438,19 @@ def main():
             vis = np.isfinite(res["centers"])
             cvis = res["centers"][vis]
             wvis = res["fwhm"][vis]
-            k = min(cvis.size, centers_trk.shape[1])
+            hvis = res["height_fit"][vis]
+            k = min(cvis.size, ncols)
             centers_trk[f, :k] = cvis[:k]
             fwhm_trk[f, :k]    = wvis[:k]
+            height_trk[f, :k]  = hvis[:k]
             if cvis.size >= npeaks_seeded:
                 seeds = cvis[:npeaks_seeded]
 
     # Write CSV
     base = os.path.splitext(os.path.basename(args.h5))[0]
     csv_path = f"{base}_multi_peak_tracking.csv"
-    header_cols = ["frame"] + [f"center_{i}" for i in range(centers_trk.shape[1])] + \
-                  [f"FWHM_{i}" for i in range(centers_trk.shape[1])]
+    header_cols = ["frame"] + [f"center_{i}" for i in range(ncols)] + \
+                  [f"FWHM_{i}" for i in range(ncols)]
     arr = np.column_stack([np.arange(nuse), centers_trk, fwhm_trk])
     np.savetxt(csv_path, arr, delimiter=",", header=",".join(header_cols),
                comments="", fmt="%.10g")
@@ -430,6 +463,46 @@ def main():
         parts = [str(r)] + [f"{v:.6f}" if np.isfinite(v) else "nan" for v in centers_trk[r]] + \
                 [f"{v:.6f}" if np.isfinite(v) else "nan" for v in fwhm_trk[r]]
         print(",".join(parts))
+
+    # ----- Map scatter: frame vs center, color by fitted height -----
+    apply_nature_style()
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    style_axes_box(ax)
+
+    frames = np.arange(nuse)
+    # Plot each peak column as its own series (so legend keys make sense)
+    scatters = []
+    for j in range(ncols):
+        mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
+        if not np.any(mask):
+            continue
+        sc = ax.scatter(frames[mask], centers_trk[mask, j],
+                        c=height_trk[mask, j], cmap="plasma", s=14,
+                        edgecolors="none")
+        scatters.append((sc, j))
+
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Center (q or 2θ)")
+    ax.set_title("Peak Centers over Frames (colored by fitted height)")
+
+    # Colorbar
+    if scatters:
+        cbar = fig.colorbar(scatters[0][0], ax=ax, pad=0.02)
+        cbar.set_label("Height (fit)")
+
+    # Legend (one entry per plotted peak column)
+    labels = [f"peak col {j}" for _, j in scatters]
+    if scatters:
+        # place legend outside on right in a box
+        leg_elements = [s for s,_ in scatters]
+        leg = ax.legend(leg_elements, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
+                        borderaxespad=0.0, frameon=True, edgecolor="0.7", facecolor="white",
+                        fontsize=8)
+        fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
+    else:
+        fig.tight_layout()
+
+    plt.show()
 
 if __name__ == "__main__":
     main()
