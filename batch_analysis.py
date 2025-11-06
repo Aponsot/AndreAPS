@@ -34,7 +34,7 @@ CENTER_SHIFT_POS = 0.010
 
 # Residual-shoulder controls
 ENABLE_RESIDUAL_SHOULDER = True
-RESIDUAL_SNR = 3.0     # residual SNR threshold
+RESIDUAL_SNR = 1.0     # residual SNR threshold
 MIN_SEP = 0.010        # min separation from existing peaks (x units)
 AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
 
@@ -501,4 +501,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
