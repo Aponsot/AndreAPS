@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-# Multi-peak tracker: residual-added shoulder, global sigma bounds,
-# fitted-height filtering, asymmetric seed-shift limits, polished plotting,
-# component-sum check, tqdm progress, and a "map" scatter plot of centers vs frame
-# colored by fitted height.
 
 import argparse, os
 import numpy as np
@@ -17,34 +12,49 @@ except Exception:
     tqdm = None
 
 # ------------------------------
-# Tunables
+# Tunables (your values preserved)
 # ------------------------------
 WINDOW = 0.50          # half-width around the seeded peak range (x-units, e.g., q)
 MIN_POINTS = 8         # minimum points in window to attempt a fit
 PEAK_HEIGHT_MIN = 5.0  # min *fitted* height above background to report/plot
 
 # Global sigma bounds for ALL components (seeded and residual-added)
-SIGMA_MIN_FIT = 0.0002  # raise to avoid needle spikes
-SIGMA_MAX_FIT = 0.080  # raise to allow broad shoulders
+SIGMA_MIN_FIT = 0.0002
+SIGMA_MAX_FIT = 0.080
 
 # Asymmetric per-frame seed shift limits (relative to current seed)
 # center_i ∈ [seed_i - CENTER_SHIFT_NEG, seed_i + CENTER_SHIFT_POS]
 CENTER_SHIFT_NEG = 0.10
 CENTER_SHIFT_POS = 0.010
 
-# Residual-shoulder controls
+# Residual-shoulder controls (single-frame proposal gate; kept for seeding)
 ENABLE_RESIDUAL_SHOULDER = True
-RESIDUAL_SNR = 0.5     # residual SNR threshold
-MIN_SEP = 0.0010        # min separation from existing peaks (x units)
-AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
+RESIDUAL_SNR = 0.5       # base residual SNR threshold to *consider* adding
+MIN_SEP = 0.0010         # min separation from existing peaks (x units)
+AIC_IMPROVE = 6.0        # require ΔAIC <= -AIC_IMPROVE to accept new peak
+
+# NEW: Stateful shoulder tracking hysteresis (for consistency across frames)
+SH_ADD_SNR = 3.0         # need at least this SNR to START shoulder
+SH_DROP_SNR = 1.5        # drop if SNR < this for SH_GRACE_FRAMES
+SH_GRACE_FRAMES = 4      # consecutive frames below drop SNR before dropping
+SH_MAX_JUMP = 0.015      # max allowed shoulder center jump between frames
+SH_MIN_HEIGHT = 6.0      # min fitted height to keep shoulder active
 
 # Plotting preferences
-PANEL_LABEL = ""           # set "" to hide
-SHOW_SEEDS = True           # show input seeds as light-blue vlines
-SEC_PER_FRAME = .004       # e.g., 0.01 -> title "t sec | R²=..."
-PLOT_ONLY_VALID_COMPONENTS = False  # if True, only components that pass PEAK_HEIGHT_MIN are drawn
-SHOW_COMPONENT_SUM = True   # draw thin black line of (background + sum(components))
+PANEL_LABEL = ""             # set "" to hide
+SHOW_SEEDS = True            # show input seeds as light-blue vlines
+SEC_PER_FRAME = .004         # -> title "t sec | R²=..."
+PLOT_ONLY_VALID_COMPONENTS = False
+SHOW_COMPONENT_SUM = True    # thin black line of (background + sum(components))
 LEGEND_COLS = 3
+
+# NEW: Performance guards (helps late noisy frames)
+MAX_NFEV = 500              # cap LMFit evaluations per solve
+EARLY_R2 = 0.998            # skip residual proposal if base fit already excellent
+
+# Optional: nudge seeds toward observed centers to avoid rail-hugging (off by default)
+ENABLE_EMA_SEED_NUDGE = False
+EMA_ALPHA = 0.4
 
 # ------------------------------
 # Helpers
@@ -91,45 +101,7 @@ def combined_window_mask(x, centers, halfwidth):
     hi = np.max(centers) + halfwidth
     return (x >= lo) & (x <= hi)
 
-def initial_params_for_frame(xw, yw, seeds, halfwidth):
-    """
-    Build model (linear background + one Gaussian per seed) & params.
-    Enforces asymmetric per-seed shift limits around 'seeds'.
-    """
-    # background initial guess
-    try:
-        bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
-    except Exception:
-        bkg_slope, bkg_intercept = 0.0, float(np.median(yw))
-
-    model = LinearModel(prefix="bkg_")
-    params = model.make_params(bkg_slope=bkg_slope, bkg_intercept=bkg_intercept)
-
-    span = max(xw[-1] - xw[0], 1e-9)
-    sigma0_base = max(span / (7.0 * len(seeds)), 1e-6)
-    sigma0 = float(np.clip(sigma0_base, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
-
-    # seeded peaks
-    for i, c_seed in enumerate(seeds):
-        g = GaussianModel(prefix=f"g{i}_")
-        model = model + g
-        idx = np.abs(xw - c_seed).argmin()
-        y_at_seed = yw[idx]
-        y_bkg = bkg_slope * xw[idx] + bkg_intercept
-        height0 = max(y_at_seed - y_bkg, np.std(yw) * 0.5)
-        amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
-        params.update(g.make_params(center=c_seed, sigma=sigma0, amplitude=amp0))
-        # enforce global sigma bounds
-        params[f"g{i}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-        params[f"g{i}_amplitude"].set(min=0.0)
-        # asymmetric seed-shift limits
-        params[f"g{i}_center"].set(min=c_seed - CENTER_SHIFT_NEG,
-                                   max=c_seed + CENTER_SHIFT_POS)
-
-    return model, params
-
 def _gaussian_y(x, amp, cen, sig):
-    # pure Gaussian component (no background)
     return amp * np.exp(-(x - cen)**2 / (2.0 * sig**2))
 
 def _compute_fitted_metrics(result, xw):
@@ -169,55 +141,12 @@ def _compute_fitted_metrics(result, xw):
 
     return bkg_line, centers, sigmas, amps, heights, fwhm, peakfit, comps
 
-def _try_add_shoulder(xw, yw, model, result):
-    resid = yw - result.best_fit
-    noise = robust_sigma(resid)
-    if noise <= 0:
-        return model, result, False
-
+def _residual_peak(xw, yw, yfit):
+    resid = yw - yfit
     idx = int(np.argmax(resid))
-    peak_resid = resid[idx]
-    if peak_resid < RESIDUAL_SNR * noise:
-        return model, result, False
-
-    x0 = xw[idx]
-    _, centers, sigmas, amps, heights, fwhm, peakfit, _ = _compute_fitted_metrics(result, xw)
-    if centers.size and np.min(np.abs(centers - x0)) < MIN_SEP:
-        return model, result, False
-
-    span = max(xw[-1] - xw[0], 1e-9)
-    mean_sigma = np.nanmean(sigmas) if sigmas.size else span/10.0
-    sigma_seed = float(np.clip(min(mean_sigma, span/12.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
-    amp_seed = max(peak_resid * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
-
-    # next prefix
-    new_idx = 0
-    while f"g{new_idx}_center" in result.params:
-        new_idx += 1
-    prefix = f"g{new_idx}_"
-
-    g = GaussianModel(prefix=prefix)
-    new_model = model + g
-    new_params = result.params.copy()
-    new_params.update(g.make_params(center=float(x0), sigma=sigma_seed, amplitude=amp_seed))
-    new_params[prefix + "sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-    new_params[prefix + "amplitude"].set(min=0.0)
-    new_params[prefix + "center"].set(min=xw[0], max=xw[-1])  # keep within window
-
-    new_result = new_model.fit(yw, new_params, x=xw, nan_policy="omit")
-
-    dAIC = new_result.aic - result.aic   # negative is better
-    _, c_new, s_new, a_new, h_new, f_new, p_new, _ = _compute_fitted_metrics(new_result, xw)
-    if c_new.size <= new_idx:
-        return model, result, False
-    new_height = h_new[new_idx]
-
-    if (dAIC <= -AIC_IMPROVE) and np.isfinite(new_height) and (new_height >= PEAK_HEIGHT_MIN):
-        return new_model, new_result, True
-    return model, result, False
+    return xw[idx], resid[idx], resid
 
 def _check_hit_bounds(result, eps=1e-10):
-    """Return list of strings noting params that hit min/max bounds."""
     hits = []
     for name, par in result.params.items():
         if par.vary and par.min is not None and par.max is not None:
@@ -227,26 +156,170 @@ def _check_hit_bounds(result, eps=1e-10):
                 hits.append(f"{name}==max")
     return hits
 
-def fit_frame(x, y, seeds, halfwidth):
-    m = combined_window_mask(x, seeds, halfwidth)
+# ------------------------------
+# Model/params builders
+# ------------------------------
+def initial_params_for_frame(xw, yw, seeds, halfwidth, shoulder_center=None):
+    """
+    Build model (linear background + one Gaussian per seed [+ optional shoulder]) & params.
+    Enforces asymmetric per-seed shift limits around 'seeds'.
+    """
+    # background initial guess
+    try:
+        bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
+    except Exception:
+        bkg_slope, bkg_intercept = 0.0, float(np.median(yw))
+
+    model = LinearModel(prefix="bkg_")
+    params = model.make_params(bkg_slope=bkg_slope, bkg_intercept=bkg_intercept)
+
+    span = max(xw[-1] - xw[0], 1e-9)
+    sigma0_base = max(span / (7.0 * max(1,len(seeds))), 1e-6)
+    sigma0 = float(np.clip(sigma0_base, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+
+    # seeded peaks
+    for i, c_seed in enumerate(seeds):
+        g = GaussianModel(prefix=f"g{i}_")
+        model = model + g
+        idx = np.abs(xw - c_seed).argmin()
+        y_at_seed = yw[idx]
+        y_bkg = bkg_slope * xw[idx] + bkg_intercept
+        height0 = max(y_at_seed - y_bkg, np.std(yw) * 0.5)
+        amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
+        params.update(g.make_params(center=c_seed, sigma=sigma0, amplitude=amp0))
+        # enforce global sigma bounds
+        params[f"g{i}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+        params[f"g{i}_amplitude"].set(min=0.0)
+        # asymmetric seed-shift limits
+        params[f"g{i}_center"].set(min=c_seed - CENTER_SHIFT_NEG,
+                                   max=c_seed + CENTER_SHIFT_POS)
+
+    # optional stateful shoulder
+    if shoulder_center is not None:
+        j = len(seeds)
+        g = GaussianModel(prefix=f"g{j}_")
+        model = model + g
+        amp0 = max(np.std(yw) * sigma0 * np.sqrt(2.0*np.pi), 1e-9)
+        params.update(g.make_params(center=float(shoulder_center), sigma=sigma0, amplitude=amp0))
+        params[f"g{j}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+        params[f"g{j}_amplitude"].set(min=0.0)
+        params[f"g{j}_center"].set(min=xw[0], max=xw[-1])
+
+    return model, params
+
+def propose_new_shoulder(xw, yw, model, result):
+    """Propose shoulder via residual SNR + ΔAIC guard."""
+    x0, peak_resid, resid = _residual_peak(xw, yw, result.best_fit)
+    noise = robust_sigma(resid)
+    snr = peak_resid / (noise if noise > 0 else 1e9)
+    if snr < max(SH_ADD_SNR, RESIDUAL_SNR):
+        return model, result, False, (x0, snr)
+
+    # add one Gaussian at x0 and AIC-check
+    j = 0
+    while f"g{j}_center" in result.params:
+        j += 1
+    prefix = f"g{j}_"
+    g = GaussianModel(prefix=prefix)
+    new_model = model + g
+
+    # seed sigma from current average
+    _, _, sigmas, _, _, _, _, _ = _compute_fitted_metrics(result, xw)
+    span = max(xw[-1] - xw[0], 1e-9)
+    mean_sigma = np.nanmean(sigmas) if sigmas.size else span/12.0
+    sigma_seed = float(np.clip(mean_sigma, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+    amp_seed = max(peak_resid * sigma_seed * np.sqrt(2.0*np.pi), 1e-9)
+
+    new_params = result.params.copy()
+    new_params.update(g.make_params(center=float(x0), sigma=sigma_seed, amplitude=amp_seed))
+    new_params[prefix + "sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+    new_params[prefix + "amplitude"].set(min=0.0)
+    new_params[prefix + "center"].set(min=xw[0], max=xw[-1])
+
+    new_result = new_model.fit(yw, new_params, x=xw, nan_policy="omit",
+                               fit_kws=dict(max_nfev=MAX_NFEV))
+    dAIC = new_result.aic - result.aic
+    if dAIC <= -AIC_IMPROVE:
+        return new_model, new_result, True, (x0, snr)
+    return model, result, False, (x0, snr)
+
+# ------------------------------
+# Shared pipeline state
+# ------------------------------
+class TrackerState:
+    def __init__(self, seeds):
+        self.seeds = seeds.astype(float).copy()
+        # shoulder tracking
+        self.sh_active = False
+        self.sh_center = None
+        self.sh_below_ctr = 0  # consecutive frames below drop SNR
+
+# ------------------------------
+# One-frame processing (used by BOTH modes)
+# ------------------------------
+def process_frame(state: TrackerState, x, y, halfwidth):
+    """Run one frame through the exact pipeline; update and return (res, state)."""
+    m = combined_window_mask(x, state.seeds, halfwidth)
     if not np.any(m):
-        return {"success": False}
+        return {"success": False}, state
     xw, yw = x[m], y[m]
     if xw.size < MIN_POINTS:
-        return {"success": False}
+        return {"success": False}, state
 
-    base_model, params = initial_params_for_frame(xw, yw, seeds, halfwidth)
+    # include shoulder if currently active
+    shoulder_center = state.sh_center if (ENABLE_RESIDUAL_SHOULDER and state.sh_active) else None
+    model, params = initial_params_for_frame(xw, yw, state.seeds, halfwidth, shoulder_center)
+
+    # base fit (capped work)
     try:
-        result = base_model.fit(yw, params, x=xw, nan_policy="omit")
+        result = model.fit(yw, params, x=xw, nan_policy="omit",
+                           fit_kws=dict(max_nfev=MAX_NFEV))
     except Exception:
-        return {"success": False}
+        return {"success": False}, state
 
-    model_used = base_model
-    if ENABLE_RESIDUAL_SHOULDER:
-        model_used, result, _ = _try_add_shoulder(xw, yw, model_used, result)
+    r2_base = r2_score(yw, result.best_fit)
 
-    # metrics
+    # if no active shoulder: maybe propose one (only if base fit isn't already excellent)
+    if ENABLE_RESIDUAL_SHOULDER and (not state.sh_active) and (r2_base < EARLY_R2):
+        model, result, accepted, (x0, snr) = propose_new_shoulder(xw, yw, model, result)
+        if accepted:
+            state.sh_active = True
+            state.sh_center = x0
+            state.sh_below_ctr = 0
+
+    # collect metrics
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps_all = _compute_fitted_metrics(result, xw)
+
+    # If shoulder is active, enforce hysteresis
+    if ENABLE_RESIDUAL_SHOULDER and state.sh_active:
+        sh_idx = len(state.seeds)  # shoulder appended after seeded peaks
+        if sh_idx < len(c_all):
+            c_sh = c_all[sh_idx]; h_sh = h_all[sh_idx]; s_sh = s_all[sh_idx]
+            ok_spatial = (np.isfinite(c_sh) and np.isfinite(state.sh_center)
+                          and abs(c_sh - state.sh_center) <= SH_MAX_JUMP)
+            ok_height  = (np.isfinite(h_sh) and (h_sh >= SH_MIN_HEIGHT))
+            ok_sigma   = (np.isfinite(s_sh) and (SIGMA_MIN_FIT <= s_sh <= SIGMA_MAX_FIT))
+            # compute SNR at shoulder center vs final fit
+            _, peak_resid, resid = _residual_peak(xw, yw, result.best_fit)
+            noise = robust_sigma(resid)
+            snr = peak_resid / (noise if noise > 0 else 1e9)
+            if ok_spatial and ok_height and ok_sigma and (snr >= SH_DROP_SNR):
+                state.sh_below_ctr = 0
+                state.sh_center = c_sh
+            else:
+                state.sh_below_ctr += 1
+                # keep last good center (no update) during grace
+            if state.sh_below_ctr >= SH_GRACE_FRAMES:
+                state.sh_active = False
+                state.sh_center = None
+                state.sh_below_ctr = 0
+        else:
+            # shoulder vanished this solve → count toward drop
+            state.sh_below_ctr += 1
+            if state.sh_below_ctr >= SH_GRACE_FRAMES:
+                state.sh_active = False
+                state.sh_center = None
+                state.sh_below_ctr = 0
 
     # filter by fitted height (for reporting)
     valid = (h_all >= PEAK_HEIGHT_MIN) & np.isfinite(h_all)
@@ -256,31 +329,35 @@ def fit_frame(x, y, seeds, halfwidth):
     peakfit_out = p_all.copy(); peakfit_out[~valid] = np.nan
 
     # choose which components to plot
-    if PLOT_ONLY_VALID_COMPONENTS:
-        comps_plot = [c for j,c in enumerate(comps_all) if valid[j]]
-    else:
-        comps_plot = comps_all
+    comps_plot = [c for j,c in enumerate(comps_all) if (not PLOT_ONLY_VALID_COMPONENTS) or valid[j]]
 
     # component sum (for sanity overlay)
-    if len(comps_all):
-        comp_sum = bkg_line + np.sum(np.vstack(comps_all), axis=0)
-    else:
-        comp_sum = bkg_line.copy()
+    comp_sum = bkg_line + (np.sum(np.vstack(comps_all), axis=0) if len(comps_all) else 0.0)
 
-    # R^2 on the window
-    r2 = r2_score(yw, result.best_fit)
+    # update seeds (first len(seeds) visible)
+    vis = np.isfinite(centers_out[:len(state.seeds)])
+    if np.any(vis):
+        obs = centers_out[:len(state.seeds)]
+        for i in range(len(state.seeds)):
+            if np.isfinite(obs[i]):
+                if ENABLE_EMA_SEED_NUDGE:
+                    state.seeds[i] = (1.0 - EMA_ALPHA) * state.seeds[i] + EMA_ALPHA * obs[i]
+                else:
+                    state.seeds[i] = obs[i]
 
-    # bounds diagnostics
-    hit_bounds = _check_hit_bounds(result)
-
-    return {
+    res = {
         "success": True,
         "xw": xw, "yw": yw, "yfit": result.best_fit, "bkg": bkg_line,
         "centers": centers_out, "fwhm": fwhm_out, "height_fit": height_out,
         "peak_fit": peakfit_out, "components": comps_plot, "comp_sum": comp_sum,
-        "r2": r2, "hit_bounds": hit_bounds, "result": result
+        "r2": r2_score(yw, result.best_fit), "r2_base": r2_base,
+        "hit_bounds": _check_hit_bounds(result), "result": result
     }
+    return res, state
 
+# ------------------------------
+# Plot style
+# ------------------------------
 def apply_nature_style():
     plt.rcParams.update({
         "figure.dpi": 300, "savefig.dpi": 300,
@@ -304,30 +381,39 @@ def style_axes_box(ax):
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background).")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (shared pipeline for map & single-frame).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True,
                     help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None,
-                    help="Fit a single frame index. Omit to track all frames.")
+                    help="Fit a single frame index. Replays 0..frame for identical behavior.")
     args = ap.parse_args()
 
-    seeds0 = parse_centers(args.centers)   # seeds for first use
+    seeds0 = parse_centers(args.centers)
     x, I_full = load_q_and_I(args.h5)
     nframes = I_full.shape[0]
 
-    # ---------- Single-frame mode ----------
+    # ---------- Single-frame mode (REPLAY through the same pipeline/state) ----------
     if args.frame is not None:
         if not (0 <= args.frame < nframes):
             raise ValueError(f"--frame {args.frame} is out of range [0, {nframes-1}]")
-        y = I_full[args.frame]
-        res = fit_frame(x, y, seeds0, WINDOW/2.0)
-        if not res["success"]:
-            # one retry with wider window
-            res = fit_frame(x, y, seeds0, WINDOW)
-            if not res["success"]:
-                print("Fit failed for the requested frame.")
-                return
+
+        state = TrackerState(seeds0)
+        iterator = range(args.frame + 1)
+        if tqdm is not None and args.frame > 200:
+            iterator = tqdm(iterator, desc="Replaying to target frame", ncols=80)
+
+        res = None
+        for f in iterator:
+            y = I_full[f]
+            # try half-window, then (only if needed) full-window
+            res, state = process_frame(state, x, y, WINDOW/2.0)
+            if (not res["success"]) or (res["r2_base"] < EARLY_R2 - 0.002):
+                res, state = process_frame(state, x, y, WINDOW)
+
+        if (res is None) or (not res["success"]):
+            print("Fit failed for the requested frame.")
+            return
 
         # visible (non-NaN) peaks for table
         vis = np.isfinite(res["centers"])
@@ -350,7 +436,6 @@ def main():
         fig = plt.figure(figsize=(6.6, 4.8))
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.45], hspace=0.18)
         ax = fig.add_subplot(gs[0])
-
         style_axes_box(ax)
 
         if PANEL_LABEL:
@@ -366,7 +451,7 @@ def main():
         for comp in res["components"]:
             ax.plot(res["xw"], comp, ":", lw=1.0, alpha=0.7, color="0.35")
 
-        # optional check: background + sum(components) overlays the fit
+        # optional check: background + sum(components)
         if SHOW_COMPONENT_SUM:
             ax.plot(res["xw"], res["comp_sum"], lw=0.9, color="k", alpha=0.6, label="Idividual Guassian Fit")
 
@@ -381,15 +466,13 @@ def main():
         else:
             title = f"Frame {args.frame} | R²={res['r2']:.4f}"
         ax.set_title(title, pad=6)
-
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity (a.u.)")
 
         # Legend in a boxed panel to the RIGHT of the axes
-        leg = ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
-                        borderaxespad=0.0, frameon=True, edgecolor="0.7",
-                        facecolor="white", fontsize=8, ncol=LEGEND_COLS)
-        # leave right margin for legend
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                  borderaxespad=0.0, frameon=True, edgecolor="0.7",
+                  facecolor="white", fontsize=8, ncol=LEGEND_COLS)
         fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
 
         # table (fitted values)
@@ -417,29 +500,26 @@ def main():
     centers_trk = np.full((nuse, ncols), np.nan)
     fwhm_trk    = np.full((nuse, ncols), np.nan)
     height_trk  = np.full((nuse, ncols), np.nan)   # store fitted heights for coloring
-    # (could also store peak@center if desired)
 
-    seeds = seeds0.copy()
+    state = TrackerState(seeds0)
     iterator = range(nuse)
     if tqdm is not None:
         iterator = tqdm(iterator, desc="Fitting frames", ncols=80)
 
     for f in iterator:
         y = I_full[f]
-        res = fit_frame(x, y, seeds, WINDOW/2.0)
-        if not res["success"]:
-            res = fit_frame(x, y, seeds, WINDOW)
+        res, state = process_frame(state, x, y, WINDOW/2.0)
+        if (not res["success"]) or (res["r2_base"] < EARLY_R2 - 0.002):
+            res, state = process_frame(state, x, y, WINDOW)
         if res["success"]:
-            vis = np.isfinite(res["centers"])
-            cvis = res["centers"][vis]
-            wvis = res["fwhm"][vis]
-            hvis = res["height_fit"][vis]
-            k = min(cvis.size, ncols)
-            centers_trk[f, :k] = cvis[:k]
-            fwhm_trk[f, :k]    = wvis[:k]
-            height_trk[f, :k]  = hvis[:k]
-            if cvis.size >= npeaks_seeded:
-                seeds = cvis[:npeaks_seeded]
+            vis_centers = res["centers"]
+            vis_fwhm    = res["fwhm"]
+            vis_height  = res["height_fit"]
+            idx = np.where(np.isfinite(vis_centers))[0][:ncols]
+            if idx.size:
+                centers_trk[f, :idx.size] = vis_centers[idx]
+                fwhm_trk[f, :idx.size]    = vis_fwhm[idx]
+                height_trk[f, :idx.size]  = vis_height[idx]
 
     # Write CSV
     base = os.path.splitext(os.path.basename(args.h5))[0]
@@ -465,7 +545,6 @@ def main():
     style_axes_box(ax)
 
     frames = np.arange(nuse)
-    # Plot each peak column as its own series (so legend keys make sense)
     scatters = []
     for j in range(ncols):
         mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
@@ -480,19 +559,14 @@ def main():
     ax.set_ylabel("Center (q or 2θ)")
     ax.set_title("Peak Centers over Frames (colored by fitted height)")
 
-    # Colorbar
     if scatters:
         cbar = fig.colorbar(scatters[0][0], ax=ax, pad=0.02)
         cbar.set_label("Height (fit)")
-
-    # Legend (one entry per plotted peak column)
-    labels = [f"peak col {j}" for _, j in scatters]
-    if scatters:
-        # place legend outside on right in a box
-        leg_elements = [s for s,_ in scatters]
-        leg = ax.legend(leg_elements, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
-                        borderaxespad=0.0, frameon=True, edgecolor="0.7", facecolor="white",
-                        fontsize=8)
+        labels = [f"peak col {j}" for _, j in scatters]
+        leg_elems = [s for s,_ in scatters]
+        ax.legend(leg_elems, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
+                  borderaxespad=0.0, frameon=True, edgecolor="0.7", facecolor="white",
+                  fontsize=8)
         fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
     else:
         fig.tight_layout()
@@ -501,7 +575,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
