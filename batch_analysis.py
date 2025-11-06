@@ -1,48 +1,63 @@
 #!/usr/bin/env python3
-# Barebones multi-peak tracker with optional residual-added shoulder
-# CLI: --h5 DATASET.h5 --centers 2.975,3.124 --frame 87
-# If --frame is omitted, tracks all frames and writes a CSV next to the HDF5.
+# Multi-peak tracker with optional residual-added shoulder, global sigma bounds,
+# fitted-height filtering, polished plotting, and tqdm progress for mapping.
 
-import argparse
-import os
+import argparse, os
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from lmfit.models import GaussianModel, LinearModel
 
-# ------------------------------
-# Tunables (simple, minimal)
-# ------------------------------
-WINDOW = 0.50        # half-width to each side around each seed (q-units)
-MIN_POINTS = 8       # minimum points in the combined window to attempt a fit
-PEAK_HEIGHT_MIN = 5.0  # min fitted height above background for reporting/plotting
+# tqdm (optional)
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
-# Global sigma bounds for ALL Gaussian components (seeded and residual-added)
-SIGMA_MIN_FIT = 0.002    # ↑ raise to avoid needle spikes
-SIGMA_MAX_FIT = 0.080    # ↑ raise to allow broad shoulders
+# ------------------------------
+# Tunables
+# ------------------------------
+WINDOW = 0.50          # half-width around the seeded peak range (q-units)
+MIN_POINTS = 8         # minimum points in window to attempt a fit
+PEAK_HEIGHT_MIN = 5.0  # min *fitted* height above background to report/plot
 
-# Shoulder (residual-add) controls
+# Global sigma bounds for ALL components (seeded and residual-added)
+SIGMA_MIN_FIT = 0.002  # raise to avoid needle spikes
+SIGMA_MAX_FIT = 0.080  # raise to allow broad shoulders
+
+# Residual-shoulder controls
 ENABLE_RESIDUAL_SHOULDER = True
-RESIDUAL_SNR = 3.0       # residual peak must exceed this SNR
-MIN_SEP = 0.010          # min separation from existing centers (x-units)
-AIC_IMPROVE = 6.0        # require ΔAIC <= -AIC_IMPROVE to accept added peak
+RESIDUAL_SNR = 3.0     # residual SNR threshold
+MIN_SEP = 0.010        # min separation from existing peaks (x units)
+AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
+
+# Plotting preferences (Nature-ish)
+PANEL_LABEL = "a"      # set "" to hide
+SHOW_SEEDS = True      # show input seeds as light-blue vlines
+SEC_PER_FRAME = None   # e.g., 0.01 -> title "t sec | R²=..." else "Frame N | R²=..."
 
 # ------------------------------
 # Helpers
 # ------------------------------
 def parse_centers(s: str):
-    vals = [float(v) for v in s.split(",") if v.strip() != ""]
+    vals = [float(v) for v in s.split(",") if v.strip()]
     if not vals:
         raise ValueError("No centers parsed from --centers.")
     return np.array(vals, float)
 
-def sigma_to_fwhm(sigma):
-    return 2.354820045 * sigma
+def sigma_to_fwhm(sigma): return 2.354820045 * sigma
 
 def robust_sigma(y):
     y = np.asarray(y, float)
     med = np.median(y)
     return 1.4826 * np.median(np.abs(y - med)) + 1e-12
+
+def r2_score(y_true, y_fit):
+    y_true = np.asarray(y_true, float)
+    y_fit  = np.asarray(y_fit, float)
+    ss_res = np.sum((y_true - y_fit)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2) + 1e-12
+    return 1.0 - ss_res/ss_tot
 
 def load_q_and_I(h5_path):
     with h5py.File(h5_path, "r") as f:
@@ -51,13 +66,12 @@ def load_q_and_I(h5_path):
         elif "tth" in f:
             x = np.asarray(f["tth"][:], float)
         else:
-            raise ValueError("HDF5 must contain 'q' (preferred) or 'tth' dataset.")
+            raise ValueError("HDF5 must contain 'q' or 'tth'.")
         I_full = np.asarray(f["int"][:], float)
     if I_full.ndim == 1:
         I_full = I_full[None, :]
     elif I_full.ndim > 2:
-        axes = tuple(range(1, I_full.ndim))
-        I_full = I_full.mean(axis=axes)
+        I_full = I_full.mean(axis=tuple(range(1, I_full.ndim)))
     if I_full.shape[1] != x.shape[0]:
         raise ValueError(f"Shape mismatch: int.shape={I_full.shape}, x.shape={x.shape}")
     return x, I_full
@@ -79,23 +93,18 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
 
     span = max(xw[-1] - xw[0], 1e-9)
     sigma0_base = max(span / (7.0 * len(centers)), 1e-6)
-    # clip initial guess into global bounds
     sigma0 = float(np.clip(sigma0_base, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
 
-    # Add one Gaussian per peak
+    # seeded peaks
     for i, c0 in enumerate(centers):
         g = GaussianModel(prefix=f"g{i}_")
         model = model + g
-
-        # seed amplitude from local height above background
         idx = np.abs(xw - c0).argmin()
         y_at_seed = yw[idx]
-        y_bkg_at_seed = bkg_slope * xw[idx] + bkg_intercept
-        height0 = max(y_at_seed - y_bkg_at_seed, np.std(yw) * 0.5)
+        y_bkg = bkg_slope * xw[idx] + bkg_intercept
+        height0 = max(y_at_seed - y_bkg, np.std(yw) * 0.5)
         amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
-
         params.update(g.make_params(center=c0, sigma=sigma0, amplitude=amp0))
-        # enforce global sigma bounds
         params[f"g{i}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
         params[f"g{i}_amplitude"].set(min=0.0)
         params[f"g{i}_center"].set(min=c0 - 0.6*halfwidth, max=c0 + 0.6*halfwidth)
@@ -106,82 +115,71 @@ def _gaussian_y(x, amp, cen, sig):
     return amp * np.exp(-(x - cen)**2 / (2.0 * sig**2))
 
 def _compute_fitted_metrics(result, xw):
-    """Extract background line, per-peak centers/sigmas, heights, fwhm, peak@center."""
+    # background line
     bkg_slope = result.params.get("bkg_slope").value if "bkg_slope" in result.params else 0.0
     bkg_intercept = result.params.get("bkg_intercept").value if "bkg_intercept" in result.params else 0.0
     bkg_line = bkg_slope * xw + bkg_intercept
 
-    # gather peaks
-    i = 0
-    centers = []
-    sigmas = []
-    amps = []
+    # collect gaussians
+    i = 0; centers=[]; sigmas=[]; amps=[]
     while f"g{i}_center" in result.params:
         centers.append(result.params[f"g{i}_center"].value)
         sigmas.append(result.params[f"g{i}_sigma"].value)
         amps.append(result.params[f"g{i}_amplitude"].value)
         i += 1
     centers = np.asarray(centers, float)
-    sigmas = np.asarray(sigmas, float)
-    amps   = np.asarray(amps, float)
+    sigmas  = np.asarray(sigmas, float)
+    amps    = np.asarray(amps, float)
 
-    heights = np.full_like(centers, np.nan, dtype=float)
-    peakfit = np.full_like(centers, np.nan, dtype=float)
-    fwhm    = np.full_like(centers, np.nan, dtype=float)
+    heights = np.full_like(centers, np.nan, float)
+    fwhm    = np.full_like(centers, np.nan, float)
+    peakfit = np.full_like(centers, np.nan, float)
     for j in range(centers.size):
         if np.isfinite(sigmas[j]) and sigmas[j] > 0:
             heights[j] = amps[j] / (sigmas[j] * np.sqrt(2.0 * np.pi))
             fwhm[j] = sigma_to_fwhm(sigmas[j])
         peakfit[j] = (bkg_slope * centers[j] + bkg_intercept) + (heights[j] if np.isfinite(heights[j]) else 0.0)
+
     return bkg_line, centers, sigmas, amps, heights, fwhm, peakfit
 
-def _try_add_shoulder(xw, yw, model, result, halfwidth):
-    """Propose one residual-based extra Gaussian and accept if it passes guardrails."""
-    # Residuals and noise
+def _try_add_shoulder(xw, yw, model, result):
     resid = yw - result.best_fit
     noise = robust_sigma(resid)
     if noise <= 0:
         return model, result, False
 
-    # Candidate at max positive residual
     idx = int(np.argmax(resid))
     peak_resid = resid[idx]
     if peak_resid < RESIDUAL_SNR * noise:
         return model, result, False
 
     x0 = xw[idx]
-
-    # Separation from existing centers
     _, centers, sigmas, amps, heights, fwhm, peakfit = _compute_fitted_metrics(result, xw)
-    if centers.size:
-        if np.min(np.abs(centers - x0)) < MIN_SEP:
-            return model, result, False
+    if centers.size and np.min(np.abs(centers - x0)) < MIN_SEP:
+        return model, result, False
 
-    # Seed amplitude/sigma for the new component (respect global bounds)
     span = max(xw[-1] - xw[0], 1e-9)
-    mean_sigma = np.nanmean(sigmas) if sigmas.size else span / 10.0
-    sigma_seed = float(np.clip(min(mean_sigma, span / 12.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+    mean_sigma = np.nanmean(sigmas) if sigmas.size else span/10.0
+    sigma_seed = float(np.clip(min(mean_sigma, span/12.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
     amp_seed = max(peak_resid * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
 
-    # Build a new model with one extra Gaussian and refit
+    # next prefix
     new_idx = 0
     while f"g{new_idx}_center" in result.params:
         new_idx += 1
     prefix = f"g{new_idx}_"
+
     g = GaussianModel(prefix=prefix)
     new_model = model + g
     new_params = result.params.copy()
-
     new_params.update(g.make_params(center=float(x0), sigma=sigma_seed, amplitude=amp_seed))
     new_params[prefix + "sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
     new_params[prefix + "amplitude"].set(min=0.0)
-    lo, hi = xw[0], xw[-1]
-    new_params[prefix + "center"].set(min=lo, max=hi)
+    new_params[prefix + "center"].set(min=xw[0], max=xw[-1])
 
     new_result = new_model.fit(yw, new_params, x=xw, nan_policy="omit")
 
-    # Model selection: require AIC improvement and height >= threshold
-    dAIC = new_result.aic - result.aic  # negative is better
+    dAIC = new_result.aic - result.aic   # negative is better
     _, c_new, s_new, a_new, h_new, f_new, p_new = _compute_fitted_metrics(new_result, xw)
     if c_new.size <= new_idx:
         return model, result, False
@@ -189,25 +187,16 @@ def _try_add_shoulder(xw, yw, model, result, halfwidth):
 
     if (dAIC <= -AIC_IMPROVE) and np.isfinite(new_height) and (new_height >= PEAK_HEIGHT_MIN):
         return new_model, new_result, True
-    else:
-        return model, result, False
+    return model, result, False
 
 def fit_frame(x, y, centers, halfwidth):
-    """
-    Fit one frame; returns:
-      centers, fwhm, height_fit (above background), peak_fit (background+height at center),
-      components (bkg+gaussian curves for plotted peaks that pass PEAK_HEIGHT_MIN),
-      yfit, xw/yw, success, result
-    """
     m = combined_window_mask(x, centers, halfwidth)
     if not np.any(m):
         return {"success": False}
-
     xw, yw = x[m], y[m]
     if xw.size < MIN_POINTS:
         return {"success": False}
 
-    # 1) initial fit with user-specified peaks
     base_model, params = initial_params_for_frame(xw, yw, centers, halfwidth)
     try:
         result = base_model.fit(yw, params, x=xw, nan_policy="omit")
@@ -215,26 +204,20 @@ def fit_frame(x, y, centers, halfwidth):
         return {"success": False}
 
     model_used = base_model
-
-    # 2) optional one-pass shoulder add via residual peak
     if ENABLE_RESIDUAL_SHOULDER:
-        model_used, result, _ = _try_add_shoulder(xw, yw, model_used, result, halfwidth)
+        model_used, result, _ = _try_add_shoulder(xw, yw, model_used, result)
 
-    # Extract metrics & component curves
+    # metrics
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all = _compute_fitted_metrics(result, xw)
 
-    # Keep only peaks that pass height threshold for reporting/plotting
+    # filter by fitted height
     valid = (h_all >= PEAK_HEIGHT_MIN) & np.isfinite(h_all)
-    centers_out = c_all.copy()
-    fwhm_out = w_all.copy()
-    height_out = h_all.copy()
-    peakfit_out = p_all.copy()
-    centers_out[~valid] = np.nan
-    fwhm_out[~valid] = np.nan
-    height_out[~valid] = np.nan
-    peakfit_out[~valid] = np.nan
+    centers_out = c_all.copy(); centers_out[~valid] = np.nan
+    fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
+    height_out  = h_all.copy(); height_out[~valid]  = np.nan
+    peakfit_out = p_all.copy(); peakfit_out[~valid] = np.nan
 
-    # Build component curves (bkg + that Gaussian) for valid peaks
+    # per-peak component curves (background + that gaussian) for valid peaks
     components = []
     for i in range(c_all.size):
         if not valid[i]:
@@ -242,16 +225,14 @@ def fit_frame(x, y, centers, halfwidth):
         comp = bkg_line + _gaussian_y(xw, a_all[i], c_all[i], s_all[i])
         components.append(comp)
 
+    # R^2 on the window
+    r2 = r2_score(yw, result.best_fit)
+
     return {
         "success": True,
-        "centers": centers_out,
-        "fwhm": fwhm_out,
-        "height_fit": height_out,
-        "peak_fit": peakfit_out,
-        "components": components,
-        "xw": xw,
-        "yw": yw,
-        "yfit": result.best_fit,
+        "xw": xw, "yw": yw, "yfit": result.best_fit, "bkg": bkg_line,
+        "centers": centers_out, "fwhm": fwhm_out, "height_fit": height_out,
+        "peak_fit": peakfit_out, "components": components, "r2": r2,
         "result": result
     }
 
@@ -268,8 +249,8 @@ def apply_nature_style():
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Barebones Gaussian peak tracking (linear background).")
-    ap.add_argument("--h5", required=True, help="HDF5 file with 'q' (or 'tth') and 'int'")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background).")
+    ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True,
                     help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None,
@@ -280,77 +261,103 @@ def main():
     x, I_full = load_q_and_I(args.h5)
     nframes = I_full.shape[0]
 
+    # ---------- Single-frame mode ----------
     if args.frame is not None:
-        if args.frame < 0 or args.frame >= nframes:
+        if not (0 <= args.frame < nframes):
             raise ValueError(f"--frame {args.frame} is out of range [0, {nframes-1}]")
         y = I_full[args.frame]
         res = fit_frame(x, y, centers0, WINDOW/2.0)
         if not res["success"]:
-            print("Fit failed for the requested frame.")
-            return
+            # one retry with wider window
+            res = fit_frame(x, y, centers0, WINDOW)
+            if not res["success"]:
+                print("Fit failed for the requested frame.")
+                return
 
-        # Prepare visible results (drop NaNs)
-        mask = np.isfinite(res["centers"])
-        centers_v = res["centers"][mask]
-        fwhm_v = res["fwhm"][mask]
-        hfit_v = res["height_fit"][mask]
-        pfit_v = res["peak_fit"][mask]
+        # visible (non-NaN) peaks
+        vis = np.isfinite(res["centers"])
+        centers_v = res["centers"][vis]
+        fwhm_v    = res["fwhm"][vis]
+        hfit_v    = res["height_fit"][vis]
+        pfit_v    = res["peak_fit"][vis]
 
+        # print numeric results
         print(f"# Frame {args.frame}")
         for i_vis, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v)):
             print(f"peak{i_vis}_center={c:.6f}, peak{i_vis}_FWHM={w:.6f}, "
                   f"peak{i_vis}_height_fit={h:.6f}, peak{i_vis}_peak_fit={p:.6f}")
 
+        # ---- Plot ----
         apply_nature_style()
         from matplotlib.gridspec import GridSpec
-        fig = plt.figure(figsize=(6.2, 4.6))
+        fig = plt.figure(figsize=(6.4, 4.8))
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.4], hspace=0.15)
         ax = fig.add_subplot(gs[0])
 
-        ax.plot(res["xw"], res["yw"], lw=1.0, label="data")
-        ax.plot(res["xw"], res["yfit"], lw=1.2, label="fit")
+        # panel label
+        if PANEL_LABEL:
+            ax.text(-0.12, 1.02, PANEL_LABEL, transform=ax.transAxes,
+                    fontsize=12, fontweight="bold", va="bottom", ha="left")
 
-        # Dotted component curves (bkg + each Gaussian that passed threshold)
+        # data / fit / background
+        ax.plot(res["xw"], res["yw"], lw=1.0, label="Data")
+        ax.plot(res["xw"], res["yfit"], lw=1.3, label="Fit")
+        ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Background", color="tab:green")
+
+        # components (bkg + Gaussian) dotted
         for comp in res["components"]:
-            ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.6, label=None)
+            ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.6, color="0.4")
 
+        # seed guide lines (optional)
+        if SHOW_SEEDS:
+            for s in centers0:
+                ax.axvline(s, color="#7ec8ff", lw=0.8, alpha=0.7)
+
+        # fitted centers
         for c in centers_v:
-            ax.axvline(c, linestyle="--", alpha=0.6, lw=0.9)
+            ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.5")
+
+        # title with R^2 (and time if provided)
+        if SEC_PER_FRAME is not None:
+            t = args.frame * float(SEC_PER_FRAME)
+            ax.set_title(f"{t:.1f} sec | R²={res['r2']:.4f}")
+        else:
+            ax.set_title(f"Frame {args.frame} | R²={res['r2']:.4f}")
 
         ax.set_xlabel("q (1/Å)")
-        ax.set_ylabel("Intensity (a.u.)")
-        ax.set_title(f"Frame {args.frame} multi-peak fit")
+        ax.set_ylabel("Intensity")
         ax.minorticks_on()
-        ax.legend(fontsize=8, ncol=2)
+        ax.legend(fontsize=8, ncol=3)
 
-        # Table with fitted metrics
+        # table (fitted values)
         ax_tbl = fig.add_subplot(gs[1])
         ax_tbl.axis("off")
         table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
                       for i, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v))]
         col_labels = ["Peak", "Center", "FWHM", "Height (fit)", "Peak@Center (fit)"]
-
         tbl = ax_tbl.table(cellText=table_data, colLabels=col_labels, loc="center")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8)
+        tbl.auto_set_font_size(False); tbl.set_fontsize(8)
         for key, cell in tbl.get_celld().items():
-            cell.set_edgecolor("0.8")
-            cell.set_linewidth(0.6)
-            cell.set_height(0.18)
-            cell.set_alpha(0.0 if key[0] == 0 else 0.15)
+            cell.set_edgecolor("0.8"); cell.set_linewidth(0.6)
+            cell.set_height(0.18); cell.set_alpha(0.0 if key[0] == 0 else 0.12)
 
         fig.tight_layout()
         plt.show()
         return
 
-    # Track all frames (allow one residual shoulder peak)
+    # ---------- Mapping mode (all frames, with tqdm) ----------
     nuse = nframes
     npeaks_seeded = len(centers0)
-    centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)  # +1 in case shoulder is accepted
-    fwhm_trk = np.full((nuse, npeaks_seeded + 1), np.nan)
+    # allow one optional shoulder peak in the CSV layout
+    centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)
+    fwhm_trk    = np.full((nuse, npeaks_seeded + 1), np.nan)
 
     seeds = centers0.copy()
-    for f in range(nuse):
+    iterator = range(nuse)
+    if tqdm is not None:
+        iterator = tqdm(iterator, desc="Fitting frames", ncols=80)
+
+    for f in iterator:
         y = I_full[f]
         res = fit_frame(x, y, seeds, WINDOW/2.0)
         if not res["success"]:
@@ -361,11 +368,12 @@ def main():
             wvis = res["fwhm"][vis]
             k = min(cvis.size, centers_trk.shape[1])
             centers_trk[f, :k] = cvis[:k]
-            fwhm_trk[f, :k] = wvis[:k]
+            fwhm_trk[f, :k]    = wvis[:k]
+            # update seeds if we have at least as many visible peaks as seeds
             if cvis.size >= seeds.size:
                 seeds = cvis[:seeds.size]
 
-    # CSV (fixed number of columns: seeded + one optional)
+    # Write CSV
     base = os.path.splitext(os.path.basename(args.h5))[0]
     csv_path = f"{base}_multi_peak_tracking.csv"
     header_cols = ["frame"] + [f"center_{i}" for i in range(centers_trk.shape[1])] + \
@@ -375,6 +383,7 @@ def main():
                comments="", fmt="%.10g")
     print(f"Wrote: {csv_path}")
 
+    # Preview
     preview_rows = min(5, nuse)
     print("# preview:")
     for r in range(preview_rows):
