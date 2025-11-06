@@ -308,11 +308,6 @@ def main():
         for comp in res["components"]:
             ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.6, color="0.4")
 
-        # seed guide lines (optional)
-        if SHOW_SEEDS:
-            for s in centers0:
-                ax.axvline(s, color="#7ec8ff", lw=0.8, alpha=0.7)
-
         # fitted centers
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.5")
@@ -393,3 +388,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
