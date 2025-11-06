@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# Multi-peak tracker with optional residual-added shoulder, global sigma bounds,
-# fitted-height filtering, polished plotting, and tqdm progress for mapping.
+# Multi-peak tracker with residual-added shoulder, global sigma bounds,
+# fitted-height filtering, asymmetric seed-shift limits, polished plotting,
+# and tqdm progress for mapping.
 
 import argparse, os
 import numpy as np
@@ -17,13 +18,18 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-WINDOW = 0.50          # half-width around the seeded peak range (q-units)
+WINDOW = 0.50          # half-width around the seeded peak range (x-units, e.g., q)
 MIN_POINTS = 8         # minimum points in window to attempt a fit
 PEAK_HEIGHT_MIN = 5.0  # min *fitted* height above background to report/plot
 
 # Global sigma bounds for ALL components (seeded and residual-added)
 SIGMA_MIN_FIT = 0.002  # raise to avoid needle spikes
 SIGMA_MAX_FIT = 0.080  # raise to allow broad shoulders
+
+# Asymmetric per-frame seed shift limits (relative to current seed)
+# center_i ∈ [seed_i - CENTER_SHIFT_NEG, seed_i + CENTER_SHIFT_POS]
+CENTER_SHIFT_NEG = 0.030
+CENTER_SHIFT_POS = 0.010
 
 # Residual-shoulder controls
 ENABLE_RESIDUAL_SHOULDER = True
@@ -81,7 +87,11 @@ def combined_window_mask(x, centers, halfwidth):
     hi = np.max(centers) + halfwidth
     return (x >= lo) & (x <= hi)
 
-def initial_params_for_frame(xw, yw, centers, halfwidth):
+def initial_params_for_frame(xw, yw, seeds, halfwidth):
+    """
+    Build model (linear background + one Gaussian per seed) & params.
+    Enforces asymmetric per-seed shift limits around 'seeds'.
+    """
     # background initial guess
     try:
         bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
@@ -92,22 +102,25 @@ def initial_params_for_frame(xw, yw, centers, halfwidth):
     params = model.make_params(bkg_slope=bkg_slope, bkg_intercept=bkg_intercept)
 
     span = max(xw[-1] - xw[0], 1e-9)
-    sigma0_base = max(span / (7.0 * len(centers)), 1e-6)
+    sigma0_base = max(span / (7.0 * len(seeds)), 1e-6)
     sigma0 = float(np.clip(sigma0_base, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
 
     # seeded peaks
-    for i, c0 in enumerate(centers):
+    for i, c_seed in enumerate(seeds):
         g = GaussianModel(prefix=f"g{i}_")
         model = model + g
-        idx = np.abs(xw - c0).argmin()
+        idx = np.abs(xw - c_seed).argmin()
         y_at_seed = yw[idx]
         y_bkg = bkg_slope * xw[idx] + bkg_intercept
         height0 = max(y_at_seed - y_bkg, np.std(yw) * 0.5)
         amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
-        params.update(g.make_params(center=c0, sigma=sigma0, amplitude=amp0))
+        params.update(g.make_params(center=c_seed, sigma=sigma0, amplitude=amp0))
+        # enforce global sigma bounds
         params[f"g{i}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
         params[f"g{i}_amplitude"].set(min=0.0)
-        params[f"g{i}_center"].set(min=c0 - 0.6*halfwidth, max=c0 + 0.6*halfwidth)
+        # asymmetric seed-shift limits
+        params[f"g{i}_center"].set(min=c_seed - CENTER_SHIFT_NEG,
+                                   max=c_seed + CENTER_SHIFT_POS)
 
     return model, params
 
@@ -175,7 +188,7 @@ def _try_add_shoulder(xw, yw, model, result):
     new_params.update(g.make_params(center=float(x0), sigma=sigma_seed, amplitude=amp_seed))
     new_params[prefix + "sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
     new_params[prefix + "amplitude"].set(min=0.0)
-    new_params[prefix + "center"].set(min=xw[0], max=xw[-1])
+    new_params[prefix + "center"].set(min=xw[0], max=xw[-1])  # keep within window
 
     new_result = new_model.fit(yw, new_params, x=xw, nan_policy="omit")
 
@@ -189,15 +202,15 @@ def _try_add_shoulder(xw, yw, model, result):
         return new_model, new_result, True
     return model, result, False
 
-def fit_frame(x, y, centers, halfwidth):
-    m = combined_window_mask(x, centers, halfwidth)
+def fit_frame(x, y, seeds, halfwidth):
+    m = combined_window_mask(x, seeds, halfwidth)
     if not np.any(m):
         return {"success": False}
     xw, yw = x[m], y[m]
     if xw.size < MIN_POINTS:
         return {"success": False}
 
-    base_model, params = initial_params_for_frame(xw, yw, centers, halfwidth)
+    base_model, params = initial_params_for_frame(xw, yw, seeds, halfwidth)
     try:
         result = base_model.fit(yw, params, x=xw, nan_policy="omit")
     except Exception:
@@ -226,7 +239,9 @@ def fit_frame(x, y, centers, halfwidth):
         components.append(comp)
 
     # R^2 on the window
-    r2 = r2_score(yw, result.best_fit)
+    ss_res = np.sum((yw - result.best_fit)**2)
+    ss_tot = np.sum((yw - np.mean(yw))**2) + 1e-12
+    r2 = 1.0 - ss_res/ss_tot
 
     return {
         "success": True,
@@ -257,7 +272,7 @@ def main():
                     help="Fit a single frame index. Omit to track all frames.")
     args = ap.parse_args()
 
-    centers0 = parse_centers(args.centers)
+    seeds0 = parse_centers(args.centers)   # seeds for first use
     x, I_full = load_q_and_I(args.h5)
     nframes = I_full.shape[0]
 
@@ -266,22 +281,20 @@ def main():
         if not (0 <= args.frame < nframes):
             raise ValueError(f"--frame {args.frame} is out of range [0, {nframes-1}]")
         y = I_full[args.frame]
-        res = fit_frame(x, y, centers0, WINDOW/2.0)
+        res = fit_frame(x, y, seeds0, WINDOW/2.0)
         if not res["success"]:
-            # one retry with wider window
-            res = fit_frame(x, y, centers0, WINDOW)
+            # one retry with wider window (same asymmetric shift limits)
+            res = fit_frame(x, y, seeds0, WINDOW)
             if not res["success"]:
                 print("Fit failed for the requested frame.")
                 return
 
-        # visible (non-NaN) peaks
         vis = np.isfinite(res["centers"])
         centers_v = res["centers"][vis]
         fwhm_v    = res["fwhm"][vis]
         hfit_v    = res["height_fit"][vis]
         pfit_v    = res["peak_fit"][vis]
 
-        # print numeric results
         print(f"# Frame {args.frame}")
         for i_vis, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v)):
             print(f"peak{i_vis}_center={c:.6f}, peak{i_vis}_FWHM={w:.6f}, "
@@ -294,25 +307,20 @@ def main():
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.4], hspace=0.15)
         ax = fig.add_subplot(gs[0])
 
-        # panel label
         if PANEL_LABEL:
             ax.text(-0.12, 1.02, PANEL_LABEL, transform=ax.transAxes,
                     fontsize=12, fontweight="bold", va="bottom", ha="left")
 
-        # data / fit / background
         ax.plot(res["xw"], res["yw"], lw=1.0, label="Data")
         ax.plot(res["xw"], res["yfit"], lw=1.3, label="Fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Background", color="tab:green")
 
-        # components (bkg + Gaussian) dotted
         for comp in res["components"]:
             ax.plot(res["xw"], comp, ":", lw=0.9, alpha=0.6, color="0.4")
 
-        # fitted centers
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.5")
 
-        # title with R^2 (and time if provided)
         if SEC_PER_FRAME is not None:
             t = args.frame * float(SEC_PER_FRAME)
             ax.set_title(f"{t:.1f} sec | R²={res['r2']:.4f}")
@@ -324,7 +332,6 @@ def main():
         ax.minorticks_on()
         ax.legend(fontsize=8, ncol=3)
 
-        # table (fitted values)
         ax_tbl = fig.add_subplot(gs[1])
         ax_tbl.axis("off")
         table_data = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
@@ -342,12 +349,12 @@ def main():
 
     # ---------- Mapping mode (all frames, with tqdm) ----------
     nuse = nframes
-    npeaks_seeded = len(centers0)
-    # allow one optional shoulder peak in the CSV layout
+    npeaks_seeded = len(seeds0)
+    # allow one optional shoulder peak in the CSV layout (visible peaks only)
     centers_trk = np.full((nuse, npeaks_seeded + 1), np.nan)
     fwhm_trk    = np.full((nuse, npeaks_seeded + 1), np.nan)
 
-    seeds = centers0.copy()
+    seeds = seeds0.copy()
     iterator = range(nuse)
     if tqdm is not None:
         iterator = tqdm(iterator, desc="Fitting frames", ncols=80)
@@ -364,9 +371,10 @@ def main():
             k = min(cvis.size, centers_trk.shape[1])
             centers_trk[f, :k] = cvis[:k]
             fwhm_trk[f, :k]    = wvis[:k]
-            # update seeds if we have at least as many visible peaks as seeds
-            if cvis.size >= seeds.size:
-                seeds = cvis[:seeds.size]
+            # update seeds from the first 'npeaks_seeded' visible centers (asymmetric limits will apply next frame)
+            if cvis.size >= npeaks_seeded:
+                seeds = cvis[:npeaks_seeded]
+            # else: keep previous seeds (bounds remain around the last good positions)
 
     # Write CSV
     base = os.path.splitext(os.path.basename(args.h5))[0]
@@ -388,4 +396,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
