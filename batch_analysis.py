@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # Multi-peak tracker: residual-added shoulder, global sigma bounds,
 # fitted-height filtering, asymmetric seed-shift limits, polished plotting,
@@ -26,7 +25,7 @@ PEAK_HEIGHT_MIN = 5.0  # min *fitted* height above background to report/plot
 
 # Global sigma bounds for ALL components (seeded and residual-added)
 SIGMA_MIN_FIT = 0.0002  # raise to avoid needle spikes
-SIGMA_MAX_FIT = 0.080  # raise to allow broad shoulders
+SIGMA_MAX_FIT = 0.080   # raise to allow broad shoulders
 
 # Asymmetric per-frame seed shift limits (relative to current seed)
 # center_i ∈ [seed_i - CENTER_SHIFT_NEG, seed_i + CENTER_SHIFT_POS]
@@ -35,14 +34,14 @@ CENTER_SHIFT_POS = 0.010
 
 # Residual-shoulder controls
 ENABLE_RESIDUAL_SHOULDER = True
-RESIDUAL_SNR = 0.5     # residual SNR threshold
+RESIDUAL_SNR = 0.5      # residual SNR threshold
 MIN_SEP = 0.0010        # min separation from existing peaks (x units)
-AIC_IMPROVE = 6.0      # require ΔAIC <= -AIC_IMPROVE to accept new peak
+AIC_IMPROVE = 6.0       # require ΔAIC <= -AIC_IMPROVE to accept new peak
 
 # Plotting preferences
-PANEL_LABEL = ""           # set "" to hide
+PANEL_LABEL = ""            # set "" to hide
 SHOW_SEEDS = True           # show input seeds as light-blue vlines
-SEC_PER_FRAME = .004       # e.g., 0.01 -> title "t sec | R²=..."
+SEC_PER_FRAME = .004        # e.g., 0.01 -> title "t sec | R²=..."
 PLOT_ONLY_VALID_COMPONENTS = False  # if True, only components that pass PEAK_HEIGHT_MIN are drawn
 SHOW_COMPONENT_SUM = True   # draw thin black line of (background + sum(components))
 LEGEND_COLS = 3
@@ -170,7 +169,20 @@ def _compute_fitted_metrics(result, xw):
 
     return bkg_line, centers, sigmas, amps, heights, fwhm, peakfit, comps
 
-def _try_add_shoulder(xw, yw, model, result):
+# --- MODIFIED: add a cap on number of components via max_allowed ---
+def _try_add_shoulder(xw, yw, model, result, max_allowed):
+    """
+    Try adding a residual-based shoulder, but NEVER exceed max_allowed components.
+    max_allowed should typically be len(seeds) from the CLI.
+    """
+    # count current components
+    n_now = 0
+    while f"g{n_now}_center" in result.params:
+        n_now += 1
+    if n_now >= max_allowed:
+        # Already at or above the cap → refuse to add.
+        return model, result, False
+
     resid = yw - result.best_fit
     noise = robust_sigma(resid)
     if noise <= 0:
@@ -192,9 +204,7 @@ def _try_add_shoulder(xw, yw, model, result):
     amp_seed = max(peak_resid * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
 
     # next prefix
-    new_idx = 0
-    while f"g{new_idx}_center" in result.params:
-        new_idx += 1
+    new_idx = n_now  # append at the end
     prefix = f"g{new_idx}_"
 
     g = GaussianModel(prefix=prefix)
@@ -244,7 +254,9 @@ def fit_frame(x, y, seeds, halfwidth):
 
     model_used = base_model
     if ENABLE_RESIDUAL_SHOULDER:
-        model_used, result, _ = _try_add_shoulder(xw, yw, model_used, result)
+        # --- pass cap: at most as many components as user-supplied centers ---
+        max_allowed = len(seeds)
+        model_used, result, _ = _try_add_shoulder(xw, yw, model_used, result, max_allowed)
 
     # metrics
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps_all = _compute_fitted_metrics(result, xw)
@@ -413,12 +425,11 @@ def main():
     # ---------- Mapping mode (all frames, with tqdm) ----------
     nuse = nframes
     npeaks_seeded = len(seeds0)
-    # allow one optional shoulder column
+    # allow one optional shoulder column (still allocated, but residual add is capped)
     ncols = npeaks_seeded + 1
     centers_trk = np.full((nuse, ncols), np.nan)
     fwhm_trk    = np.full((nuse, ncols), np.nan)
     height_trk  = np.full((nuse, ncols), np.nan)   # store fitted heights for coloring
-    # (could also store peak@center if desired)
 
     seeds = seeds0.copy()
     iterator = range(nuse)
@@ -502,7 +513,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
