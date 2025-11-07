@@ -21,7 +21,7 @@ MAX_FRAMES = 200    # max frames processed
 # Frames of interest
 MELT_FRAME = 59     # where melting happened (time origin for exponential)
 FIT_START  = 60     # start frame for exponential fit
-FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
+FIT_END    = 800    # end frame for exponential fit (capped by available nframes)
 
 # Reflection (set to your peak)
 h, k, l = 2, 0, 0
