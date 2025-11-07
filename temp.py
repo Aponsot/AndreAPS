@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import os
 import numpy as np
@@ -270,8 +269,14 @@ def main():
                 A_fit, alpha_fit = popt
                 tau_fit = 1.0 / alpha_fit
 
-                # Extrapolate and plot from MELT_FRAME onward
-                x_line = np.arange(MELT_FRAME, nframes)
+                # Diagnostic output
+                print(f"DS{i} FIT PARAMS: A={A_fit:.2f}, alpha={alpha_fit:.6f}, tau={tau_fit:.2f} frames")
+                print(f"  T at frame {MELT_FRAME}: {exp_single(MELT_FRAME, *popt):.1f}°C")
+                print(f"  T at frame {max_frame_for_fit}: {exp_single(max_frame_for_fit, *popt):.1f}°C")
+                print(f"  Expected decay over fit window: {A_fit * (1 - np.exp(-alpha_fit * (max_frame_for_fit - MELT_FRAME))):.1f}°C")
+
+                # Extrapolate and plot from MELT_FRAME onward with DENSE sampling
+                x_line = np.linspace(MELT_FRAME, nframes-1, 500)
                 y_line = exp_single(x_line, *popt)
                 line = ['-', '--', ':'][i % 3]
                 ax.plot(x_line, y_line, color=Color, linewidth=2.0, linestyle=line,
