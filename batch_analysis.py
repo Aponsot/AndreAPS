@@ -273,7 +273,7 @@ def _try_residual_add_bic(xw, yw, result, max_n):
     base_bic = result.bic
     if n_now < max_n:
         trial = _trial_with()
-        if trial.bic < base_bic +.5:
+        if trial.bic < base_bic +1:
             return trial, True
         return result, False
 
@@ -510,6 +510,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
