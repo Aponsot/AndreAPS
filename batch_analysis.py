@@ -14,7 +14,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.13
+HALF_WINDOW = 0.135
 MIN_POINTS  = 8
 
 # Peak reporting/pruning floor (applied at the END when reporting/plotting)
@@ -30,7 +30,7 @@ DRIFT_POS = 0.010
 
 # Shoulder logic (both respect cap)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.1
+RESIDUAL_SNR    = 0.05
 MIN_SEP         = 0.000010
 AIC_IMPROVE     = 1.0
 
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
