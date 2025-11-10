@@ -21,7 +21,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.15      # window half-width around [min(seeds), max(seeds)]
+HALF_WINDOW = 0.10     # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8           # min points in window to attempt a fit
 
 # Peak reporting/pruning floor (for keeping/plotting components)
@@ -42,8 +42,8 @@ MIN_SEP         = 0.00010    # min separation from existing centers
 AIC_IMPROVE     = 4.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 # Admission looseners for new components (avoid height floor blocking)
-ADD_SNR_MIN         = 0.80   # admit new comp if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
-EDGE_SNR_AREA_MIN   = 2.0    # area-SNR threshold for edge/flank addition
+ADD_SNR_MIN         = 0.40   # admit new comp if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
+EDGE_SNR_AREA_MIN   = .1    # area-SNR threshold for edge/flank addition
 
 SEC_PER_FRAME   = 0.004      # for titles; set None to show "Frame N" instead
 
@@ -607,6 +607,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
