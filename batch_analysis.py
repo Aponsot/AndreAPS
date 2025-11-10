@@ -47,8 +47,8 @@ SEC_PER_FRAME   = 0.004   # for titles; set None to show "Frame N" instead
 BROAD_FWHM_TRIGGER = 0.020      # if any fitted FWHM exceeds this, enable shoulder mode
 SHOULDER_MODE_NBOOST = 1        # allow up to +1 extra component *only* in shoulder mode
 # Looseners used only during shoulder mode (per-frame)
-SHOULDER_RESIDUAL_SNR  = 0.30   # was 0.35
-SHOULDER_AIC_IMPROVE   = 3.0    # was 4.0
+SHOULDER_RESIDUAL_SNR  = 0.05   # was 0.35
+SHOULDER_AIC_IMPROVE   = 1.0    # was 4.0
 SHOULDER_MIN_SEP       = 0.00008
 SHOULDER_DRIFT_SCALE   = 1.3
 SHOULDER_DRIFT_ADD     = (0.005, 0.002)  # (neg, pos) absolute slack
@@ -514,3 +514,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
