@@ -20,7 +20,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.50        # window half-width around [min(seeds), max(seeds)]
+HALF_WINDOW = 0.25       # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8           # min points in window to attempt a fit
 
 # Peak reporting/pruning floor
@@ -455,3 +455,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
