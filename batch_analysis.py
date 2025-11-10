@@ -521,7 +521,7 @@ def fit_frame(x, y, seeds, halfwidth, max_allowed):
 # ------------------------------
 def apply_pub_style():
     plt.rcParams.update({
-        "figure.figsize": (6.5, 4.8),
+        "figure.figsize": (6, 4),
         "figure.dpi": 160,
         "savefig.dpi": 300,
         "font.size": 12,
@@ -588,12 +588,10 @@ def main():
         ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
         ax.plot(res["xw"], res["yw"],  lw=1.2, label="Data")
         ax.plot(res["xw"], res["yfit"], lw=1.6, label="Total fit")
-        ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Linear bkg")
+  
 
         for comp in res["components"]:
             ax.plot(res["xw"], comp, ":", lw=1.0, alpha=0.75)
-
-        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.55, label="Gaussians + bkg")
 
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.6, lw=1.0, color="0.45")
@@ -666,11 +664,10 @@ def main():
         sc = ax.scatter(frames[mask], centers_trk[mask, j],
                         c=height_trk[mask, j], cmap="plasma",
                         s=18, linewidths=0.0, edgecolors="none")
-        handles.append(sc); labels.append(f"Peak {j}")
+        handles.append(sc); 
 
     ax.set_xlabel("Frame")
     ax.set_ylabel("Center (q or 2θ)")
-    ax.set_title("Peak centers over frames (color = fitted height)")
 
     if handles:
         cbar = fig.colorbar(handles[0], ax=ax, pad=0.02)
@@ -684,3 +681,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
