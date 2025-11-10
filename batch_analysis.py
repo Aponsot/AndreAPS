@@ -576,14 +576,14 @@ def main():
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.2], hspace=0.18)
 
         ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
-        ax.plot(res["xw"], res["yw"],  lw=1.2, label="Data")
-        ax.plot(res["xw"], res["yfit"], lw=1.8, label="Total fit")
+        ax.plot(res["xw"], res["yw"],  lw=1,  label="Data")
+        ax.plot(res["xw"], res["yfit"], lw=1.8, "--", label="Total fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Linear bkg")
 
         for comp in res["components"]:
             ax.plot(res["xw"], comp, lw=0.9, alpha=0.9)
 
-        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.55, label="Gaussians + bkg")
+        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", "--", alpha=0.55,)
 
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.4")
@@ -599,7 +599,7 @@ def main():
         ax.set_title(title_prefix + f"R²={res['r2']:.4f}", pad=6)
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity (a.u.)")
-        ax.legend(loc="upper right", ncol=1)
+        ax.legend(loc="upper right", ncol=1,fontsize = 10)
 
         # Residual panel
         axr = fig.add_subplot(gs[1]); style_axes(axr, light_grid=False)
@@ -699,3 +699,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
