@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# Core v1.2 — Gaussian multi-peak fitting with linear background
+# Core v1.3 — Gaussian multi-peak fitting with linear background
 # - Single-frame and full-experiment tracking
 # - Fixed number of peaks from --centers (hard cap)
 # - Prune low-height components (< PEAK_HEIGHT_MIN) BEFORE shoulder detection
 # - Residual shoulder detection (cap respected)
-# - NEW: Shoulder-hunt mode triggers when any FWHM > BROAD_FWHM_TRIGGER:
-#        temporarily loosens drift/SNR/AIC/MIN_SEP and allows +1 component (tunable)
+# - NEW: Edge/Flank shoulder detector that seeds a broad Gaussian from run-of-residuals on one side
+# - Loosened sigma_min to avoid blocking narrow/medium features
 
 import argparse, os
 import numpy as np
@@ -24,34 +24,28 @@ except Exception:
 HALF_WINDOW = 0.20        # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8           # min points in window to attempt a fit
 
-# Peak reporting/pruning floor
-PEAK_HEIGHT_MIN = 5.0     # components with fitted height < this are pruned
+# Peak reporting/pruning floor (for keeping/plotting components)
+PEAK_HEIGHT_MIN = 5.0
 
-# Global sigma bounds
-SIGMA_MIN_FIT = 0.005
+# Global sigma bounds (loosened min to avoid blocking)
+SIGMA_MIN_FIT = 0.001
 SIGMA_MAX_FIT = 0.080
 
 # Per-seed drift limits per frame (asymmetric)
 DRIFT_NEG = 0.10
 DRIFT_POS = 0.010
 
-# Residual-shoulder logic (default, strict) — never exceed seeded count
+# Residual-shoulder logic (point-peak style; cap respected)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.35    # residual peak must be ≥ SNR * robust_noise
-MIN_SEP         = 0.00010 # min separation from existing centers
-AIC_IMPROVE     = 4.0     # require ΔAIC ≤ -AIC_IMPROVE to accept addition
+RESIDUAL_SNR    = 0.35       # residual peak must be ≥ SNR * robust_noise
+MIN_SEP         = 0.00010    # min separation from existing centers
+AIC_IMPROVE     = 4.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
-SEC_PER_FRAME   = 0.004   # for titles; set None to show "Frame N" instead
+# NEW: Admission looseners for new components (don’t let height floor block)
+ADD_SNR_MIN         = 0.80   # admit new comp if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
+EDGE_SNR_AREA_MIN   = 2.0    # area-SNR threshold for edge/flank addition
 
-# --- Shoulder-hunt trigger (broad main peak) ---
-BROAD_FWHM_TRIGGER = 0.020      # if any fitted FWHM exceeds this, enable shoulder mode
-SHOULDER_MODE_NBOOST = 1        # allow up to +1 extra component *only* in shoulder mode
-# Looseners used only during shoulder mode (per-frame)
-SHOULDER_RESIDUAL_SNR  = 0.05   # was 0.35
-SHOULDER_AIC_IMPROVE   = 1.0    # was 4.0
-SHOULDER_MIN_SEP       = 0.00008
-SHOULDER_DRIFT_SCALE   = 1.3
-SHOULDER_DRIFT_ADD     = (0.005, 0.002)  # (neg, pos) absolute slack
+SEC_PER_FRAME   = 0.004      # for titles; set None to show "Frame N" instead
 
 # ------------------------------
 # Helpers
@@ -189,17 +183,22 @@ def _rebuild_from_kept(xw, yw, result, keep_mask):
             params_new.update(gk.make_params(center=ccur, sigma=scur, amplitude=acur))
             params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
             params_new[f"g{next_idx}_amplitude"].set(min=0.0)
-            # Keep a small drift band around current center for this refit
             params_new[f"g{next_idx}_center"].set(min=ccur - DRIFT_NEG, max=ccur + DRIFT_POS)
             next_idx += 1
         j += 1
 
-    # If no components kept, we still have background-only model
     refit = model_new.fit(yw, params_new, x=xw, nan_policy="omit")
     return model_new, refit
 
+def _accept_new_component(trial, base_aic, xw, new_height, noise):
+    """Admission rule for a new/edge component."""
+    daic_ok = (trial.aic <= base_aic - AIC_IMPROVE)
+    height_ok = (np.isfinite(new_height) and
+                 (new_height >= PEAK_HEIGHT_MIN or new_height >= ADD_SNR_MIN * max(noise, 1e-12)))
+    return daic_ok and height_ok
+
 def _try_residual_add(xw, yw, result, max_n):
-    """Try adding a residual-based component, but NEVER exceed max_n."""
+    """Point-peak shoulder add (never exceed max_n)."""
     # count current components
     n_now = 0
     while f"g{n_now}_center" in result.params:
@@ -226,64 +225,211 @@ def _try_residual_add(xw, yw, result, max_n):
     if centers_old.size and np.min(np.abs(centers_old - x0)) < MIN_SEP:
         return result, False
 
-    # seed width: modest, not needle-thin
+    # seed width: modest
     span = max(xw[-1] - xw[0], 1e-9)
     mean_sigma = np.nanmean([result.params[f"g{k}_sigma"].value for k in range(n_now)]) if n_now else span/10.0
     sigma_seed = float(np.clip(min(max(mean_sigma, span/12.0), span/8.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
     amp_seed = max(resid[idx] * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
 
-    # build trial with candidate appended (only if under cap)
-    if n_now >= max_n:
+    # Build trial with candidate appended, or replace weakest if at cap
+    from lmfit import Parameters
+    def _build_params_from_result(res, drop_idx=None):
+        params_new = Parameters()
+        model_expr = LinearModel(prefix="bkg_")
+        for nm in ["bkg_slope","bkg_intercept"]:
+            if nm in res.params:
+                p = res.params[nm]
+                params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
+            else:
+                params_new.add(nm, value=0.0)
+        # copy existing (optionally drop one)
+        next_idx = 0
+        j = 0
+        while f"g{j}_center" in res.params:
+            if drop_idx is not None and j == drop_idx:
+                j += 1; continue
+            g = GaussianModel(prefix=f"g{next_idx}_")
+            model_expr = model_expr + g
+            params_new.update(g.make_params(
+                center=res.params[f"g{j}_center"].value,
+                sigma =res.params[f"g{j}_sigma"].value,
+                amplitude=res.params[f"g{j}_amplitude"].value))
+            params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+            params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+            ccur = res.params[f"g{j}_center"].value
+            params_new[f"g{next_idx}_center"].set(min=ccur-DRIFT_NEG, max=ccur+DRIFT_POS)
+            next_idx += 1; j += 1
+        return model_expr, params_new, next_idx
+
+    n_now = int(n_now)
+    if n_now < max_n:
+        model_expr, params_new, next_idx = _build_params_from_result(result)
+        gnew = GaussianModel(prefix=f"g{next_idx}_")
+        model_expr = model_expr + gnew
+        params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
+        params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+        params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+        params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
+
+        trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
+        _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+        new_h = h[-1] if h.size else -np.inf
+        if _accept_new_component(trial, result.aic, xw, new_h, noise):
+            return trial, True
         return result, False
 
-    from lmfit import Parameters
-    params_new = Parameters()
-    model_expr = LinearModel(prefix="bkg_")
-    for nm in ["bkg_slope","bkg_intercept"]:
-        if nm in result.params:
-            p = result.params[nm]
-            params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
-        else:
-            params_new.add(nm, value=0.0)
-
-    # copy existing
-    for j in range(n_now):
-        g = GaussianModel(prefix=f"g{j}_")
-        model_expr = model_expr + g
-        for nm in [f"g{j}_center", f"g{j}_sigma", f"g{j}_amplitude"]:
-            p = result.params[nm]
-            params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
-
-    # add candidate
-    gnew = GaussianModel(prefix=f"g{n_now}_")
+    # At cap: try replacing the weakest height
+    _, c0, s0, a0, h0, _, _, _ = _extract_metrics(result, xw)
+    if h0.size == 0:
+        return result, False
+    weakest = int(np.nanargmin(h0))
+    model_expr, params_new, next_idx = _build_params_from_result(result, drop_idx=weakest)
+    gnew = GaussianModel(prefix=f"g{next_idx}_")
     model_expr = model_expr + gnew
     params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
-    params_new[f"g{n_now}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-    params_new[f"g{n_now}_amplitude"].set(min=0.0)
-    params_new[f"g{n_now}_center"].set(min=xw[0], max=xw[-1])
-
+    params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+    params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+    params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
-    dAIC = trial.aic - result.aic  # negative is better
-
-    # accept only if it clearly improves and the new peak is tall enough
     _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
-    new_height = h[-1] if h.size else -np.inf
-    if (dAIC <= -AIC_IMPROVE) and np.isfinite(new_height) and new_height >= PEAK_HEIGHT_MIN:
+    new_h = h[-1] if h.size else -np.inf
+    if _accept_new_component(trial, result.aic, xw, new_h, noise):
         return trial, True
     return result, False
 
-def _apply_drift_relax(params, scale=1.0, add_neg=0.0, add_pos=0.0):
-    """Loosen center bounds for a params set (in-place)."""
-    i = 0
-    while f"g{i}_center" in params:
-        p = params[f"g{i}_center"]
-        c = p.value
-        lo = p.min if p.min is not None else c - 1.0
-        hi = p.max if p.max is not None else c + 1.0
-        neg = (c - lo) * scale + add_neg
-        pos = (hi - c) * scale + add_pos
-        p.set(min=c - neg, max=c + pos)
-        i += 1
+def _try_edge_add(xw, yw, result, max_n):
+    """
+    Edge/flank-based shoulder add:
+    - choose dominant peak
+    - compute positive residual area on each side
+    - if area-SNR is high, seed a broad Gaussian at residual-weighted centroid with width from residual spread
+    - add or replace weakest (if at cap) with standard AIC & SNR admission
+    """
+    # Components present?
+    _, centers, sigmas, amps, heights, fwhm, _, _ = _extract_metrics(result, xw)
+    if centers.size == 0:
+        return result, False
+
+    resid = yw - result.best_fit
+    noise = robust_sigma(resid)
+    if noise <= 0:
+        return result, False
+
+    # pick dominant component by height
+    j_main = int(np.nanargmax(heights))
+    x_main = centers[j_main]
+
+    left_mask  = xw <  x_main
+    right_mask = xw >  x_main
+    rpos = np.maximum(resid, 0.0)
+
+    # area-SNR per side
+    def side_stats(msk):
+        if not np.any(msk): 
+            return 0.0, np.nan, np.nan
+        area = np.sum(rpos[msk])
+        # normalize area by noise * sqrt(N) (rough SNR of integrated residual)
+        snr_area = area / (max(noise,1e-12) * np.sqrt(int(np.sum(msk))))
+        if area <= 0:
+            return 0.0, np.nan, np.nan
+        x_side = xw[msk]; w = rpos[msk]
+        # residual-weighted centroid and spread
+        xc = np.sum(x_side * w) / np.sum(w)
+        var = max(np.sum(w * (x_side - xc)**2) / np.sum(w), 1e-12)
+        sig = float(np.clip(np.sqrt(var), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+        return snr_area, xc, sig
+
+    snrL, xL, sL = side_stats(left_mask)
+    snrR, xR, sR = side_stats(right_mask)
+
+    # choose the better side if above threshold
+    if snrL < EDGE_SNR_AREA_MIN and snrR < EDGE_SNR_AREA_MIN:
+        return result, False
+    if snrR > snrL:
+        x0, sigma_seed = xR, sR
+        side_mask = right_mask
+    else:
+        x0, sigma_seed = xL, sL
+        side_mask = left_mask
+
+    # min separation from existing centers
+    if centers.size and np.min(np.abs(centers - x0)) < MIN_SEP:
+        return result, False
+
+    # amplitude from area on the chosen side: area ≈ amp * sqrt(2π) * sigma
+    area_side = np.sum(rpos[side_mask])
+    amp_seed  = max(area_side / (np.sqrt(2.0*np.pi) * max(sigma_seed, 1e-12)), 1e-9)
+
+    # Build trial similar to residual add (with replacement if at cap)
+    # Reuse builder from residual add
+    from lmfit import Parameters
+    def _build_params_from_result(res, drop_idx=None):
+        params_new = Parameters()
+        model_expr = LinearModel(prefix="bkg_")
+        for nm in ["bkg_slope","bkg_intercept"]:
+            if nm in res.params:
+                p = res.params[nm]
+                params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
+            else:
+                params_new.add(nm, value=0.0)
+        # copy existing (optionally drop one)
+        next_idx = 0
+        j = 0
+        while f"g{j}_center" in res.params:
+            if drop_idx is not None and j == drop_idx:
+                j += 1; continue
+            g = GaussianModel(prefix=f"g{next_idx}_")
+            model_expr = model_expr + g
+            params_new.update(g.make_params(
+                center=res.params[f"g{j}_center"].value,
+                sigma =res.params[f"g{j}_sigma"].value,
+                amplitude=res.params[f"g{j}_amplitude"].value))
+            params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+            params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+            ccur = res.params[f"g{j}_center"].value
+            params_new[f"g{next_idx}_center"].set(min=ccur-DRIFT_NEG, max=ccur+DRIFT_POS)
+            next_idx += 1; j += 1
+        return model_expr, params_new, next_idx
+
+    # count components
+    n_now = 0
+    while f"g{n_now}_center" in result.params:
+        n_now += 1
+    n_now = int(n_now)
+
+    if n_now < max_n:
+        model_expr, params_new, next_idx = _build_params_from_result(result)
+        gnew = GaussianModel(prefix=f"g{next_idx}_")
+        model_expr = model_expr + gnew
+        params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
+        params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+        params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+        params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
+        trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
+        _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+        new_h = h[-1] if h.size else -np.inf
+        if _accept_new_component(trial, result.aic, xw, new_h, noise):
+            return trial, True
+        return result, False
+
+    # at cap: replace weakest height
+    _, _, _, _, h0, _, _, _ = _extract_metrics(result, xw)
+    if h0.size == 0:
+        return result, False
+    weakest = int(np.nanargmin(h0))
+    model_expr, params_new, next_idx = _build_params_from_result(result, drop_idx=weakest)
+    gnew = GaussianModel(prefix=f"g{next_idx}_")
+    model_expr = model_expr + gnew
+    params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
+    params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+    params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+    params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
+    trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
+    _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+    new_h = h[-1] if h.size else -np.inf
+    if _accept_new_component(trial, result.aic, xw, new_h, noise):
+        return trial, True
+    return result, False
 
 def fit_frame(x, y, seeds, halfwidth):
     m = window_mask(x, seeds, halfwidth)
@@ -307,53 +453,17 @@ def fit_frame(x, y, seeds, halfwidth):
         _, result = _rebuild_from_kept(xw, yw, result, keep)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # 3) Residual shoulder addition (default strict; cap respected)
+    # 3) EDGE/FLANK addition first (since your shoulders are extended edges)
     max_allowed = len(seeds)
+    result, _ = _try_edge_add(xw, yw, result, max_allowed)
+    bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
+
+    # 3b) Then classic point-residual addition (still capped)
     if ENABLE_RESIDUAL and max_allowed > 0:
         result, _ = _try_residual_add(xw, yw, result, max_allowed)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-        # --- Shoulder-hunt mode: trigger on broad FWHM
-        if np.nanmax(w_all) > BROAD_FWHM_TRIGGER:
-            # clone params and relax drift for this frame only
-            params_relaxed = result.params.copy()
-            _apply_drift_relax(
-                params_relaxed,
-                scale=SHOULDER_DRIFT_SCALE,
-                add_neg=SHOULDER_DRIFT_ADD[0],
-                add_pos=SHOULDER_DRIFT_ADD[1],
-            )
-            # re-fit with relaxed drift
-            relaxed = result.model.fit(yw, params_relaxed, x=xw, nan_policy="omit")
-
-            # temporarily loosen SNR/AIC/MIN_SEP and allow +1 component
-            saved_snr, saved_aic, saved_sep = RESIDUAL_SNR, AIC_IMPROVE, MIN_SEP
-            try:
-                globals()["RESIDUAL_SNR"] = SHOULDER_RESIDUAL_SNR
-                globals()["AIC_IMPROVE"]  = SHOULDER_AIC_IMPROVE
-                globals()["MIN_SEP"]      = SHOULDER_MIN_SEP
-
-                relaxed, _ = _try_residual_add(
-                    xw, yw, relaxed, max_allowed + max(0, int(SHOULDER_MODE_NBOOST))
-                )
-
-                # accept only if the relaxed solution is genuinely better
-                def _r2(y_true, y_fit):
-                    ss_res = np.sum((y_true - y_fit)**2)
-                    ss_tot = np.sum((y_true - np.mean(y_true))**2) + 1e-12
-                    return 1.0 - ss_res/ss_tot
-
-                if (relaxed.aic <= result.aic - 1.0) or (_r2(yw, relaxed.best_fit) >= _r2(yw, result.best_fit) + 5e-4):
-                    result = relaxed
-            finally:
-                globals()["RESIDUAL_SNR"] = saved_snr
-                globals()["AIC_IMPROVE"]  = saved_aic
-                globals()["MIN_SEP"]      = saved_sep
-
-            # refresh metrics after shoulder mode
-            bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
-
-    # 4) Apply reporting mask (same as prune rule for consistency)
+    # 4) Apply reporting mask (based on PEAK_HEIGHT_MIN)
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
@@ -390,7 +500,7 @@ def style_axes(ax):
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, fixed peak count, height-prune, shoulder-hunt).")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, height-prune, edge-shoulder).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -464,7 +574,7 @@ def main():
 
     # -------- Mapping (all frames) --------
     nuse = nframes
-    npeaks = len(seeds0)            # hard cap (default mode)
+    npeaks = len(seeds0)            # hard cap
     centers_trk = np.full((nuse, npeaks), np.nan)
     fwhm_trk    = np.full((nuse, npeaks), np.nan)
     height_trk  = np.full((nuse, npeaks), np.nan)
@@ -514,4 +624,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
