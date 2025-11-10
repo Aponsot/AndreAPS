@@ -21,7 +21,7 @@ MIN_POINTS  = 8
 PEAK_HEIGHT_MIN = 5.2
 
 # Sigma bounds
-SIGMA_MIN_FIT = 0.001
+SIGMA_MIN_FIT = 0.0001
 SIGMA_MAX_FIT = 0.080
 
 # Per-seed drift limits (asymmetric, relative to seed)
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
