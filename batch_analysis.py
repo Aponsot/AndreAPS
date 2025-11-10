@@ -38,7 +38,7 @@ DRIFT_POS = 0.010
 ENABLE_RESIDUAL = True
 RESIDUAL_SNR    = 0.25     # residual peak must be ≥ SNR * robust_noise
 MIN_SEP         = 0.0007  # min separation from existing centers
-AIC_IMPROVE     = 8.0     # require ΔAIC ≤ -AIC_IMPROVE to accept replacement
+AIC_IMPROVE     = 5.0     # require ΔAIC ≤ -AIC_IMPROVE to accept replacement
 
 SEC_PER_FRAME   = 0.004   # for titles; set None to show "Frame N" instead
 
@@ -468,6 +468,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
