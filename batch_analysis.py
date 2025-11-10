@@ -3,9 +3,9 @@
 # - Single-frame and full-experiment tracking
 # - Fixed number of peaks from --centers (hard cap)
 # - Prune low-height components (< PEAK_HEIGHT_MIN) BEFORE shoulder detection
-# - Residual shoulder detection (cap respected)
-# - NEW: Edge/Flank shoulder detector that seeds a broad Gaussian from run-of-residuals on one side
-# - Loosened sigma_min to avoid blocking narrow/medium features
+# - Edge/flank shoulder detector (extended tails) + classic residual peak add (both respect cap)
+# - Polished plotting (publishable) + plasma colormap for map points
+# - No CSV writing
 
 import argparse, os
 import numpy as np
@@ -41,7 +41,7 @@ RESIDUAL_SNR    = 0.35       # residual peak must be ≥ SNR * robust_noise
 MIN_SEP         = 0.00010    # min separation from existing centers
 AIC_IMPROVE     = 4.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
-# NEW: Admission looseners for new components (don’t let height floor block)
+# Admission looseners for new components (avoid height floor blocking)
 ADD_SNR_MIN         = 0.80   # admit new comp if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
 EDGE_SNR_AREA_MIN   = 2.0    # area-SNR threshold for edge/flank addition
 
@@ -197,9 +197,38 @@ def _accept_new_component(trial, base_aic, xw, new_height, noise):
                  (new_height >= PEAK_HEIGHT_MIN or new_height >= ADD_SNR_MIN * max(noise, 1e-12)))
     return daic_ok and height_ok
 
+def _build_params_from_result(res, drop_idx=None):
+    from lmfit import Parameters
+    params_new = Parameters()
+    model_expr = LinearModel(prefix="bkg_")
+    for nm in ["bkg_slope","bkg_intercept"]:
+        if nm in res.params:
+            p = res.params[nm]
+            params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
+        else:
+            params_new.add(nm, value=0.0)
+    # copy existing (optionally drop one)
+    next_idx = 0
+    j = 0
+    while f"g{j}_center" in res.params:
+        if drop_idx is not None and j == drop_idx:
+            j += 1; continue
+        g = GaussianModel(prefix=f"g{next_idx}_")
+        model_expr = model_expr + g
+        params_new.update(g.make_params(
+            center=res.params[f"g{j}_center"].value,
+            sigma =res.params[f"g{j}_sigma"].value,
+            amplitude=res.params[f"g{j}_amplitude"].value))
+        params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+        params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+        ccur = res.params[f"g{j}_center"].value
+        params_new[f"g{next_idx}_center"].set(min=ccur-DRIFT_NEG, max=ccur+DRIFT_POS)
+        next_idx += 1; j += 1
+    return model_expr, params_new, next_idx
+
 def _try_residual_add(xw, yw, result, max_n):
-    """Point-peak shoulder add (never exceed max_n)."""
-    # count current components
+    """Point-peak shoulder add (never exceed max_n; replace weakest at cap if better)."""
+    # current component count
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
@@ -231,37 +260,6 @@ def _try_residual_add(xw, yw, result, max_n):
     sigma_seed = float(np.clip(min(max(mean_sigma, span/12.0), span/8.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
     amp_seed = max(resid[idx] * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
 
-    # Build trial with candidate appended, or replace weakest if at cap
-    from lmfit import Parameters
-    def _build_params_from_result(res, drop_idx=None):
-        params_new = Parameters()
-        model_expr = LinearModel(prefix="bkg_")
-        for nm in ["bkg_slope","bkg_intercept"]:
-            if nm in res.params:
-                p = res.params[nm]
-                params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
-            else:
-                params_new.add(nm, value=0.0)
-        # copy existing (optionally drop one)
-        next_idx = 0
-        j = 0
-        while f"g{j}_center" in res.params:
-            if drop_idx is not None and j == drop_idx:
-                j += 1; continue
-            g = GaussianModel(prefix=f"g{next_idx}_")
-            model_expr = model_expr + g
-            params_new.update(g.make_params(
-                center=res.params[f"g{j}_center"].value,
-                sigma =res.params[f"g{j}_sigma"].value,
-                amplitude=res.params[f"g{j}_amplitude"].value))
-            params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-            params_new[f"g{next_idx}_amplitude"].set(min=0.0)
-            ccur = res.params[f"g{j}_center"].value
-            params_new[f"g{next_idx}_center"].set(min=ccur-DRIFT_NEG, max=ccur+DRIFT_POS)
-            next_idx += 1; j += 1
-        return model_expr, params_new, next_idx
-
-    n_now = int(n_now)
     if n_now < max_n:
         model_expr, params_new, next_idx = _build_params_from_result(result)
         gnew = GaussianModel(prefix=f"g{next_idx}_")
@@ -279,7 +277,7 @@ def _try_residual_add(xw, yw, result, max_n):
         return result, False
 
     # At cap: try replacing the weakest height
-    _, c0, s0, a0, h0, _, _, _ = _extract_metrics(result, xw)
+    _, _, _, _, h0, _, _, _ = _extract_metrics(result, xw)
     if h0.size == 0:
         return result, False
     weakest = int(np.nanargmin(h0))
@@ -305,7 +303,6 @@ def _try_edge_add(xw, yw, result, max_n):
     - if area-SNR is high, seed a broad Gaussian at residual-weighted centroid with width from residual spread
     - add or replace weakest (if at cap) with standard AIC & SNR admission
     """
-    # Components present?
     _, centers, sigmas, amps, heights, fwhm, _, _ = _extract_metrics(result, xw)
     if centers.size == 0:
         return result, False
@@ -323,17 +320,14 @@ def _try_edge_add(xw, yw, result, max_n):
     right_mask = xw >  x_main
     rpos = np.maximum(resid, 0.0)
 
-    # area-SNR per side
     def side_stats(msk):
-        if not np.any(msk): 
+        if not np.any(msk):
             return 0.0, np.nan, np.nan
         area = np.sum(rpos[msk])
-        # normalize area by noise * sqrt(N) (rough SNR of integrated residual)
         snr_area = area / (max(noise,1e-12) * np.sqrt(int(np.sum(msk))))
         if area <= 0:
             return 0.0, np.nan, np.nan
         x_side = xw[msk]; w = rpos[msk]
-        # residual-weighted centroid and spread
         xc = np.sum(x_side * w) / np.sum(w)
         var = max(np.sum(w * (x_side - xc)**2) / np.sum(w), 1e-12)
         sig = float(np.clip(np.sqrt(var), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
@@ -342,7 +336,6 @@ def _try_edge_add(xw, yw, result, max_n):
     snrL, xL, sL = side_stats(left_mask)
     snrR, xR, sR = side_stats(right_mask)
 
-    # choose the better side if above threshold
     if snrL < EDGE_SNR_AREA_MIN and snrR < EDGE_SNR_AREA_MIN:
         return result, False
     if snrR > snrL:
@@ -361,37 +354,6 @@ def _try_edge_add(xw, yw, result, max_n):
     amp_seed  = max(area_side / (np.sqrt(2.0*np.pi) * max(sigma_seed, 1e-12)), 1e-9)
 
     # Build trial similar to residual add (with replacement if at cap)
-    # Reuse builder from residual add
-    from lmfit import Parameters
-    def _build_params_from_result(res, drop_idx=None):
-        params_new = Parameters()
-        model_expr = LinearModel(prefix="bkg_")
-        for nm in ["bkg_slope","bkg_intercept"]:
-            if nm in res.params:
-                p = res.params[nm]
-                params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
-            else:
-                params_new.add(nm, value=0.0)
-        # copy existing (optionally drop one)
-        next_idx = 0
-        j = 0
-        while f"g{j}_center" in res.params:
-            if drop_idx is not None and j == drop_idx:
-                j += 1; continue
-            g = GaussianModel(prefix=f"g{next_idx}_")
-            model_expr = model_expr + g
-            params_new.update(g.make_params(
-                center=res.params[f"g{j}_center"].value,
-                sigma =res.params[f"g{j}_sigma"].value,
-                amplitude=res.params[f"g{j}_amplitude"].value))
-            params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-            params_new[f"g{next_idx}_amplitude"].set(min=0.0)
-            ccur = res.params[f"g{j}_center"].value
-            params_new[f"g{next_idx}_center"].set(min=ccur-DRIFT_NEG, max=ccur+DRIFT_POS)
-            next_idx += 1; j += 1
-        return model_expr, params_new, next_idx
-
-    # count components
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
@@ -453,7 +415,7 @@ def fit_frame(x, y, seeds, halfwidth):
         _, result = _rebuild_from_kept(xw, yw, result, keep)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # 3) EDGE/FLANK addition first (since your shoulders are extended edges)
+    # 3) EDGE/FLANK addition first (since shoulders are extended edges)
     max_allowed = len(seeds)
     result, _ = _try_edge_add(xw, yw, result, max_allowed)
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
@@ -480,21 +442,37 @@ def fit_frame(x, y, seeds, halfwidth):
         "r2": r2, "result": result
     }
 
+# ------------------------------
+# Visual style
+# ------------------------------
 def apply_pub_style():
     plt.rcParams.update({
-        "figure.dpi": 300, "savefig.dpi": 300,
-        "font.size": 12, "axes.titlesize": 12, "axes.labelsize": 14,
-        "axes.linewidth": 1.0, "xtick.labelsize": 12, "ytick.labelsize": 12,
-        "xtick.direction": "in", "ytick.direction": "in",
-        "xtick.major.size": 4, "ytick.major.size": 4
+        "figure.figsize": (6.5, 4.8),
+        "figure.dpi": 160,
+        "savefig.dpi": 300,
+        "font.size": 12,
+        "axes.labelsize": 14,
+        "legend.fontsize": 12,
+        "legend.frameon": False,   # per preference
+        "axes.linewidth": 1.15,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 4,
+        "ytick.major.size": 4,
+        "xtick.minor.size": 2,
+        "ytick.minor.size": 2,
+        "axes.grid": False,        # clean; we’ll add light grid selectively
     })
 
-def style_axes(ax):
+def style_axes(ax, light_grid=True):
     for side in ("top","right","bottom","left"):
         ax.spines[side].set_visible(True)
-        ax.spines[side].set_linewidth(1.0)
+        ax.spines[side].set_linewidth(1.15)
     ax.minorticks_on()
-    ax.grid(True, which="major", alpha=0.12, linestyle="-", linewidth=0.6)
+    if light_grid:
+        ax.grid(True, which="major", alpha=0.12, linestyle="-", linewidth=0.6)
 
 # ------------------------------
 # Main
@@ -526,49 +504,44 @@ def main():
         hfit_v    = res["height_fit"][vis]
         pfit_v    = res["peak_fit"][vis]
 
-        # numeric dump
-        print(f"# Frame {args.frame}")
-        for i, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v)):
-            print(f"peak{i}_center={c:.6f}, peak{i}_FWHM={w:.6f}, peak{i}_height_fit={h:.6f}, peak{i}_peak_fit={p:.6f}")
-
-        # plot
+        # ---- Plot (single frame) ----
         apply_pub_style()
         from matplotlib.gridspec import GridSpec
-        fig = plt.figure(figsize=(6.6, 4.8))
-        gs = GridSpec(2, 1, height_ratios=[3.0, 1.45], hspace=0.18)
-        ax = fig.add_subplot(gs[0]); style_axes(ax)
+        fig = plt.figure()
+        gs = GridSpec(2, 1, height_ratios=[3.2, 1.2], hspace=0.18)
 
+        ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
         ax.plot(res["xw"], res["yw"],  lw=1.2, label="Data")
-        ax.plot(res["xw"], res["yfit"], lw=1.4, label="Fit")
-        ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Background")
+        ax.plot(res["xw"], res["yfit"], lw=1.6, label="Total fit")
+        ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Linear bkg")
 
         for comp in res["components"]:
-            ax.plot(res["xw"], comp, ":", lw=1.0, alpha=0.7)
+            ax.plot(res["xw"], comp, ":", lw=1.0, alpha=0.75)
 
-        ax.plot(res["xw"], res["comp_sum"], lw=0.9, color="k", alpha=0.6, label="Gaussian Sum + Background")
+        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.55, label="Gaussians + bkg")
 
         for c in centers_v:
-            ax.axvline(c, linestyle="--", alpha=0.45, lw=0.95, color="0.5")
+            ax.axvline(c, linestyle="--", alpha=0.6, lw=1.0, color="0.45")
 
-        title = (f"{args.frame*float(SEC_PER_FRAME):.1f} sec | " if SEC_PER_FRAME is not None else f"Frame {args.frame} | ")
+        title = (f"{args.frame*float(SEC_PER_FRAME):.1f} s | " if SEC_PER_FRAME is not None else f"Frame {args.frame} | ")
         ax.set_title(title + f"R²={res['r2']:.4f}", pad=6)
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity (a.u.)")
-        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
-        fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
+        ax.legend(loc="upper right", ncol=1)
 
-        # table
-        ax_tbl = fig.add_subplot(gs[1]); style_axes(ax_tbl); ax_tbl.axis("off")
+        # Compact table
+        ax_tbl = fig.add_subplot(gs[1]); style_axes(ax_tbl, light_grid=False); ax_tbl.axis("off")
         rows = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
                 for i, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v))]
         col_labels = ["Peak", "Center", "FWHM", "Height (fit)", "Peak@Center (fit)"]
         tbl = ax_tbl.table(cellText=rows, colLabels=col_labels, loc="center")
-        tbl.auto_set_font_size(False); tbl.set_fontsize(9)
-        for key, cell in tbl.get_celld().items():
-            cell.set_edgecolor("0.8"); cell.set_linewidth(0.6)
-            if key[0] != 0: cell.set_alpha(0.08)
+        tbl.auto_set_font_size(False); tbl.set_fontsize(10)
+        for (r, _c), cell in tbl.get_celld().items():
+            cell.set_edgecolor("0.85")
+            cell.set_linewidth(0.6)
+            cell.set_alpha(0.0 if r == 0 else 0.06)
 
-        fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
+        fig.tight_layout()
         plt.show()
         return
 
@@ -602,23 +575,33 @@ def main():
             if k > 0:
                 seeds = cvis[:min(k, npeaks)]  # per-frame seeding
 
-    # Map plot
+    # ---- Map plot (all frames) ----
     apply_pub_style()
-    fig, ax = plt.subplots(figsize=(7.2, 4.2)); style_axes(ax)
+    fig, ax = plt.subplots()
+    style_axes(ax, light_grid=True)
+
     frames = np.arange(nuse)
+    handles, labels = [], []
     for j in range(npeaks):
         mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
         if not np.any(mask):
             continue
-        ax.scatter(frames[mask], centers_trk[mask, j], c=height_trk[mask, j],
-                   cmap="plasma", s=14, edgecolors="none", label=f"peak {j}")
+        sc = ax.scatter(frames[mask], centers_trk[mask, j],
+                        c=height_trk[mask, j], cmap="plasma",
+                        s=18, linewidths=0.0, edgecolors="none")
+        handles.append(sc); labels.append(f"Peak {j}")
+
     ax.set_xlabel("Frame")
     ax.set_ylabel("Center (q or 2θ)")
-    ax.set_title("Peak Centers over Frames (colored by fitted height)")
-    if np.any(np.isfinite(height_trk)):
-        cbar = fig.colorbar(ax.collections[0], ax=ax, pad=0.02)
+    ax.set_title("Peak centers over frames (color = fitted height)")
+
+    if handles:
+        cbar = fig.colorbar(handles[0], ax=ax, pad=0.02)
         cbar.set_label("Height (fit)")
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
+
+    if handles:
+        ax.legend(handles, labels, loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False)
+
     fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
     plt.show()
 
