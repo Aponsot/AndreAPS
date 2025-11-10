@@ -28,8 +28,8 @@ MIN_POINTS      = 8      # min points in window to attempt a fit
 
 PEAK_HEIGHT_MIN = 5.2    # floor for reporting/plotting (post-fit filtering)
 
-SIGMA_MIN_FIT   = 0.001  # global σ bounds (FWHM = 2.355 σ)
-SIGMA_MAX_FIT   = 0.080
+SIGMA_MIN_FIT   = 0.0005  # global σ bounds (FWHM = 2.355 σ)
+SIGMA_MAX_FIT   = 0.10
 
 DRIFT_NEG       = 0.10   # allowed center drift around each seed per frame
 DRIFT_POS       = 0.010
@@ -510,3 +510,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
