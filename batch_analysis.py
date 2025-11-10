@@ -14,11 +14,11 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.20
+HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
 # Peak reporting/pruning floor (applied at the END when reporting/plotting)
-PEAK_HEIGHT_MIN = 1
+PEAK_HEIGHT_MIN = 5.2
 
 # Sigma bounds
 SIGMA_MIN_FIT = 0.001
@@ -699,3 +699,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
