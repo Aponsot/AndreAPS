@@ -565,3 +565,122 @@ def main():
 
     # -------- Single frame --------
     if args.frame is not None:
+        if not (0 <= args.frame < nframes):
+            raise ValueError(f"--frame {args.frame} is out of range [0, {nframes-1}]")
+        y = I_full[args.frame]
+        res = fit_frame(x, y, seeds0, HALF_WINDOW, max_allowed=max_allowed)
+        if not res["success"]:
+            print("Fit failed for the requested frame.")
+            return
+
+        vis = np.isfinite(res["centers"])
+        centers_v = res["centers"][vis]
+        fwhm_v    = res["fwhm"][vis]
+        hfit_v    = res["height_fit"][vis]
+        pfit_v    = res["peak_fit"][vis]
+
+        # ---- Plot (single frame) ----
+        apply_pub_style()
+        from matplotlib.gridspec import GridSpec
+        fig = plt.figure()
+        gs = GridSpec(2, 1, height_ratios=[3.2, 1.2], hspace=0.18)
+
+        ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
+        ax.plot(res["xw"], res["yw"],  lw=1.2, label="Data")
+        ax.plot(res["xw"], res["yfit"], lw=1.6, label="Total fit")
+        ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Linear bkg")
+
+        for comp in res["components"]:
+            ax.plot(res["xw"], comp, ":", lw=1.0, alpha=0.75)
+
+        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.55, label="Gaussians + bkg")
+
+        for c in centers_v:
+            ax.axvline(c, linestyle="--", alpha=0.6, lw=1.0, color="0.45")
+
+        title = (f"{args.frame*float(SEC_PER_FRAME):.1f} s | " if SEC_PER_FRAME is not None else f"Frame {args.frame} | ")
+        ax.set_title(title + f"R²={res['r2']:.4f}", pad=6)
+        ax.set_xlabel("q (1/Å)")
+        ax.set_ylabel("Intensity (a.u.)")
+        ax.legend(loc="upper right", ncol=1)
+
+        # Compact table
+        ax_tbl = fig.add_subplot(gs[1]); style_axes(ax_tbl, light_grid=False); ax_tbl.axis("off")
+        rows = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
+                for i, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v))]
+        col_labels = ["Peak", "Center", "FWHM", "Height (fit)", "Peak@Center (fit)"]
+        tbl = ax_tbl.table(cellText=rows, colLabels=col_labels, loc="center")
+        tbl.auto_set_font_size(False); tbl.set_fontsize(10)
+        for (r, _c), cell in tbl.get_celld().items():
+            cell.set_edgecolor("0.85")
+            cell.set_linewidth(0.6)
+            cell.set_alpha(0.0 if r == 0 else 0.06)
+
+        fig.tight_layout()
+        plt.show()
+        return
+
+    # -------- Mapping (all frames) --------
+    nuse = nframes
+    npeaks = len(seeds0)            # hard cap (constant)
+    centers_trk = np.full((nuse, npeaks), np.nan)
+    fwhm_trk    = np.full((nuse, npeaks), np.nan)
+    height_trk  = np.full((nuse, npeaks), np.nan)
+
+    seeds = seeds0.copy()
+    iterator = range(nuse)
+    if tqdm is not None:
+        iterator = tqdm(iterator, desc="Fitting frames", ncols=80)
+
+    for f in iterator:
+        y = I_full[f]
+        res = fit_frame(x, y, seeds, HALF_WINDOW, max_allowed=max_allowed)
+        if res["success"]:
+            vis = np.isfinite(res["centers"])
+            cvis = res["centers"][vis]
+            wvis = res["fwhm"][vis]
+            hvis = res["height_fit"][vis]
+
+            # Assign current fits onto previous seed identities
+            C, W, H = _assign_by_nearest(seeds, cvis, wvis, hvis)
+
+            # Record exactly by identity (fixed columns)
+            centers_trk[f, :] = C
+            fwhm_trk[f, :]    = W
+            height_trk[f, :]  = H
+
+            # Carry seeds forward (keep previous where unmatched to preserve identity & cap)
+            seeds = np.where(np.isfinite(C), C, seeds)
+
+    # ---- Map plot (all frames) ----
+    apply_pub_style()
+    fig, ax = plt.subplots()
+    style_axes(ax, light_grid=True)
+
+    frames = np.arange(nuse)
+    handles, labels = [], []
+    for j in range(npeaks):
+        mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
+        if not np.any(mask):
+            continue
+        sc = ax.scatter(frames[mask], centers_trk[mask, j],
+                        c=height_trk[mask, j], cmap="plasma",
+                        s=18, linewidths=0.0, edgecolors="none")
+        handles.append(sc); labels.append(f"Peak {j}")
+
+    ax.set_xlabel("Frame")
+    ax.set_ylabel("Center (q or 2θ)")
+    ax.set_title("Peak centers over frames (color = fitted height)")
+
+    if handles:
+        cbar = fig.colorbar(handles[0], ax=ax, pad=0.02)
+        cbar.set_label("Height (fit)")
+
+    if handles:
+        ax.legend(handles, labels, loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False)
+
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
+    plt.show()
+
+if __name__ == "__main__":
+    main()
