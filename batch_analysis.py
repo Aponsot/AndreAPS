@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# Core v1 — Gaussian multi-peak fitting with linear background
-# - Single-frame mode and full-experiment tracking
+# Core v1.1 — Gaussian multi-peak fitting with linear background
+# - Single-frame and full-experiment tracking
 # - Fixed number of peaks from --centers (hard cap)
+# - NEW: prune low-height components (< PEAK_HEIGHT_MIN) BEFORE shoulder detection
 # - Shoulder robustness via sigma bounds, per-seed drift limits, residual SNR + AIC checks (cap respected)
-# - Clean CSV and simple plots for iteration
+# - CSV gated behind --csv (off by default)
 
 import argparse, os
 import numpy as np
@@ -17,28 +18,27 @@ except Exception:
     tqdm = None
 
 # ------------------------------
-# Tunables (minimal & focused)
+# Tunables
 # ------------------------------
-HALF_WINDOW = 0.25        # window half-width around [min(seeds), max(seeds)]
+HALF_WINDOW = 0.50        # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8           # min points in window to attempt a fit
 
-# Peak reporting floor
-PEAK_HEIGHT_MIN = 5.0     # fitted height above background to report/track
+# Peak reporting/pruning floor
+PEAK_HEIGHT_MIN = 5.0     # components with fitted height < this are pruned
 
-# Global sigma bounds (handles tall/narrow and small/wide)
+# Global sigma bounds
 SIGMA_MIN_FIT = 0.0002
 SIGMA_MAX_FIT = 0.080
 
-# Per-seed drift limits per frame (asymmetric helps avoid identity swaps)
-# center_i ∈ [seed_i - DRIFT_NEG, seed_i + DRIFT_POS]
+# Per-seed drift limits per frame (asymmetric)
 DRIFT_NEG = 0.10
 DRIFT_POS = 0.010
 
 # Residual-shoulder logic (never exceed seeded count)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.10     # residual peak must be ≥ SNR * robust_noise
-MIN_SEP         = 0.00007  # min separation from existing centers
-AIC_IMPROVE     = 1     # require ΔAIC ≤ -AIC_IMPROVE to accept replacement
+RESIDUAL_SNR    = 0.5     # residual peak must be ≥ SNR * robust_noise
+MIN_SEP         = 0.0010  # min separation from existing centers
+AIC_IMPROVE     = 6.0     # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 SEC_PER_FRAME   = 0.004   # for titles; set None to show "Frame N" instead
 
@@ -152,30 +152,51 @@ def _extract_metrics(result, xw):
             comps.append(np.full_like(xw, np.nan, float))
     return bkg_line, centers, sigmas, amps, heights, fwhm, peak_at_center, comps
 
-def _hit_bounds(result, eps=1e-10):
-    hits = []
-    for name, par in result.params.items():
-        if par.vary and par.min is not None and par.max is not None:
-            if abs(par.value - par.min) <= eps: hits.append(f"{name}==min")
-            elif abs(par.value - par.max) <= eps: hits.append(f"{name}==max")
-    return hits
+def _rebuild_from_kept(xw, yw, result, keep_mask):
+    """Rebuild a model keeping only components where keep_mask is True; refit."""
+    from lmfit import Parameters
+    params_new = Parameters()
+    model_new = LinearModel(prefix="bkg_")
+    # background
+    for nm in ["bkg_slope", "bkg_intercept"]:
+        if nm in result.params:
+            p = result.params[nm]
+            params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
+        else:
+            params_new.add(nm, value=0.0)
 
-def _try_residual_replacement(xw, yw, result, max_n):
-    """Try to add a residual-based component, but NEVER exceed max_n.
-       If we'd exceed, replace the weakest (height) component if the AIC improves."""
-    # current components
-    centers_old, sigmas_old, amps_old = [], [], []
-    i = 0
-    while f"g{i}_center" in result.params:
-        centers_old.append(result.params[f"g{i}_center"].value)
-        sigmas_old.append (result.params[f"g{i}_sigma"].value)
-        amps_old.append   (result.params[f"g{i}_amplitude"].value)
-        i += 1
-    n_now = len(centers_old)
+    next_idx = 0
+    # keep selected components; reindex tightly
+    j = 0
+    while f"g{j}_center" in result.params:
+        if keep_mask[j]:
+            gk = GaussianModel(prefix=f"g{next_idx}_")
+            model_new = model_new + gk
+            ccur = result.params[f"g{j}_center"].value
+            scur = result.params[f"g{j}_sigma"].value
+            acur = result.params[f"g{j}_amplitude"].value
+            params_new.update(gk.make_params(center=ccur, sigma=scur, amplitude=acur))
+            params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+            params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+            # Keep a small drift band around current center for this refit
+            params_new[f"g{next_idx}_center"].set(min=ccur - DRIFT_NEG, max=ccur + DRIFT_POS)
+            next_idx += 1
+        j += 1
+
+    # If no components kept, we still have background-only model
+    refit = model_new.fit(yw, params_new, x=xw, nan_policy="omit")
+    return model_new, refit
+
+def _try_residual_add(xw, yw, result, max_n):
+    """Try adding a residual-based component, but NEVER exceed max_n."""
+    # count current components
+    n_now = 0
+    while f"g{n_now}_center" in result.params:
+        n_now += 1
 
     resid = yw - result.best_fit
     noise = robust_sigma(resid)
-    if noise <= 0: 
+    if noise <= 0:
         return result, False
 
     idx = int(np.argmax(resid))
@@ -183,20 +204,30 @@ def _try_residual_replacement(xw, yw, result, max_n):
         return result, False
 
     x0 = float(xw[idx])
+
+    # abort if too close to existing center
+    centers_old = []
+    j = 0
+    while f"g{j}_center" in result.params:
+        centers_old.append(result.params[f"g{j}_center"].value)
+        j += 1
     centers_old = np.asarray(centers_old, float)
     if centers_old.size and np.min(np.abs(centers_old - x0)) < MIN_SEP:
         return result, False
 
+    # seed width: modest, not needle-thin
     span = max(xw[-1] - xw[0], 1e-9)
-    mean_sigma = np.nanmean(np.asarray(sigmas_old)) if n_now else span/10.0
-    sigma_seed = float(np.clip(min(mean_sigma, span/12.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+    mean_sigma = np.nanmean([result.params[f"g{k}_sigma"].value for k in range(n_now)]) if n_now else span/10.0
+    sigma_seed = float(np.clip(min(max(mean_sigma, span/12.0), span/8.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
     amp_seed = max(resid[idx] * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
 
-    # Build a trial model by cloning the old result
+    # build trial with candidate appended (only if under cap)
+    if n_now >= max_n:
+        return result, False
+
     from lmfit import Parameters
     params_new = Parameters()
     model_expr = LinearModel(prefix="bkg_")
-    # copy background
     for nm in ["bkg_slope","bkg_intercept"]:
         if nm in result.params:
             p = result.params[nm]
@@ -204,7 +235,7 @@ def _try_residual_replacement(xw, yw, result, max_n):
         else:
             params_new.add(nm, value=0.0)
 
-    # copy existing components
+    # copy existing
     for j in range(n_now):
         g = GaussianModel(prefix=f"g{j}_")
         model_expr = model_expr + g
@@ -212,77 +243,23 @@ def _try_residual_replacement(xw, yw, result, max_n):
             p = result.params[nm]
             params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
 
-    # add candidate as the next index
-    cand_idx = n_now
-    gnew = GaussianModel(prefix=f"g{cand_idx}_")
+    # add candidate
+    gnew = GaussianModel(prefix=f"g{n_now}_")
     model_expr = model_expr + gnew
     params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
-    params_new[f"g{cand_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-    params_new[f"g{cand_idx}_amplitude"].set(min=0.0)
-    params_new[f"g{cand_idx}_center"].set(min=xw[0], max=xw[-1])
+    params_new[f"g{n_now}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+    params_new[f"g{n_now}_amplitude"].set(min=0.0)
+    params_new[f"g{n_now}_center"].set(min=xw[0], max=xw[-1])
 
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
     dAIC = trial.aic - result.aic  # negative is better
 
-    # If we are under the cap, accept if it clearly helps and the new peak is real enough.
-    bkg_line, c_all, s_all, a_all, h_all, _, _, _ = _extract_metrics(trial, xw)
-    if cand_idx < max_n:
-        new_h = h_all[cand_idx] if cand_idx < h_all.size else -np.inf
-        if (dAIC <= -AIC_IMPROVE) and np.isfinite(new_h) and new_h >= PEAK_HEIGHT_MIN:
-            return trial, True
-        return result, False
-
-    # If we'd exceed the cap, consider replacing the weakest existing component.
-    if n_now >= max_n:
-        # find weakest (by fitted height) among existing
-        heights_old = []
-        for j in range(n_now):
-            if s_all[j] > 0:
-                heights_old.append(a_all[j] / (s_all[j]*np.sqrt(2.0*np.pi)))
-            else:
-                heights_old.append(-np.inf)
-        weakest = int(np.argmin(heights_old))
-        # Build a "replacement" parameterset: drop weakest, keep others + candidate
-        from lmfit import Parameters
-        params_rep = Parameters()
-        model_rep = LinearModel(prefix="bkg_")
-        for nm in ["bkg_slope","bkg_intercept"]:
-            if nm in result.params:
-                p = result.params[nm]
-                params_rep.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
-            else:
-                params_rep.add(nm, value=0.0)
-
-        next_idx = 0
-        # keep all except weakest, but reindex to keep param names compact
-        for j in range(n_now):
-            if j == weakest: 
-                continue
-            gk = GaussianModel(prefix=f"g{next_idx}_")
-            model_rep = model_rep + gk
-            params_rep.update(gk.make_params(
-                center=result.params[f"g{j}_center"].value,
-                sigma =result.params[f"g{j}_sigma"].value,
-                amplitude=result.params[f"g{j}_amplitude"].value))
-            params_rep[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-            params_rep[f"g{next_idx}_amplitude"].set(min=0.0)
-            # keep the original drift band roughly around current value
-            ccur = result.params[f"g{j}_center"].value
-            params_rep[f"g{next_idx}_center"].set(min=ccur-DRIFT_NEG, max=ccur+DRIFT_POS)
-            next_idx += 1
-
-        # add candidate as last
-        gk = GaussianModel(prefix=f"g{next_idx}_")
-        model_rep = model_rep + gk
-        params_rep.update(gk.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
-        params_rep[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-        params_rep[f"g{next_idx}_amplitude"].set(min=0.0)
-        params_rep[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
-
-        rep = model_rep.fit(yw, params_rep, x=xw, nan_policy="omit")
-        if rep.aic <= result.aic - AIC_IMPROVE:
-            return rep, True
-        return result, False
+    # accept only if it clearly improves and the new peak is tall enough
+    _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+    new_height = h[-1] if h.size else -np.inf
+    if (dAIC <= -AIC_IMPROVE) and np.isfinite(new_height) and new_height >= PEAK_HEIGHT_MIN:
+        return trial, True
+    return result, False
 
 def fit_frame(x, y, seeds, halfwidth):
     m = window_mask(x, seeds, halfwidth)
@@ -292,20 +269,31 @@ def fit_frame(x, y, seeds, halfwidth):
     if xw.size < MIN_POINTS:
         return {"success": False}
 
+    # 1) Seeded fit
     base_model, params = _build_seed_model(xw, yw, seeds)
     try:
         result = base_model.fit(yw, params, x=xw, nan_policy="omit")
     except Exception:
         return {"success": False}
 
+    # 2) Height-based PRUNE before shoulder detection
+    bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
+    keep = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
+    if keep.size and not np.all(keep):
+        # rebuild model with only kept components and refit
+        _, result = _rebuild_from_kept(xw, yw, result, keep)
+        # refresh metrics after prune-refit
+        bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
+
+    # 3) Residual shoulder addition (cap respected)
     max_allowed = len(seeds)
     if ENABLE_RESIDUAL and max_allowed > 0:
-        result, _ = _try_residual_replacement(xw, yw, result, max_allowed)
+        result, _ = _try_residual_add(xw, yw, result, max_allowed)
+        # refresh metrics again
+        bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
-
-    # apply reporting floor
-    valid = (h_all >= PEAK_HEIGHT_MIN) & np.isfinite(h_all)
+    # 4) Apply reporting mask (same as prune rule for consistency)
+    valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
     height_out  = h_all.copy(); height_out[~valid]  = np.nan
@@ -341,7 +329,7 @@ def style_axes(ax):
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, fixed peak count).")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, fixed peak count, height-prune).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -433,19 +421,17 @@ def main():
             cvis = res["centers"][vis]
             wvis = res["fwhm"][vis]
             hvis = res["height_fit"][vis]
+            # track up to npeaks, sorted by center
+            if cvis.size:
+                order = np.argsort(cvis)
+                cvis, wvis, hvis = cvis[order], wvis[order], hvis[order]
             k = min(cvis.size, npeaks)
             centers_trk[f, :k] = cvis[:k]
             fwhm_trk[f, :k]    = wvis[:k]
             height_trk[f, :k]  = hvis[:k]
-            if k == npeaks:
-                seeds = cvis[:npeaks]   # per-frame seeding
-
-    # Preview
-    print("# preview:")
-    for r in range(min(5, nuse)):
-        row = [str(r)] + [f"{v:.6f}" if np.isfinite(v) else "nan" for v in centers_trk[r]] \
-                    + [f"{v:.6f}" if np.isfinite(v) else "nan" for v in fwhm_trk[r]]
-        print(",".join(row))
+            if k > 0:
+                # per-frame seeding from kept components; if fewer than npeaks, we seed with what we have
+                seeds = cvis[:min(k, npeaks)]
 
     # Map plot
     apply_pub_style()
@@ -455,7 +441,8 @@ def main():
         mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
         if not np.any(mask): 
             continue
-        sc = ax.scatter(frames[mask], centers_trk[mask, j], c=height_trk[mask, j], cmap="plasma", s=14, edgecolors="none", label=f"peak {j}")
+        sc = ax.scatter(frames[mask], centers_trk[mask, j], c=height_trk[mask, j],
+                        cmap="plasma", s=14, edgecolors="none", label=f"peak {j}")
     ax.set_xlabel("Frame")
     ax.set_ylabel("Center (q or 2θ)")
     ax.set_title("Peak Centers over Frames (colored by fitted height)")
@@ -468,11 +455,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
