@@ -588,8 +588,15 @@ def main():
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.4")
 
-        title = (f"{args.frame*float(SEC_PER_FRAME):.1f} s | " if SEC_PER_FRAME is not None else f"Frame {args.frame} | ")
-        ax.set_title(title + f"R²={res['r2']:.4f}", pad=6)
+        # Enforce same x-window as map: seeds ± HALF_WINDOW
+        lo = float(np.min(seeds0) - HALF_WINDOW)
+        hi = float(np.max(seeds0) + HALF_WINDOW)
+        ax.set_xlim(lo, hi)
+
+        title_prefix = (f"{args.frame*float(SEC_PER_FRAME):.1f} s | "
+                        if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0)
+                        else f"Frame {args.frame} | ")
+        ax.set_title(title_prefix + f"R²={res['r2']:.4f}", pad=6)
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity (a.u.)")
         ax.legend(loc="upper right", ncol=1)
@@ -623,6 +630,8 @@ def main():
         if not res["success"]:
             continue
 
+        # Use EXACT same validity logic as single-frame output:
+        # final mask is (finite & >= PEAK_HEIGHT_MIN); these are already inside the window
         valid = np.isfinite(res["centers"]) & np.isfinite(res["height_fit"])
         if np.any(valid):
             c = res["centers"][valid]
@@ -633,9 +642,11 @@ def main():
         else:
             c = w = h = np.array([])
 
+        # Order by center for consistent left→right assignment
         if c.size:
             order = np.argsort(c)
             c, w, h = c[order], w[order], h[order]
+
         k = min(c.size, npeaks)
         centers_trk[f, :k] = c[:k]
         fwhm_trk[f, :k]    = w[:k]
@@ -646,6 +657,9 @@ def main():
     fig, ax = plt.subplots(); style_axes(ax, light_grid=True)
 
     frames = np.arange(nuse)
+    xvals = (frames * float(SEC_PER_FRAME)) if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else frames
+    xlabel = "Time (s)" if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else "Frame"
+
     handles, labels = [], []
     for j in range(npeaks):
         mask = (
@@ -656,7 +670,7 @@ def main():
         if not np.any(mask):
             continue
         sc = ax.scatter(
-            frames[mask],
+            xvals[mask],
             centers_trk[mask, j],
             c=height_trk[mask, j],
             cmap="plasma",
@@ -666,7 +680,12 @@ def main():
         )
         handles.append(sc); labels.append(f"Peak {j+1}")
 
-    ax.set_xlabel("Frame")
+    # Enforce SAME y-window as the single-frame plot
+    lo = float(np.min(seeds0) - HALF_WINDOW)
+    hi = float(np.max(seeds0) + HALF_WINDOW)
+    ax.set_ylim(lo, hi)
+
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Center (q or 2θ)")
     ax.set_title("Peak centers over frames (color = fitted height)")
 
@@ -680,25 +699,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
