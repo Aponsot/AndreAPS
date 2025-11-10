@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# Core v1.4 — Gaussian multi-peak fitting with linear background
+# Core v1.5 — Gaussian multi-peak fitting with linear background
 # - Single-frame and full-experiment tracking
 # - Fixed number of peaks from --centers (hard cap)
 # - Prune low-height components (< PEAK_HEIGHT_MIN) BEFORE shoulder detection
 # - Edge/flank shoulder detector (extended tails) + classic residual peak add (both respect cap)
-# - Map uses EXACTLY the same single-frame logic per-frame with the ORIGINAL seeds (no replay, no per-frame seeding)
-# - Polished plotting (publishable) + plasma colormap for map points
+# - MAP == single-frame truth: each frame uses the SAME seeds0 + SAME fit_frame logic
+# - Strict height-floor filtering for MAP (no sub-threshold points in data arrays or plot)
+# - Publishable plotting (your prefs) + plasma colormap
 # - No CSV writing
 
 import argparse, os
@@ -22,17 +23,17 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.10     # window half-width around [min(seeds), max(seeds)] for BOTH modes
+HALF_WINDOW = 0.10     # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8        # min points in window to attempt a fit
 
-# Peak reporting/pruning floor (for keeping/plotting components)
+# Peak reporting/pruning floor
 PEAK_HEIGHT_MIN = 5.2
 
 # Global sigma bounds
 SIGMA_MIN_FIT = 0.001
 SIGMA_MAX_FIT = 0.080
 
-# Per-seed drift limits per frame (asymmetric, relative to seed)
+# Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.10
 DRIFT_POS = 0.010
 
@@ -43,7 +44,7 @@ MIN_SEP         = 0.00010    # min separation from existing centers
 AIC_IMPROVE     = 4.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 # Admission loosener for new components (avoid height floor blocking)
-ADD_SNR_MIN       = 0.40     # admit new comp if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
+ADD_SNR_MIN       = 0.40     # admit if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
 EDGE_SNR_AREA_MIN = 0.8      # area-SNR threshold for edge/flank addition
 
 SEC_PER_FRAME   = 0.004      # for titles; set None to show "Frame N" instead
@@ -406,9 +407,7 @@ def fit_frame(x, y, seeds, halfwidth):
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
     keep = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     if keep.size and not np.all(keep):
-        # rebuild model with only kept components and refit
         _, result = _rebuild_from_kept(xw, yw, result, keep)
-        # refresh metrics after prune-refit
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
     # 3) EDGE/FLANK addition first (extended tails)
@@ -449,7 +448,7 @@ def apply_pub_style():
         "font.size": 12,
         "axes.labelsize": 14,
         "legend.fontsize": 12,
-        "legend.frameon": False,   # per preference
+        "legend.frameon": False,
         "axes.linewidth": 1.15,
         "xtick.labelsize": 12,
         "ytick.labelsize": 12,
@@ -555,20 +554,29 @@ def main():
 
     for f in iterator:
         y = I_full[f]
-        res = fit_frame(x, y, seeds0, HALF_WINDOW)   # <<< SAME seeds0 as single-frame
-        if res["success"]:
-            vis = np.isfinite(res["centers"])
-            cvis = res["centers"][vis]
-            wvis = res["fwhm"][vis]
-            hvis = res["height_fit"][vis]
-            # take up to npeaks; sort by center for stable columns
-            if cvis.size:
-                order = np.argsort(cvis)
-                cvis, wvis, hvis = cvis[order], wvis[order], hvis[order]
-            k = min(cvis.size, npeaks)
-            centers_trk[f, :k] = cvis[:k]
-            fwhm_trk[f, :k]    = wvis[:k]
-            height_trk[f, :k]  = hvis[:k]
+        res = fit_frame(x, y, seeds0, HALF_WINDOW)   # SAME seeds0 as single-frame
+        if not res["success"]:
+            continue
+
+        # Re-apply explicit height-floor guard (drop anything < PEAK_HEIGHT_MIN)
+        valid = np.isfinite(res["centers"]) & np.isfinite(res["height_fit"])
+        if np.any(valid):
+            c = res["centers"][valid]
+            w = res["fwhm"][valid]
+            h = res["height_fit"][valid]
+            hi = h >= PEAK_HEIGHT_MIN
+            c, w, h = c[hi], w[hi], h[hi]
+        else:
+            c = w = h = np.array([])
+
+        # Put up to npeaks into columns (sorted by center for stability)
+        if c.size:
+            order = np.argsort(c)
+            c, w, h = c[order], w[order], h[order]
+        k = min(c.size, npeaks)
+        centers_trk[f, :k] = c[:k]
+        fwhm_trk[f, :k]    = w[:k]
+        height_trk[f, :k]  = h[:k]
 
     # ---- Map plot (all frames) ----
     apply_pub_style()
@@ -577,12 +585,22 @@ def main():
     frames = np.arange(nuse)
     handles, labels = [], []
     for j in range(npeaks):
-        mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
+        mask = (
+            np.isfinite(centers_trk[:, j]) &
+            np.isfinite(height_trk[:, j]) &
+            (height_trk[:, j] >= PEAK_HEIGHT_MIN)   # enforce floor at draw time
+        )
         if not np.any(mask):
             continue
-        sc = ax.scatter(frames[mask], centers_trk[mask, j],
-                        c=height_trk[mask, j], cmap="plasma",
-                        s=18, linewidths=0.0, edgecolors="none")
+        sc = ax.scatter(
+            frames[mask],
+            centers_trk[mask, j],
+            c=height_trk[mask, j],
+            cmap="plasma",
+            s=18,
+            linewidths=0.0,
+            edgecolors="none",
+        )
         handles.append(sc); labels.append(f"Peak {j}")
 
     ax.set_xlabel("Frame")
