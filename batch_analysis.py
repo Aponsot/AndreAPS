@@ -319,18 +319,18 @@ def _try_edge_add(xw, yw, result, max_n,
     rpos = np.maximum(resid, 0.0)
 
     def side_stats(msk):
-        if not np.any(msk):
-            return 0.0, np.nan, np.nan
-        area = np.sum(rpos[msk])
-        snr_area = area / (max(noise,1e-12) * np.sqrt(int(np.sum(msk))))
-        if area <= 0:
-            return 0.0, np.nan, np.nan
-        x_side = xw[msk]; w = rpos[msk]
-        xc = np.sum(x_side * w) / np.sum(w)
-        var = max(np.sum(w * (x_side - xc)**2) / np.sum(w), 1e-12)
-        sig = float(np.clip(np.sqrt(var), SIGMA_MIN_FIT, MAX=None))
-        sig = float(np.clip(sig, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
-        return snr_area, xc, sig
+    if not np.any(msk):
+        return 0.0, np.nan, np.nan
+    area = np.sum(rpos[msk])
+    snr_area = area / (max(noise, 1e-12) * np.sqrt(int(np.sum(msk))))
+    if area <= 0:
+        return 0.0, np.nan, np.nan
+    x_side = xw[msk]; w = rpos[msk]
+    xc = np.sum(x_side * w) / np.sum(w)
+    var = max(np.sum(w * (x_side - xc)**2) / np.sum(w), 1e-12)
+    # Single proper clip to enforce sigma bounds
+    sig = float(np.clip(np.sqrt(var), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+    return snr_area, xc, sig
 
     snrL, xL, sL = side_stats(left_mask)
     snrR, xR, sR = side_stats(right_mask)
@@ -699,4 +699,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
