@@ -36,7 +36,7 @@ AIC_IMPROVE     = 1.0
 
 # Admission looseners for adding components
 ADD_SNR_MIN       = 0.15
-EDGE_SNR_AREA_MIN = 0.10
+EDGE_SNR_AREA_MIN = 0.05
 
 # Plot title time scaling
 SEC_PER_FRAME   = 0.004
@@ -680,5 +680,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
