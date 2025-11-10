@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-# Core v1.3 — Gaussian multi-peak fitting with linear background
+# Core v1.4 — Gaussian multi-peak fitting with linear background
 # - Single-frame and full-experiment tracking
-# - Fixed number of peaks from --centers (hard cap)
+# - Fixed number of peaks from --centers (hard cap, constant across frames)
 # - Prune low-height components (< PEAK_HEIGHT_MIN) BEFORE shoulder detection
-# - Edge/flank shoulder detector (extended tails) + classic residual peak add (both respect cap)
+# - Edge/flank shoulder detector + classic residual peak add (both respect cap)
+# - Identity-preserving map assignment (nearest-neighbor to previous seeds)
+# - Border-aware asymmetric auto-expansion for edge-add only (then refit back)
 # - Polished plotting (publishable) + plasma colormap for map points
 # - No CSV writing
 
@@ -21,13 +23,13 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.10     # window half-width around [min(seeds), max(seeds)]
-MIN_POINTS  = 8           # min points in window to attempt a fit
+HALF_WINDOW = 0.10      # symmetric window half-width around [min(seeds), max(seeds)]
+MIN_POINTS  = 8         # min points in window to attempt a fit
 
 # Peak reporting/pruning floor (for keeping/plotting components)
 PEAK_HEIGHT_MIN = 5.2
 
-# Global sigma bounds (loosened min to avoid blocking)
+# Global sigma bounds
 SIGMA_MIN_FIT = 0.001
 SIGMA_MAX_FIT = 0.080
 
@@ -42,10 +44,16 @@ MIN_SEP         = 0.00010    # min separation from existing centers
 AIC_IMPROVE     = 4.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 # Admission looseners for new components (avoid height floor blocking)
-ADD_SNR_MIN         = 0.40   # admit new comp if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
-EDGE_SNR_AREA_MIN   = .1    # area-SNR threshold for edge/flank addition
+ADD_SNR_MIN         = 0.40   # admit new comp if height >= ADD_SNR_MIN*noise (even if < PEAK_HEIGHT_MIN)
+EDGE_SNR_AREA_MIN   = 0.6    # area-SNR threshold for edge/flank addition (raised from 0.1)
 
-SEC_PER_FRAME   = 0.004      # for titles; set None to show "Frame N" instead
+# Border-aware expansion (only for edge-add; then project back to tight window)
+AUTO_EDGE_EXPAND = True
+BORDER_SNR       = 0.9       # residual at border must exceed this * noise
+EXPAND_FACTOR    = 1.6
+MAX_HALF_WINDOW  = 0.50
+
+SEC_PER_FRAME    = 0.004     # for titles; set None to show "Frame N" instead
 
 # ------------------------------
 # Helpers
@@ -393,7 +401,45 @@ def _try_edge_add(xw, yw, result, max_n):
         return trial, True
     return result, False
 
-def fit_frame(x, y, seeds, halfwidth):
+def _edge_border_snr(resid, k=5):
+    """Return (snr_left, snr_right) using average positive residual over k-edge points."""
+    noise = robust_sigma(resid)
+    if noise <= 0: 
+        return 0.0, 0.0
+    k = max(1, min(k, resid.size//10))
+    rpos = np.maximum(resid, 0.0)
+    sl = np.mean(rpos[:k])  / noise
+    sr = np.mean(rpos[-k:]) / noise
+    return sl, sr
+
+def _assign_by_nearest(prev, cur_c, cur_w, cur_h):
+    """
+    Greedy nearest-neighbor assignment of current fits (cur_*) onto previous seeds (prev).
+    Returns arrays (C, W, H) of length len(prev), with NaN where unmatched.
+    """
+    prev = np.asarray(prev, float)
+    cur_c = np.asarray(cur_c, float); cur_w = np.asarray(cur_w, float); cur_h = np.asarray(cur_h, float)
+    used = [False]*cur_c.size
+    out_c = np.full(prev.size, np.nan); out_w = np.full(prev.size, np.nan); out_h = np.full(prev.size, np.nan)
+
+    for i, p in enumerate(prev):
+        best = -1; dmin = 1e18
+        for j in range(cur_c.size):
+            if used[j] or not np.isfinite(cur_c[j]): 
+                continue
+            d = abs(cur_c[j] - p)
+            if d < dmin:
+                dmin = d; best = j
+        if best >= 0:
+            used[best] = True
+            out_c[i], out_w[i], out_h[i] = cur_c[best], cur_w[best], cur_h[best]
+    return out_c, out_w, out_h
+
+# ------------------------------
+# Fit one frame
+# ------------------------------
+def fit_frame(x, y, seeds, halfwidth, max_allowed):
+    # tight window
     m = window_mask(x, seeds, halfwidth)
     if not np.any(m):
         return {"success": False}
@@ -415,8 +461,36 @@ def fit_frame(x, y, seeds, halfwidth):
         _, result = _rebuild_from_kept(xw, yw, result, keep)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # 3) EDGE/FLANK addition first (since shoulders are extended edges)
-    max_allowed = len(seeds)
+    # 3) EDGE/FLANK addition — with optional border-aware expansion
+    if AUTO_EDGE_EXPAND:
+        resid0 = yw - result.best_fit
+        sl, sr = _edge_border_snr(resid0, k=5)
+        if max(sl, sr) >= BORDER_SNR:
+            # expand asymmetrically toward pressured edge
+            hwL = min(halfwidth * (EXPAND_FACTOR if sl >= sr else 1.0), MAX_HALF_WINDOW)
+            hwR = min(halfwidth * (EXPAND_FACTOR if sr >  sl else 1.0), MAX_HALF_WINDOW)
+            m2 = (x >= np.min(seeds) - hwL) & (x <= np.max(seeds) + hwR)
+            xw2, yw2 = x[m2], y[m2]
+            # refit on expanded window using current params as init
+            model2, params2 = _build_seed_model(xw2, yw2, seeds)
+            i = 0
+            while f"g{i}_center" in params2 and f"g{i}_center" in result.params:
+                for nm in ("center","sigma","amplitude"):
+                    params2[f"g{i}_{nm}"].value = result.params[f"g{i}_{nm}"].value
+                i += 1
+            result2 = model2.fit(yw2, params2, x=xw2, nan_policy="omit")
+            result2, changed = _try_edge_add(xw2, yw2, result2, max_allowed)
+            if changed:
+                # project back to tight window by refitting with the new params
+                model_back, params_back = _build_seed_model(xw, yw, seeds)
+                i = 0
+                while f"g{i}_center" in params_back and f"g{i}_center" in result2.params:
+                    for nm in ("center","sigma","amplitude"):
+                        params_back[f"g{i}_{nm}"].value = result2.params[f"g{i}_{nm}"].value
+                    i += 1
+                result = model_back.fit(yw, params_back, x=xw, nan_policy="omit")
+
+    # regular edge add on tight window (still useful if expansion didn’t add)
     result, _ = _try_edge_add(xw, yw, result, max_allowed)
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
@@ -478,7 +552,7 @@ def style_axes(ax, light_grid=True):
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, height-prune, edge-shoulder).")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, fixed cap, identity map, border-aware edge-add).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -487,128 +561,7 @@ def main():
     seeds0 = parse_centers(args.centers)
     x, I_full = load_q_and_I(args.h5)
     nframes = I_full.shape[0]
+    max_allowed = len(seeds0)  # CONSTANT cap across the run
 
     # -------- Single frame --------
     if args.frame is not None:
-        if not (0 <= args.frame < nframes):
-            raise ValueError(f"--frame {args.frame} is out of range [0, {nframes-1}]")
-        y = I_full[args.frame]
-        res = fit_frame(x, y, seeds0, HALF_WINDOW)
-        if not res["success"]:
-            print("Fit failed for the requested frame.")
-            return
-
-        vis = np.isfinite(res["centers"])
-        centers_v = res["centers"][vis]
-        fwhm_v    = res["fwhm"][vis]
-        hfit_v    = res["height_fit"][vis]
-        pfit_v    = res["peak_fit"][vis]
-
-        # ---- Plot (single frame) ----
-        apply_pub_style()
-        from matplotlib.gridspec import GridSpec
-        fig = plt.figure()
-        gs = GridSpec(2, 1, height_ratios=[3.2, 1.2], hspace=0.18)
-
-        ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
-        ax.plot(res["xw"], res["yw"],  lw=1.2, label="Data")
-        ax.plot(res["xw"], res["yfit"], lw=1.6, label="Total fit")
-        ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Linear bkg")
-
-        for comp in res["components"]:
-            ax.plot(res["xw"], comp, ":", lw=1.0, alpha=0.75)
-
-        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.55, label="Gaussians + bkg")
-
-        for c in centers_v:
-            ax.axvline(c, linestyle="--", alpha=0.6, lw=1.0, color="0.45")
-
-        title = (f"{args.frame*float(SEC_PER_FRAME):.1f} s | " if SEC_PER_FRAME is not None else f"Frame {args.frame} | ")
-        ax.set_title(title + f"R²={res['r2']:.4f}", pad=6)
-        ax.set_xlabel("q (1/Å)")
-        ax.set_ylabel("Intensity (a.u.)")
-        ax.legend(loc="upper right", ncol=1)
-
-        # Compact table
-        ax_tbl = fig.add_subplot(gs[1]); style_axes(ax_tbl, light_grid=False); ax_tbl.axis("off")
-        rows = [[f"peak{i}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}", f"{p:.6f}"]
-                for i, (c, w, h, p) in enumerate(zip(centers_v, fwhm_v, hfit_v, pfit_v))]
-        col_labels = ["Peak", "Center", "FWHM", "Height (fit)", "Peak@Center (fit)"]
-        tbl = ax_tbl.table(cellText=rows, colLabels=col_labels, loc="center")
-        tbl.auto_set_font_size(False); tbl.set_fontsize(10)
-        for (r, _c), cell in tbl.get_celld().items():
-            cell.set_edgecolor("0.85")
-            cell.set_linewidth(0.6)
-            cell.set_alpha(0.0 if r == 0 else 0.06)
-
-        fig.tight_layout()
-        plt.show()
-        return
-
-    # -------- Mapping (all frames) --------
-    nuse = nframes
-    npeaks = len(seeds0)            # hard cap
-    centers_trk = np.full((nuse, npeaks), np.nan)
-    fwhm_trk    = np.full((nuse, npeaks), np.nan)
-    height_trk  = np.full((nuse, npeaks), np.nan)
-
-    seeds = seeds0.copy()
-    iterator = range(nuse)
-    if tqdm is not None:
-        iterator = tqdm(iterator, desc="Fitting frames", ncols=80)
-
-    for f in iterator:
-        y = I_full[f]
-        res = fit_frame(x, y, seeds, HALF_WINDOW)
-        if res["success"]:
-            vis = np.isfinite(res["centers"])
-            cvis = res["centers"][vis]
-            wvis = res["fwhm"][vis]
-            hvis = res["height_fit"][vis]
-            if cvis.size:
-                order = np.argsort(cvis)
-                cvis, wvis, hvis = cvis[order], wvis[order], hvis[order]
-            k = min(cvis.size, npeaks)
-            centers_trk[f, :k] = cvis[:k]
-            fwhm_trk[f, :k]    = wvis[:k]
-            height_trk[f, :k]  = hvis[:k]
-            if k > 0:
-                seeds = cvis[:min(k, npeaks)]  # per-frame seeding
-
-    # ---- Map plot (all frames) ----
-    apply_pub_style()
-    fig, ax = plt.subplots()
-    style_axes(ax, light_grid=True)
-
-    frames = np.arange(nuse)
-    handles, labels = [], []
-    for j in range(npeaks):
-        mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
-        if not np.any(mask):
-            continue
-        sc = ax.scatter(frames[mask], centers_trk[mask, j],
-                        c=height_trk[mask, j], cmap="plasma",
-                        s=18, linewidths=0.0, edgecolors="none")
-        handles.append(sc); labels.append(f"Peak {j}")
-
-    ax.set_xlabel("Frame")
-    ax.set_ylabel("Center (q or 2θ)")
-    ax.set_title("Peak centers over frames (color = fitted height)")
-
-    if handles:
-        cbar = fig.colorbar(handles[0], ax=ax, pad=0.02)
-        cbar.set_label("Height (fit)")
-
-    if handles:
-        ax.legend(handles, labels, loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False)
-
-    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
-    plt.show()
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
