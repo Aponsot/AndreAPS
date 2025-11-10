@@ -577,7 +577,7 @@ def main():
 
         ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
         ax.plot(res["xw"], res["yw"],  lw=1,  label="Data")
-        ax.plot(res["xw"], res["yfit"], lw=1.8, "--", label="Total fit")
+        ax.plot(res["xw"], res["yfit"], lw=1.8, label="Total fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Linear bkg")
 
         for comp in res["components"]:
@@ -699,5 +699,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
