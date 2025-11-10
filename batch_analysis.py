@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Core v1.5 — Gaussian multi-peak fitting with linear background
-# (Graphing fix + residual panel)
+# Core v1.7 — visuals, terminal table, and residual-triggered double-peak rescue (cap respected)
 import argparse, os
 import numpy as np
 import h5py
@@ -17,18 +16,37 @@ except Exception:
 # ------------------------------
 HALF_WINDOW = 0.12
 MIN_POINTS  = 8
+
+# Peak reporting/pruning floor (applied at the END when reporting/plotting)
 PEAK_HEIGHT_MIN = 5.2
+
+# Sigma bounds
 SIGMA_MIN_FIT = 0.001
 SIGMA_MAX_FIT = 0.080
+
+# Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.10
 DRIFT_POS = 0.010
+
+# Shoulder logic (both respect cap)
 ENABLE_RESIDUAL = True
 RESIDUAL_SNR    = 0.15
 MIN_SEP         = 0.000010
 AIC_IMPROVE     = 1.0
+
+# Admission looseners for adding components
 ADD_SNR_MIN       = 0.15
-EDGE_SNR_AREA_MIN = 0.1
+EDGE_SNR_AREA_MIN = 0.10
+
+# Plot title time scaling
 SEC_PER_FRAME   = 0.004
+
+# --- NEW: residual-triggered double-peak rescue (never exceed seed cap) ---
+RESIDUAL_TRIGGER_ABS = 15.0   # trigger if max|residual| >= this value
+RESCUE_MAX_COMPONENTS = 2      # only try to reach 2 components in rescue
+RESCUE_HEIGHT_FLOOR   = 0.6 * PEAK_HEIGHT_MIN  # temporary floor for admitting the rescue component
+RESCUE_ADD_SNR_MIN    = 0.10   # temporary SNR floor for rescue admission
+RESCUE_AIC_IMPROVE    = 0.0    # allow non-worse AIC in rescue (<= base AIC)
 
 # ------------------------------
 # Helpers
@@ -74,10 +92,10 @@ def window_mask(x, centers, halfwidth):
     hi = float(np.max(centers) + halfwidth)
     return (x >= lo) & (x <= hi)
 
-# -- FIX: amplitude in lmfit is AREA, not height
+# lmfit GaussianModel uses amplitude = AREA
 def _gaussian_y(x, amp_area, cen, sig):
-    # y = [amp_area / (sqrt(2π)*sigma)] * exp(-(x-c)^2/(2*sigma^2))
-    return (amp_area / (np.sqrt(2.0*np.pi)*max(sig,1e-12))) * np.exp(-(x - cen)**2 / (2.0 * max(sig,1e-12)**2))
+    sig = max(sig, 1e-12)
+    return (amp_area / (np.sqrt(2.0*np.pi)*sig)) * np.exp(-(x - cen)**2 / (2.0 * sig**2))
 
 def _build_seed_model(xw, yw, seeds):
     # background init via linear fit
@@ -136,13 +154,14 @@ def _extract_metrics(result, xw):
     comps = []
     for a, c, s in zip(amps, centers, sigmas):
         if np.all(np.isfinite([a, c, s])) and s > 0:
-            comps.append(_gaussian_y(xw, a, c, s))  # <- FIXED
+            comps.append(_gaussian_y(xw, a, c, s))
         else:
             comps.append(np.full_like(xw, np.nan, float))
     return bkg_line, centers, sigmas, amps, heights, fwhm, peak_at_center, comps
 
 from lmfit import Parameters
 def _rebuild_from_kept(xw, yw, result, keep_mask):
+    """Rebuild a model keeping only components where keep_mask is True; refit."""
     params_new = Parameters()
     model_new = LinearModel(prefix="bkg_")
     for nm in ["bkg_slope", "bkg_intercept"]:
@@ -171,10 +190,14 @@ def _rebuild_from_kept(xw, yw, result, keep_mask):
     refit = model_new.fit(yw, params_new, x=xw, nan_policy="omit")
     return model_new, refit
 
-def _accept_new_component(trial, base_aic, new_height, noise):
-    daic_ok = (trial.aic <= base_aic - AIC_IMPROVE)
+# ---- admission check; params allow rescue-time relaxations
+def _accept_new_component(trial, base_aic, new_height, noise,
+                          height_floor=PEAK_HEIGHT_MIN,
+                          add_snr_min=ADD_SNR_MIN,
+                          aic_improve=AIC_IMPROVE):
+    daic_ok   = (trial.aic <= base_aic - aic_improve)
     height_ok = (np.isfinite(new_height) and
-                 (new_height >= PEAK_HEIGHT_MIN or new_height >= ADD_SNR_MIN * max(noise, 1e-12)))
+                 (new_height >= height_floor or new_height >= add_snr_min * max(noise, 1e-12)))
     return daic_ok and height_ok
 
 def _build_params_from_result(res, drop_idx=None):
@@ -204,7 +227,11 @@ def _build_params_from_result(res, drop_idx=None):
         next_idx += 1; j += 1
     return model_expr, params_new, next_idx
 
-def _try_residual_add(xw, yw, result, max_n):
+def _try_residual_add(xw, yw, result, max_n,
+                      height_floor=PEAK_HEIGHT_MIN,
+                      add_snr_min=ADD_SNR_MIN,
+                      aic_improve=AIC_IMPROVE):
+    """Point-peak shoulder add (not exceeding max_n; may replace weakest)."""
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
@@ -219,6 +246,8 @@ def _try_residual_add(xw, yw, result, max_n):
         return result, False
 
     x0 = float(xw[idx])
+
+    # abort if too close to existing center
     centers_old = []
     j = 0
     while f"g{j}_center" in result.params:
@@ -245,11 +274,14 @@ def _try_residual_add(xw, yw, result, max_n):
         trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
         _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
         new_h = h[-1] if h.size else -np.inf
-        if _accept_new_component(trial, result.aic, new_h, noise):
+        if _accept_new_component(trial, result.aic, new_h, noise,
+                                 height_floor=height_floor,
+                                 add_snr_min=add_snr_min,
+                                 aic_improve=aic_improve):
             return trial, True
         return result, False
 
-    # replace weakest at cap
+    # At cap: try replacing the weakest height
     _, _, _, _, h0, _, _, _ = _extract_metrics(result, xw)
     if h0.size == 0:
         return result, False
@@ -264,11 +296,18 @@ def _try_residual_add(xw, yw, result, max_n):
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
     _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
     new_h = h[-1] if h.size else -np.inf
-    if _accept_new_component(trial, result.aic, new_h, noise):
+    if _accept_new_component(trial, result.aic, new_h, noise,
+                             height_floor=height_floor,
+                             add_snr_min=add_snr_min,
+                             aic_improve=aic_improve):
         return trial, True
     return result, False
 
-def _try_edge_add(xw, yw, result, max_n):
+def _try_edge_add(xw, yw, result, max_n,
+                  height_floor=PEAK_HEIGHT_MIN,
+                  add_snr_min=ADD_SNR_MIN,
+                  aic_improve=AIC_IMPROVE):
+    """Edge/flank-based shoulder add."""
     _, centers, sigmas, amps, heights, fwhm, _, _ = _extract_metrics(result, xw)
     if centers.size == 0:
         return result, False
@@ -330,10 +369,14 @@ def _try_edge_add(xw, yw, result, max_n):
         trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
         _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
         new_h = h[-1] if h.size else -np.inf
-        if _accept_new_component(trial, result.aic, new_h, noise):
+        if _accept_new_component(trial, result.aic, new_h, noise,
+                                 height_floor=height_floor,
+                                 add_snr_min=add_snr_min,
+                                 aic_improve=aic_improve):
             return trial, True
         return result, False
 
+    # at cap: replace weakest height
     _, _, _, _, h0, _, _, _ = _extract_metrics(result, xw)
     if h0.size == 0:
         return result, False
@@ -348,9 +391,53 @@ def _try_edge_add(xw, yw, result, max_n):
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
     _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
     new_h = h[-1] if h.size else -np.inf
-    if _accept_new_component(trial, result.aic, new_h, noise):
+    if _accept_new_component(trial, result.aic, new_h, noise,
+                             height_floor=height_floor,
+                             add_snr_min=add_snr_min,
+                             aic_improve=aic_improve):
         return trial, True
     return result, False
+
+def _rescue_double_peak(xw, yw, result, seed_cap):
+    """
+    If only one component survived and residuals are large, try to reach 2 components
+    (but NEVER exceed 'seed_cap'). Uses relaxed admission thresholds.
+    """
+    # Current number of components
+    n_now = 0
+    while f"g{n_now}_center" in result.params:
+        n_now += 1
+
+    target = min(seed_cap, RESCUE_MAX_COMPONENTS)
+    if n_now >= target:
+        return result, False
+
+    changed = False
+    # Try edge-add first, then residual-add, with relaxed thresholds
+    trial, ok = _try_edge_add(
+        xw, yw, result, max_n=target,
+        height_floor=RESCUE_HEIGHT_FLOOR,
+        add_snr_min=RESCUE_ADD_SNR_MIN,
+        aic_improve=RESCUE_AIC_IMPROVE
+    )
+    if ok:
+        result = trial; changed = True
+
+    # May still be < target; try residual-add
+    n_now2 = 0
+    while f"g{n_now2}_center" in result.params:
+        n_now2 += 1
+    if n_now2 < target:
+        trial, ok = _try_residual_add(
+            xw, yw, result, max_n=target,
+            height_floor=RESCUE_HEIGHT_FLOOR,
+            add_snr_min=RESCUE_ADD_SNR_MIN,
+            aic_improve=RESCUE_AIC_IMPROVE
+        )
+        if ok:
+            result = trial; changed = True
+
+    return result, changed
 
 def fit_frame(x, y, seeds, halfwidth):
     m = window_mask(x, seeds, halfwidth)
@@ -360,18 +447,21 @@ def fit_frame(x, y, seeds, halfwidth):
     if xw.size < MIN_POINTS:
         return {"success": False}
 
+    # 1) Seeded fit
     base_model, params = _build_seed_model(xw, yw, seeds)
     try:
         result = base_model.fit(yw, params, x=xw, nan_policy="omit")
     except Exception:
         return {"success": False}
 
+    # 2) Height-based PRUNE before shoulder detection
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
     keep = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     if keep.size and not np.all(keep):
         _, result = _rebuild_from_kept(xw, yw, result, keep)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
+    # 3) EDGE addition then residual addition (respect cap=len(seeds))
     max_allowed = len(seeds)
     result, _ = _try_edge_add(xw, yw, result, max_allowed)
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
@@ -380,6 +470,21 @@ def fit_frame(x, y, seeds, halfwidth):
         result, _ = _try_residual_add(xw, yw, result, max_allowed)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
+    # 3b) --- RESCUE: if only one kept and residuals huge, try to get 2 (but ≤ seed cap)
+    resid_vec = yw - (bkg_line + (np.sum(np.vstack(comps), axis=0) if len(comps) else 0.0))
+    resid_max_abs = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
+
+    # Count kept components at reporting floor
+    kept_mask = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
+    n_kept = int(np.sum(kept_mask))
+
+    if (n_kept == 1) and (resid_max_abs >= RESIDUAL_TRIGGER_ABS) and (len(seeds) >= 2):
+        result2, changed = _rescue_double_peak(xw, yw, result, seed_cap=len(seeds))
+        if changed:
+            result = result2
+            bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
+
+    # 4) Final reporting mask (strict PEAK_HEIGHT_MIN)
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
@@ -393,7 +498,8 @@ def fit_frame(x, y, seeds, halfwidth):
         "xw": xw, "yw": yw, "yfit": result.best_fit, "bkg": bkg_line,
         "centers": centers_out, "fwhm": fwhm_out, "height_fit": height_out,
         "peak_fit": peakfit_out, "components": comps, "comp_sum": comp_sum,
-        "r2": r2, "result": result
+        "r2": r2, "result": result,
+        "resid_max_abs": resid_max_abs
     }
 
 # ------------------------------
@@ -432,7 +538,7 @@ def style_axes(ax, light_grid=True):
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, height-prune, edge-shoulder).")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, height-prune, edge/residual adds, rescue).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -452,34 +558,33 @@ def main():
             print("Fit failed for the requested frame.")
             return
 
+        # ---- Terminal table (no on-figure table) ----
         vis = np.isfinite(res["centers"])
         centers_v = res["centers"][vis]
         fwhm_v    = res["fwhm"][vis]
         hfit_v    = res["height_fit"][vis]
-        pfit_v    = res["peak_fit"][vis]
+        print("\nPEAKS (kept >= height floor):")
+        print("Index\tCenter\t\tFWHM\t\tHeight")
+        for i, (c, w, h) in enumerate(zip(centers_v, fwhm_v, hfit_v), start=1):
+            print(f"{i}\t{c:.6f}\t{w:.6f}\t{h:.6f}")
+        print(f"R2 = {res['r2']:.4f} | max|residual| = {res['resid_max_abs']:.3f}\n")
 
         # ---- Plot (single frame) ----
         apply_pub_style()
         from matplotlib.gridspec import GridSpec
-        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-
         fig = plt.figure()
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.2], hspace=0.18)
 
-        # Main axis
         ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
         ax.plot(res["xw"], res["yw"],  lw=1.2, label="Data")
         ax.plot(res["xw"], res["yfit"], lw=1.8, label="Total fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.0, label="Linear bkg")
 
-        # Individual components (thin)
         for comp in res["components"]:
             ax.plot(res["xw"], comp, lw=0.9, alpha=0.9)
 
-        # Sum of Gaussians + background (sanity)
         ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.55, label="Gaussians + bkg")
 
-        # Center guides
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.4")
 
@@ -489,7 +594,7 @@ def main():
         ax.set_ylabel("Intensity (a.u.)")
         ax.legend(loc="upper right", ncol=1)
 
-        # Residual axis
+        # Residual panel
         axr = fig.add_subplot(gs[1]); style_axes(axr, light_grid=False)
         resid = res["yw"] - res["yfit"]
         axr.plot(res["xw"], resid, lw=1.0)
@@ -497,29 +602,13 @@ def main():
         axr.set_xlabel("q (1/Å)")
         axr.set_ylabel("Residual")
 
-        # Compact table as inset on main axes
-        ax_tbl = inset_axes(ax, width="46%", height="46%", loc="upper left", borderpad=0.9)
-        ax_tbl.axis("off")
-        rows = [[f"{i+1}", f"{c:.6f}", f"{w:.6f}", f"{h:.6f}"]
-                for i, (c, w, h) in enumerate(zip(centers_v, fwhm_v, hfit_v))]
-        col_labels = ["Index", "Center", "FWHM", "Height"]
-        tbl = ax_tbl.table(cellText=rows, colLabels=col_labels, loc="center")
-        tbl.auto_set_font_size(False); tbl.set_fontsize(9)
-        for (r, _c), cell in tbl.get_celld().items():
-            cell.set_edgecolor("0.85")
-            cell.set_linewidth(0.6)
-            if r == 0:
-                cell.set_alpha(0.10)
-            else:
-                cell.set_alpha(0.06)
-
         fig.tight_layout()
         plt.show()
         return
 
     # -------- Mapping (all frames) --------
     nuse = nframes
-    npeaks = len(seeds0)            # hard cap
+    npeaks = len(seeds0)            # hard cap from user seeds
     centers_trk = np.full((nuse, npeaks), np.nan)
     fwhm_trk    = np.full((nuse, npeaks), np.nan)
     height_trk  = np.full((nuse, npeaks), np.nan)
