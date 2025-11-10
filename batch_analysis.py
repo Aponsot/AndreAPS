@@ -31,7 +31,7 @@ DRIFT_POS = 0.010
 # Shoulder logic (both respect cap)
 ENABLE_RESIDUAL = True
 RESIDUAL_SNR    = 0.05
-MIN_SEP         = 0.00080
+MIN_SEP         = 0.00090
 AIC_IMPROVE     = .05
 
 # Admission looseners for adding components
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
