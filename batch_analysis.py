@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# Core v1.1 — Gaussian multi-peak fitting with linear background
+# Core v1.2 — Gaussian multi-peak fitting with linear background
 # - Single-frame and full-experiment tracking
 # - Fixed number of peaks from --centers (hard cap)
-# - NEW: prune low-height components (< PEAK_HEIGHT_MIN) BEFORE shoulder detection
-# - Shoulder robustness via sigma bounds, per-seed drift limits, residual SNR + AIC checks (cap respected)
-# - CSV gated behind --csv (off by default)
+# - Prune low-height components (< PEAK_HEIGHT_MIN) BEFORE shoulder detection
+# - Residual shoulder detection (cap respected)
+# - NEW: Shoulder-hunt mode triggers when any FWHM > BROAD_FWHM_TRIGGER:
+#        temporarily loosens drift/SNR/AIC/MIN_SEP and allows +1 component (tunable)
 
 import argparse, os
 import numpy as np
@@ -20,7 +21,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.20     # window half-width around [min(seeds), max(seeds)]
+HALF_WINDOW = 0.20        # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8           # min points in window to attempt a fit
 
 # Peak reporting/pruning floor
@@ -34,13 +35,23 @@ SIGMA_MAX_FIT = 0.080
 DRIFT_NEG = 0.10
 DRIFT_POS = 0.010
 
-# Residual-shoulder logic (never exceed seeded count)
+# Residual-shoulder logic (default, strict) — never exceed seeded count
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.35     # residual peak must be ≥ SNR * robust_noise
-MIN_SEP         = 0.00010  # min separation from existing centers
+RESIDUAL_SNR    = 0.35    # residual peak must be ≥ SNR * robust_noise
+MIN_SEP         = 0.00010 # min separation from existing centers
 AIC_IMPROVE     = 4.0     # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 SEC_PER_FRAME   = 0.004   # for titles; set None to show "Frame N" instead
+
+# --- Shoulder-hunt trigger (broad main peak) ---
+BROAD_FWHM_TRIGGER = 0.020      # if any fitted FWHM exceeds this, enable shoulder mode
+SHOULDER_MODE_NBOOST = 1        # allow up to +1 extra component *only* in shoulder mode
+# Looseners used only during shoulder mode (per-frame)
+SHOULDER_RESIDUAL_SNR  = 0.30   # was 0.35
+SHOULDER_AIC_IMPROVE   = 3.0    # was 4.0
+SHOULDER_MIN_SEP       = 0.00008
+SHOULDER_DRIFT_SCALE   = 1.3
+SHOULDER_DRIFT_ADD     = (0.005, 0.002)  # (neg, pos) absolute slack
 
 # ------------------------------
 # Helpers
@@ -51,7 +62,7 @@ def parse_centers(s: str):
         raise ValueError("No centers parsed from --centers.")
     return np.array(vals, float)
 
-def sigma_to_fwhm(sigma): 
+def sigma_to_fwhm(sigma):
     return 2.354820045 * sigma
 
 def robust_sigma(y):
@@ -261,6 +272,19 @@ def _try_residual_add(xw, yw, result, max_n):
         return trial, True
     return result, False
 
+def _apply_drift_relax(params, scale=1.0, add_neg=0.0, add_pos=0.0):
+    """Loosen center bounds for a params set (in-place)."""
+    i = 0
+    while f"g{i}_center" in params:
+        p = params[f"g{i}_center"]
+        c = p.value
+        lo = p.min if p.min is not None else c - 1.0
+        hi = p.max if p.max is not None else c + 1.0
+        neg = (c - lo) * scale + add_neg
+        pos = (hi - c) * scale + add_pos
+        p.set(min=c - neg, max=c + pos)
+        i += 1
+
 def fit_frame(x, y, seeds, halfwidth):
     m = window_mask(x, seeds, halfwidth)
     if not np.any(m):
@@ -280,17 +304,54 @@ def fit_frame(x, y, seeds, halfwidth):
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
     keep = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     if keep.size and not np.all(keep):
-        # rebuild model with only kept components and refit
         _, result = _rebuild_from_kept(xw, yw, result, keep)
-        # refresh metrics after prune-refit
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # 3) Residual shoulder addition (cap respected)
+    # 3) Residual shoulder addition (default strict; cap respected)
     max_allowed = len(seeds)
     if ENABLE_RESIDUAL and max_allowed > 0:
         result, _ = _try_residual_add(xw, yw, result, max_allowed)
-        # refresh metrics again
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
+
+        # --- Shoulder-hunt mode: trigger on broad FWHM
+        if np.nanmax(w_all) > BROAD_FWHM_TRIGGER:
+            # clone params and relax drift for this frame only
+            params_relaxed = result.params.copy()
+            _apply_drift_relax(
+                params_relaxed,
+                scale=SHOULDER_DRIFT_SCALE,
+                add_neg=SHOULDER_DRIFT_ADD[0],
+                add_pos=SHOULDER_DRIFT_ADD[1],
+            )
+            # re-fit with relaxed drift
+            relaxed = result.model.fit(yw, params_relaxed, x=xw, nan_policy="omit")
+
+            # temporarily loosen SNR/AIC/MIN_SEP and allow +1 component
+            saved_snr, saved_aic, saved_sep = RESIDUAL_SNR, AIC_IMPROVE, MIN_SEP
+            try:
+                globals()["RESIDUAL_SNR"] = SHOULDER_RESIDUAL_SNR
+                globals()["AIC_IMPROVE"]  = SHOULDER_AIC_IMPROVE
+                globals()["MIN_SEP"]      = SHOULDER_MIN_SEP
+
+                relaxed, _ = _try_residual_add(
+                    xw, yw, relaxed, max_allowed + max(0, int(SHOULDER_MODE_NBOOST))
+                )
+
+                # accept only if the relaxed solution is genuinely better
+                def _r2(y_true, y_fit):
+                    ss_res = np.sum((y_true - y_fit)**2)
+                    ss_tot = np.sum((y_true - np.mean(y_true))**2) + 1e-12
+                    return 1.0 - ss_res/ss_tot
+
+                if (relaxed.aic <= result.aic - 1.0) or (_r2(yw, relaxed.best_fit) >= _r2(yw, result.best_fit) + 5e-4):
+                    result = relaxed
+            finally:
+                globals()["RESIDUAL_SNR"] = saved_snr
+                globals()["AIC_IMPROVE"]  = saved_aic
+                globals()["MIN_SEP"]      = saved_sep
+
+            # refresh metrics after shoulder mode
+            bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
     # 4) Apply reporting mask (same as prune rule for consistency)
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
@@ -329,7 +390,7 @@ def style_axes(ax):
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, fixed peak count, height-prune).")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, fixed peak count, height-prune, shoulder-hunt).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -383,7 +444,7 @@ def main():
         ax.set_title(title + f"R²={res['r2']:.4f}", pad=6)
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity (a.u.)")
-        leg = ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
         fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
 
         # table
@@ -403,7 +464,7 @@ def main():
 
     # -------- Mapping (all frames) --------
     nuse = nframes
-    npeaks = len(seeds0)            # hard cap
+    npeaks = len(seeds0)            # hard cap (default mode)
     centers_trk = np.full((nuse, npeaks), np.nan)
     fwhm_trk    = np.full((nuse, npeaks), np.nan)
     height_trk  = np.full((nuse, npeaks), np.nan)
@@ -421,7 +482,6 @@ def main():
             cvis = res["centers"][vis]
             wvis = res["fwhm"][vis]
             hvis = res["height_fit"][vis]
-            # track up to npeaks, sorted by center
             if cvis.size:
                 order = np.argsort(cvis)
                 cvis, wvis, hvis = cvis[order], wvis[order], hvis[order]
@@ -430,8 +490,7 @@ def main():
             fwhm_trk[f, :k]    = wvis[:k]
             height_trk[f, :k]  = hvis[:k]
             if k > 0:
-                # per-frame seeding from kept components; if fewer than npeaks, we seed with what we have
-                seeds = cvis[:min(k, npeaks)]
+                seeds = cvis[:min(k, npeaks)]  # per-frame seeding
 
     # Map plot
     apply_pub_style()
@@ -439,10 +498,10 @@ def main():
     frames = np.arange(nuse)
     for j in range(npeaks):
         mask = np.isfinite(centers_trk[:, j]) & np.isfinite(height_trk[:, j])
-        if not np.any(mask): 
+        if not np.any(mask):
             continue
-        sc = ax.scatter(frames[mask], centers_trk[mask, j], c=height_trk[mask, j],
-                        cmap="plasma", s=14, edgecolors="none", label=f"peak {j}")
+        ax.scatter(frames[mask], centers_trk[mask, j], c=height_trk[mask, j],
+                   cmap="plasma", s=14, edgecolors="none", label=f"peak {j}")
     ax.set_xlabel("Frame")
     ax.set_ylabel("Center (q or 2θ)")
     ax.set_title("Peak Centers over Frames (colored by fitted height)")
@@ -455,10 +514,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
