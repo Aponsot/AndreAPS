@@ -35,7 +35,7 @@ MIN_SEP         = 0.000010
 AIC_IMPROVE     = .05
 
 # Admission looseners for adding components
-ADD_SNR_MIN       = 0.15
+ADD_SNR_MIN       = 0.1
 EDGE_SNR_AREA_MIN = 0.05
 
 # Plot title time scaling
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
