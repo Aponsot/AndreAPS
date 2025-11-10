@@ -42,7 +42,7 @@ DRIFT_POS = 0.010
 ENABLE_RESIDUAL = True
 RESIDUAL_SNR    = 0.25       # residual peak must be ≥ SNR * robust_noise
 MIN_SEP         = 0.000010    # min separation from existing centers
-AIC_IMPROVE     = 4.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
+AIC_IMPROVE     = 2.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 # Admission loosener for new components (avoid height floor blocking)
 ADD_SNR_MIN       = 0.15     # admit if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
@@ -618,5 +618,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
