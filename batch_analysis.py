@@ -30,7 +30,7 @@ DRIFT_POS = 0.010
 
 # Shoulder logic (both respect cap)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.05
+RESIDUAL_SNR    = 0.15
 MIN_SEP         = 0.00080
 AIC_IMPROVE     = .05
 
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
