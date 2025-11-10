@@ -14,14 +14,14 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.135
+HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
 # Peak reporting/pruning floor (applied at the END when reporting/plotting)
 PEAK_HEIGHT_MIN = 5.2
 
 # Sigma bounds
-SIGMA_MIN_FIT = 0.0001
+SIGMA_MIN_FIT = 0.001
 SIGMA_MAX_FIT = 0.080
 
 # Per-seed drift limits (asymmetric, relative to seed)
@@ -44,7 +44,7 @@ SEC_PER_FRAME   = 0.004
 # --- NEW: residual-triggered double-peak rescue (never exceed seed cap) ---
 RESIDUAL_TRIGGER_ABS = 15.0   # trigger if max|residual| >= this value
 RESCUE_MAX_COMPONENTS = 2      # only try to reach 2 components in rescue
-RESCUE_HEIGHT_FLOOR   = 2* PEAK_HEIGHT_MIN  # temporary floor for admitting the rescue component
+RESCUE_HEIGHT_FLOOR   = .05 * PEAK_HEIGHT_MIN  # temporary floor for admitting the rescue component
 RESCUE_ADD_SNR_MIN    = 0.005   # temporary SNR floor for rescue admission
 RESCUE_AIC_IMPROVE    = 0.0    # allow non-worse AIC in rescue (<= base AIC)
 
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
