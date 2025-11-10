@@ -583,7 +583,7 @@ def main():
         for comp in res["components"]:
             ax.plot(res["xw"], comp, lw=0.9, alpha=0.9)
 
-        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", "--", alpha=0.55,)
+        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", "--", alpha=0.55)
 
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.5, lw=0.9, color="0.4")
@@ -699,6 +699,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
