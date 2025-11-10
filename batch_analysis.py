@@ -14,7 +14,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.12
+HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
 # Peak reporting/pruning floor (applied at the END when reporting/plotting)
@@ -25,12 +25,12 @@ SIGMA_MIN_FIT = 0.001
 SIGMA_MAX_FIT = 0.080
 
 # Per-seed drift limits (asymmetric, relative to seed)
-DRIFT_NEG = 0.10
+DRIFT_NEG = 0.15
 DRIFT_POS = 0.010
 
 # Shoulder logic (both respect cap)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.15
+RESIDUAL_SNR    = 0.1
 MIN_SEP         = 0.000010
 AIC_IMPROVE     = 1.0
 
@@ -44,8 +44,8 @@ SEC_PER_FRAME   = 0.004
 # --- NEW: residual-triggered double-peak rescue (never exceed seed cap) ---
 RESIDUAL_TRIGGER_ABS = 15.0   # trigger if max|residual| >= this value
 RESCUE_MAX_COMPONENTS = 2      # only try to reach 2 components in rescue
-RESCUE_HEIGHT_FLOOR   = 0.3 * PEAK_HEIGHT_MIN  # temporary floor for admitting the rescue component
-RESCUE_ADD_SNR_MIN    = 0.10   # temporary SNR floor for rescue admission
+RESCUE_HEIGHT_FLOOR   = 0.8 * PEAK_HEIGHT_MIN  # temporary floor for admitting the rescue component
+RESCUE_ADD_SNR_MIN    = 0.05   # temporary SNR floor for rescue admission
 RESCUE_AIC_IMPROVE    = 0.0    # allow non-worse AIC in rescue (<= base AIC)
 
 # ------------------------------
@@ -680,4 +680,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
