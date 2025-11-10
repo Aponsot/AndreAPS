@@ -32,7 +32,7 @@ DRIFT_POS = 0.010
 ENABLE_RESIDUAL = True
 RESIDUAL_SNR    = 0.05
 MIN_SEP         = 0.000010
-AIC_IMPROVE     = 1.0
+AIC_IMPROVE     = .05
 
 # Admission looseners for adding components
 ADD_SNR_MIN       = 0.15
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
