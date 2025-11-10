@@ -23,7 +23,7 @@ except Exception:
 # ------------------------------
 # Tunables (minimal & clear)
 # ------------------------------
-HALF_WINDOW     = 0.12   # half-width of fit window around [min(seeds), max(seeds)]
+HALF_WINDOW     = 0.14   # half-width of fit window around [min(seeds), max(seeds)]
 MIN_POINTS      = 8      # min points in window to attempt a fit
 
 PEAK_HEIGHT_MIN = 5.2    # floor for reporting/plotting (post-fit filtering)
@@ -510,6 +510,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
