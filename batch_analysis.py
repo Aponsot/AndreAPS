@@ -36,7 +36,7 @@ DRIFT_POS = 0.010
 
 # Residual-shoulder logic (never exceed seeded count)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.35     # residual peak must be ≥ SNR * robust_noise
+RESIDUAL_SNR    = 0.25     # residual peak must be ≥ SNR * robust_noise
 MIN_SEP         = 0.007  # min separation from existing centers
 AIC_IMPROVE     = 8.0     # require ΔAIC ≤ -AIC_IMPROVE to accept replacement
 
@@ -468,6 +468,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
