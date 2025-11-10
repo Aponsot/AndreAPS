@@ -31,7 +31,7 @@ MIN_POINTS  = 8        # min points in window to attempt a fit
 PEAK_HEIGHT_MIN = 5.2
 
 # Global sigma bounds
-SIGMA_MIN_FIT = 0.01
+SIGMA_MIN_FIT = 0.001
 SIGMA_MAX_FIT = 0.080
 
 # Per-seed drift limits (asymmetric, relative to seed)
@@ -618,6 +618,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
