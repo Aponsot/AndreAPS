@@ -34,7 +34,7 @@ SIGMA_MAX_FIT   = 0.10
 DRIFT_NEG       = 0.10   # allowed center drift around each seed per frame
 DRIFT_POS       = 0.010
 
-MIN_SEP         = 1e-4   # min separation between component centers (x-units)
+MIN_SEP         = 1e-8   # min separation between component centers (x-units)
 
 SEC_PER_FRAME   = 0.004  # for titles; set None to show "Frame N" instead
 
@@ -510,6 +510,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
