@@ -18,7 +18,7 @@ HALF_WINDOW = 0.20
 MIN_POINTS  = 8
 
 # Peak reporting/pruning floor (applied at the END when reporting/plotting)
-PEAK_HEIGHT_MIN = 1.2
+PEAK_HEIGHT_MIN = 1
 
 # Sigma bounds
 SIGMA_MIN_FIT = 0.001
@@ -699,6 +699,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
