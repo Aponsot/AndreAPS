@@ -40,7 +40,7 @@ DRIFT_POS = 0.010
 
 # Residual-shoulder logic (cap respected)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.20       # residual peak must be ≥ SNR * robust_noise
+RESIDUAL_SNR    = 0.15       # residual peak must be ≥ SNR * robust_noise
 MIN_SEP         = 0.000010    # min separation from existing centers
 AIC_IMPROVE     = 1.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
@@ -618,6 +618,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
