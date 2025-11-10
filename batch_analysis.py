@@ -14,7 +14,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.15
+HALF_WINDOW = 0.10
 MIN_POINTS  = 8
 
 # Peak reporting/pruning floor (applied at the END when reporting/plotting)
@@ -680,6 +680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
