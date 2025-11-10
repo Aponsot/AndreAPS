@@ -46,7 +46,7 @@ AIC_IMPROVE     = 2.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 # Admission loosener for new components (avoid height floor blocking)
 ADD_SNR_MIN       = 0.15     # admit if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
-EDGE_SNR_AREA_MIN = 0.3    # area-SNR threshold for edge/flank addition
+EDGE_SNR_AREA_MIN = 0.1    # area-SNR threshold for edge/flank addition
 
 SEC_PER_FRAME   = 0.004      # for titles; set None to show "Frame N" instead
 
@@ -618,6 +618,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
