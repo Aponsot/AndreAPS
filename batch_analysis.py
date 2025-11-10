@@ -563,7 +563,7 @@ def main():
         plt.rcParams.update({"figure.figsize": (10.5, 5.2)})
 
         fig = plt.figure()
-        gs = GridSpec(2, 1, height_ratios=[3.0, 1.2], hspace=0.18)
+        gs = GridSpec(2, 1, height_ratios=[3.0, 1.2], hspace=0.50)
 
         ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
 
@@ -699,6 +699,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
