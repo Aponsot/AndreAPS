@@ -25,7 +25,7 @@ HALF_WINDOW = 0.20        # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8           # min points in window to attempt a fit
 
 # Peak reporting/pruning floor (for keeping/plotting components)
-PEAK_HEIGHT_MIN = 5.0
+PEAK_HEIGHT_MIN = 5.2
 
 # Global sigma bounds (loosened min to avoid blocking)
 SIGMA_MIN_FIT = 0.001
@@ -607,3 +607,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
