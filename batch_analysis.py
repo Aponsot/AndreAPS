@@ -24,7 +24,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.10     # window half-width around [min(seeds), max(seeds)]
+HALF_WINDOW = 0.12     # window half-width around [min(seeds), max(seeds)]
 MIN_POINTS  = 8        # min points in window to attempt a fit
 
 # Peak reporting/pruning floor
@@ -40,13 +40,13 @@ DRIFT_POS = 0.010
 
 # Residual-shoulder logic (cap respected)
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.35       # residual peak must be ≥ SNR * robust_noise
+RESIDUAL_SNR    = 0.30       # residual peak must be ≥ SNR * robust_noise
 MIN_SEP         = 0.00010    # min separation from existing centers
 AIC_IMPROVE     = 4.0        # require ΔAIC ≤ -AIC_IMPROVE to accept addition
 
 # Admission loosener for new components (avoid height floor blocking)
-ADD_SNR_MIN       = 0.40     # admit if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
-EDGE_SNR_AREA_MIN = 0.8      # area-SNR threshold for edge/flank addition
+ADD_SNR_MIN       = 0.20     # admit if height >= ADD_SNR_MIN * noise (even if < PEAK_HEIGHT_MIN)
+EDGE_SNR_AREA_MIN = 0.6     # area-SNR threshold for edge/flank addition
 
 SEC_PER_FRAME   = 0.004      # for titles; set None to show "Frame N" instead
 
@@ -618,3 +618,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
