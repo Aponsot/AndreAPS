@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# Pixel-integrated Gaussian multi-peak fit with ONE add-path:
-# area-based residual add (centroid + sigma tied to main sigma).
-# Linear background. Height floor governs both admission and reporting.
+# Pixel-integrated Gaussian multi-peak fit with ONE mechanism:
+# If residual is high, FORCE-SPLIT the tallest peak into two and refit.
+# Linear background. Height floor governs admission & reporting.
 #
-# CLI: --h5, --centers, --frame   (unchanged)
+# CLI unchanged: --h5, --centers, --frame
 
 import argparse, os
 import numpy as np
@@ -20,37 +20,43 @@ except Exception:
     tqdm = None
 
 # ------------------------------
-# Tunables (minimal set)
+# Tunables (minimal + force-split)
 # ------------------------------
 HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
-# Peak reporting/admission floor (applied when adding AND at the END)
-PEAK_HEIGHT_MIN = 5000
+# Peak reporting/admission floor (both children must pass after split)
+PEAK_HEIGHT_MIN = 5.0
 
-# Sigma bounds
+# Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.001
-SIGMA_MAX_FIT = 0.1
+SIGMA_MAX_FIT = 0.12    # slight headroom helps in broad frames
 
 # Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.15
 DRIFT_POS = 0.010
 
-# Separation guard between components
-MIN_SEP = 0.00050
+# Minimum separation between components
+MIN_SEP = 0.00040
 
-# Model selection requirement for adding a component
-AIC_IMPROVE = 1.0
+# Model selection requirement for accepting a split (ΔAIC improvement)
+AIC_IMPROVE = 0.3
 
-# Time scaling for titles (0 or None -> use frame index)
+# Plot title time scaling (0 or None -> use frame index)
 SEC_PER_FRAME = 0.004
 
-# Area-based add/rescue behavior
-SIGMA_ADDED_MIN_FRAC = 0.7     # new comp sigma >= 0.7 * main_sigma
-SIGMA_ADDED_MAX_FRAC = 2.5     # and <= 1.5 * main_sigma
-NOISE_TRIGGER_MULT   = 4.0     # rescue fire level = NOISE_TRIGGER_MULT * noise
+# --- FORCE-SPLIT controls ---
+# Fire split if max|residual| >= FORCE_SPLIT_NOISE_MULT * noise
+FORCE_SPLIT_NOISE_MULT   = 6.0
+# Children centers offset ~ frac * parent_sigma (clamped by MIN_SEP and residual geometry)
+FORCE_SPLIT_DELTA_SIGMA_FRAC = 0.7
+# Accept split if (ΔAIC >= AIC_IMPROVE) OR (resid_rms drops by >= this fraction)
+FORCE_SPLIT_RESID_DROP_FRAC  = 0.20
+# Children sigma bounds relative to parent
+FORCE_SPLIT_SIGMA_FRAC_MIN = 0.6
+FORCE_SPLIT_SIGMA_FRAC_MAX = 2.2
 
-DEBUG = True  # set True to print why adds are accepted/rejected
+DEBUG = False  # flip to True for per-frame diagnostics
 
 # ------------------------------
 # Pixel-integrated Gaussian model
@@ -67,7 +73,7 @@ def bin_edges_from_centers(x):
     edges[-1] = x[-1] + (x[-1] - mids[-1])
     return edges
 
-# amplitude = total area under the continuous Gaussian
+# amplitude == total area
 def pixint_gauss(x, amplitude, center, sigma):
     sigma = max(float(sigma), 1e-12)
     edges = bin_edges_from_centers(x)
@@ -122,11 +128,8 @@ def window_mask(x, centers, halfwidth):
     hi = float(np.max(centers) + halfwidth)
     return (x >= lo) & (x <= hi)
 
-def _gaussian_y(x, amp_area, cen, sig):
-    return pixint_gauss(x, amp_area, cen, sig)
-
 def _build_seed_model(xw, yw, seeds):
-    # background init via linear fit
+    # linear background init
     try:
         bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
     except Exception:
@@ -182,10 +185,16 @@ def _extract_metrics(result, xw):
     comps = []
     for a, c, s in zip(amps, centers, sigmas):
         if np.all(np.isfinite([a, c, s])) and s > 0:
-            comps.append(_gaussian_y(xw, a, c, s))
+            # individual component (no bkg)
+            edges = _gaussian_y(xw, a, c, s)
+            comps.append(edges)
         else:
             comps.append(np.full_like(xw, np.nan, float))
+
     return bkg_line, centers, sigmas, amps, heights, fwhm, peak_at_center, comps
+
+def _gaussian_y(x, amp_area, cen, sig):
+    return pixint_gauss(x, amp_area, cen, sig)
 
 def _rebuild_from_kept(xw, yw, result, keep_mask):
     params_new = Parameters()
@@ -243,156 +252,181 @@ def _build_params_from_result(res, drop_idx=None):
         next_idx += 1; j += 1
     return model_expr, params_new, next_idx
 
-# ---- ONE add path: area-based residual add ----
-def _try_area_add(xw, yw, result, max_n,
-                  height_floor=PEAK_HEIGHT_MIN,
-                  aic_improve=AIC_IMPROVE):
-    # count components
+# ------------------------------
+# FORCE-SPLIT of tallest peak
+# ------------------------------
+def _force_split_if_needed(xw, yw, result, seed_cap):
+    """
+    If residual is high, split tallest component into two children and refit.
+    Respect seed_cap by optionally dropping the weakest other component.
+    Accept if (ΔAIC >= AIC_IMPROVE) OR (RMS residual drops by >= FORCE_SPLIT_RESID_DROP_FRAC),
+    AND both children heights >= PEAK_HEIGHT_MIN and separation >= MIN_SEP.
+    """
+    # current comps
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
     if n_now == 0:
         return result, False
 
-    # extract centers/sigmas/heights
-    centers, sigmas, heights = [], [], []
-    for k in range(n_now):
-        c = result.params[f"g{k}_center"].value
-        s = max(result.params[f"g{k}_sigma"].value, 1e-12)
-        a = result.params[f"g{k}_amplitude"].value
-        h = a / (s * np.sqrt(2.0*np.pi))   # area→height
-        centers.append(c); sigmas.append(s); heights.append(h)
-    centers = np.asarray(centers, float)
-    sigmas  = np.asarray(sigmas,  float)
-    heights = np.asarray(heights, float)
-    j_main  = int(np.nanargmax(heights))
-    main_c  = float(centers[j_main])
-    main_s  = float(sigmas[j_main])
+    # Extract current metrics
+    bkg_line, centers, sigmas, amps, heights, _, _, _ = _extract_metrics(result, xw)
+    resid_vec = yw - (bkg_line + sum_component_stack(xw, result))
+    noise = robust_sigma(resid_vec)
+    resid_max = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
+    resid_rms0 = float(np.sqrt(np.mean(resid_vec**2))) if resid_vec.size else 0.0
 
-    # residuals & noise
-    resid = yw - result.best_fit
-    noise = robust_sigma(resid)
     if noise <= 0:
         return result, False
-    rpos = np.maximum(resid, 0.0)
+    if resid_max < FORCE_SPLIT_NOISE_MULT * noise:
+        return result, False
 
-    def side_stats(mask):
+    # Identify tallest component (by height)
+    j_main = int(np.nanargmax(heights))
+    main_c = float(centers[j_main])
+    main_s = max(float(sigmas[j_main]), 1e-12)
+    main_a = max(float(amps[j_main]),   1e-12)
+
+    # Residual centroid to choose split direction
+    r = resid_vec
+    rpos = np.maximum(r, 0.0)
+    left_mask  = xw <  main_c
+    right_mask = xw >  main_c
+
+    def centroid(mask):
         if not np.any(mask):
-            return None
+            return None, 0.0
         w = rpos[mask]
         if np.sum(w) <= 0:
-            return None
+            return None, 0.0
         x_side = xw[mask]
-        area   = float(np.sum(w))
-        xc     = float(np.sum(x_side * w) / np.sum(w))
-        var    = max(np.sum(w * (x_side - xc)**2) / np.sum(w), 1e-12)
-        s_est  = float(np.clip(np.sqrt(var), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
-        h_est  = area / (np.sqrt(2.0*np.pi) * max(s_est, 1e-12))
-        return (area, xc, s_est, h_est)
+        xc = float(np.sum(x_side * w) / np.sum(w))
+        area = float(np.sum(w))
+        return xc, area
 
-    left  = side_stats(xw <  main_c)
-    right = side_stats(xw >  main_c)
+    xL, areaL = centroid(left_mask)
+    xR, areaR = centroid(right_mask)
+    if (xL is None) and (xR is None):
+        return result, False
 
-    cand = None
-    if left and right:
-        cand = left if left[3] >= right[3] else right
-    elif left:
-        cand = left
-    elif right:
-        cand = right
+    # Choose side by larger positive-residual area; set direction sign
+    if (xR is not None and areaR >= areaL) or (xL is None):
+        x_centroid = xR
+        sign_dir = +1.0
     else:
-        return result, False
+        x_centroid = xL
+        sign_dir = -1.0
 
-    area_side, x0_centroid, sigma_est, h_est = cand
+    # Compute child centers: symmetric around main_c but nudged toward residual centroid
+    # base delta from parent sigma
+    delta0 = max(FORCE_SPLIT_DELTA_SIGMA_FRAC * main_s, MIN_SEP)
+    # also consider distance to residual centroid (helps aim the split)
+    if x_centroid is not None:
+        delta0 = max(delta0, min(abs(x_centroid - main_c), 2.0*main_s))
+    delta = float(np.clip(delta0, MIN_SEP, 2.5*main_s))
 
-    # spacing guard
-    if centers.size and np.min(np.abs(centers - x0_centroid)) < MIN_SEP:
-        if DEBUG:
-            print("[add] blocked by MIN_SEP")
-        return result, False
+    c1 = main_c - 0.5 * delta
+    c2 = main_c + 0.5 * delta
 
-    # tie sigma to main sigma to avoid needle splits
-    sigma_seed = float(np.clip(main_s,
-                               SIGMA_ADDED_MIN_FRAC*main_s,
-                               SIGMA_ADDED_MAX_FRAC*main_s))
-    sigma_seed = float(np.clip(sigma_seed, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+    # Enforce minimum separation
+    if abs(c2 - c1) < MIN_SEP:
+        c1 = main_c - 0.5 * MIN_SEP
+        c2 = main_c + 0.5 * MIN_SEP
 
-    # amp seed equals residual area (pixel-integrated amp == area)
-    amp_seed = max(float(area_side), 1e-9)
+    # Children sigmas tied to parent within range
+    s_child = float(np.clip(main_s,
+                            FORCE_SPLIT_SIGMA_FRAC_MIN*main_s,
+                            FORCE_SPLIT_SIGMA_FRAC_MAX*main_s))
+    s1 = s2 = float(np.clip(s_child, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
 
-    # admission: height estimate and ΔAIC
-    if not (np.isfinite(h_est) and (h_est >= height_floor)):
-        if DEBUG:
-            print(f"[add] blocked by height floor: h_est={h_est:.3g} < {height_floor}")
-        return result, False
+    # Split area: start 50/50
+    a1 = a2 = 0.5 * main_a
 
-    # add or replace weakest, respecting max_n
-    if n_now < max_n:
-        model_expr, params_new, next_idx = _build_params_from_result(result)
-        gnew = Model(pixint_gauss, prefix=f"g{next_idx}_")
-        model_expr = model_expr + gnew
-        params_new.update(gnew.make_params(center=x0_centroid,
-                                           sigma=sigma_seed,
-                                           amplitude=amp_seed))
-        params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
-        params_new[f"g{next_idx}_amplitude"].set(min=0.0)
-        params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
-        trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
-        _, _, _, _, h_all, _, _, _ = _extract_metrics(trial, xw)
-        new_h = h_all[-1] if h_all.size else -np.inf
-        daic_ok = (trial.aic <= result.aic - aic_improve)
-        if DEBUG:
-            print(f"[add] ΔAIC={result.aic - trial.aic:.3g}, new_h={new_h:.3g}")
-        if daic_ok and np.isfinite(new_h) and (new_h >= height_floor):
-            return trial, True
-        return result, False
+    # Build model: drop main, add two children; if at cap, drop weakest other
+    over_cap = (n_now >= seed_cap)  # split would increase count by +1
+    drop_idx = None
+    if over_cap:
+        # choose weakest other (exclude j_main)
+        idx_others = [i for i in range(n_now) if i != j_main]
+        if idx_others:
+            h_others = heights[idx_others]
+            drop_idx = idx_others[int(np.nanargmin(h_others))]
+        else:
+            drop_idx = j_main  # degenerate; should not happen
 
-    # replace weakest by height if at cap
-    _, _, _, _, h0, _, _, _ = _extract_metrics(result, xw)
-    if h0.size == 0:
-        return result, False
-    weakest = int(np.nanargmin(h0))
-    model_expr, params_new, next_idx = _build_params_from_result(result, drop_idx=weakest)
-    gnew = Model(pixint_gauss, prefix=f"g{next_idx}_")
-    model_expr = model_expr + gnew
-    params_new.update(gnew.make_params(center=x0_centroid,
-                                       sigma=sigma_seed,
-                                       amplitude=amp_seed))
+    model_expr, params_new, next_idx = _build_params_from_result(result, drop_idx=j_main if drop_idx is None else drop_idx)
+
+    # If we dropped someone else to honor cap, we need to keep main if not dropped.
+    # Ensure main is removed (we're replacing it with two)
+    if drop_idx is not None and drop_idx != j_main:
+        # we removed a different weakest peak; now remove main too by rebuilding again
+        model_expr, params_new, next_idx = _build_params_from_result(result, drop_idx=j_main)
+
+    # Add the two children
+    g1 = Model(pixint_gauss, prefix=f"g{next_idx}_")
+    model_expr = model_expr + g1
+    params_new.update(g1.make_params(center=c1, sigma=s1, amplitude=a1))
     params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
     params_new[f"g{next_idx}_amplitude"].set(min=0.0)
     params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
+    next_idx += 1
+
+    g2 = Model(pixint_gauss, prefix=f"g{next_idx}_")
+    model_expr = model_expr + g2
+    params_new.update(g2.make_params(center=c2, sigma=s2, amplitude=a2))
+    params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
+    params_new[f"g{next_idx}_amplitude"].set(min=0.0)
+    params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
+
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
-    _, _, _, _, h_all, _, _, _ = _extract_metrics(trial, xw)
-    new_h = h_all[-1] if h_all.size else -np.inf
-    daic_ok = (trial.aic <= result.aic - aic_improve)
+
+    # Evaluate acceptance
+    bkg_line_t, _, _, _, h_all_t, _, _, comps_t = _extract_metrics(trial, xw)
+    child_heights_ok = np.sum(np.isfinite(h_all_t) & (h_all_t >= PEAK_HEIGHT_MIN)) >= 2
+    daic_ok = (trial.aic <= result.aic - AIC_IMPROVE)
+
+    comp_sum_t = bkg_line_t + (np.sum(np.vstack(comps_t), axis=0) if len(comps_t) else 0.0)
+    resid_vec_t = yw - comp_sum_t
+    resid_rms1 = float(np.sqrt(np.mean(resid_vec_t**2))) if resid_vec_t.size else resid_rms0
+    resid_drop_ok = (resid_rms0 > 0.0) and ((resid_rms0 - resid_rms1) / resid_rms0 >= FORCE_SPLIT_RESID_DROP_FRAC)
+
+    # Ensure the two closest peaks are at least MIN_SEP apart
+    # (extract updated centers and check min spacing)
+    _, centers_t, _, _, _, _, _, _ = _extract_metrics(trial, xw)
+    minsep_ok = True
+    if centers_t.size >= 2:
+        diff = np.sort(np.abs(np.subtract.outer(centers_t, centers_t) + np.eye(centers_t.size)*1e9).ravel())[:centers_t.size]
+        minsep_ok = (np.min(diff) >= MIN_SEP)
+
+    accept = child_heights_ok and minsep_ok and (daic_ok or resid_drop_ok)
+
     if DEBUG:
-        print(f"[add-replace] ΔAIC={result.aic - trial.aic:.3g}, new_h={new_h:.3g}")
-    if daic_ok and np.isfinite(new_h) and (new_h >= height_floor):
+        print(f"[force-split] resid_max/noise={resid_max/noise:.2f}, ΔAIC={result.aic - trial.aic:.3g}, "
+              f"RMS drop={(resid_rms0 - resid_rms1)/max(resid_rms0,1e-9):.2%}, "
+              f"heights_ok={child_heights_ok}, minsep_ok={minsep_ok}, accept={accept}")
+
+    if accept:
         return trial, True
     return result, False
 
-def _rescue_double_peak(xw, yw, result, seed_cap):
-    """
-    Use the SAME area-based add once more if:
-     - only one kept peak after height floor, and
-     - residual is large relative to noise
-    """
-    resid = yw - result.best_fit
-    noise = robust_sigma(resid)
-    trigger = NOISE_TRIGGER_MULT * noise
+def sum_component_stack(xw, result):
+    """Sum of all Gaussian components only (no background), as a vector."""
+    comps = []
+    i = 0
+    while f"g{i}_center" in result.params:
+        c = result.params[f"g{i}_center"].value
+        s = result.params[f"g{i}_sigma"].value
+        a = result.params[f"g{i}_amplitude"].value
+        if np.all(np.isfinite([a, c, s])) and s > 0:
+            comps.append(_gaussian_y(xw, a, c, s))
+        i += 1
+    if not comps:
+        return np.zeros_like(xw, float)
+    return np.sum(np.vstack(comps), axis=0)
 
-    _, _, _, _, h_all, _, _, _ = _extract_metrics(result, xw)
-    kept = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
-    n_kept = int(np.sum(kept))
-
-    if (n_kept == 1) and (np.max(np.abs(resid)) >= trigger) and (seed_cap >= 2):
-        trial, ok = _try_area_add(xw, yw, result, max_n=seed_cap,
-                                  height_floor=PEAK_HEIGHT_MIN,
-                                  aic_improve=AIC_IMPROVE)
-        if ok:
-            return trial, True
-    return result, False
-
+# ------------------------------
+# Fit a single frame
+# ------------------------------
 def fit_frame(x, y, seeds, halfwidth):
     m = window_mask(x, seeds, halfwidth)
     if not np.any(m):
@@ -407,26 +441,18 @@ def fit_frame(x, y, seeds, halfwidth):
     except Exception:
         return {"success": False}
 
-    # initial prune by height (and refit)
+    # Initial prune by height and refit
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
     keep = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     if keep.size and not np.all(keep):
         _, result = _rebuild_from_kept(xw, yw, result, keep)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # ONE add attempt (area-based), bounded by number of seeds
-    max_allowed = len(seeds)
-    if max_allowed > 0:
-        result, _ = _try_area_add(xw, yw, result, max_n=max_allowed,
-                                  height_floor=PEAK_HEIGHT_MIN,
-                                  aic_improve=AIC_IMPROVE)
-        bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
-
-    # rescue if still looks like a wide single
-    result, _ = _rescue_double_peak(xw, yw, result, seed_cap=len(seeds))
+    # FORCE-SPLIT if residual is high, respecting seed cap
+    result, _ = _force_split_if_needed(xw, yw, result, seed_cap=len(seeds))
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # final hard gate for outputs
+    # Final hard gate for outputs
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
@@ -479,7 +505,6 @@ def style_axes(ax, light_grid=True):
     if light_grid:
         ax.grid(True, which="major", alpha=0.12, linestyle="-", linewidth=0.6)
 
-# Distinct colors for Gaussian components
 COMP_COLORS = [
     "tab:purple","tab:red","tab:brown","tab:pink","tab:olive","tab:cyan",
     "#7f7f7f","#9467bd","#8c564b"
@@ -489,7 +514,7 @@ COMP_COLORS = [
 # Main (CLI unchanged)
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, single area-based add + rescue).")
+    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, FORCE-SPLIT on high residual).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -520,7 +545,7 @@ def main():
             print(f"{i}\t{c:.6f}\t{w:.6f}\t{h:.6f}")
         print(f"R2 = {res['r2']:.4f} | max|residual| = {res['resid_max_abs']:.3f}\n")
 
-        # ---- Plot (single frame, wide) ----
+        # Plot
         apply_pub_style()
         from matplotlib.gridspec import GridSpec
         plt.rcParams.update({"figure.figsize": (10.5, 5.2)})
@@ -529,22 +554,13 @@ def main():
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.2], hspace=0.50)
 
         ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
-
-        # Data: BLUE solid
-        ax.plot(res["xw"], res["yw"],  lw=1.2, color="tab:blue", label="Data")
-
-        # Total fit: ORANGE solid
+        ax.plot(res["xw"], res["yw"],  lw=1.2, color="tab:blue",   label="Data")
         ax.plot(res["xw"], res["yfit"], lw=1.8, color="tab:orange", label="Total fit")
-
-        # Linear background: GREEN dashed, alpha 0.7
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.2, color="tab:green", alpha=0.7, label="Linear bkg")
 
-        # Each Gaussian: distinct color dashed, alpha 0.7
         for idx, comp in enumerate(res["components"]):
             ax.plot(res["xw"], comp, lw=1.0, linestyle="--",
                     color=COMP_COLORS[idx % len(COMP_COLORS)], alpha=0.7)
-
-        # Composite sum (light)
         ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
 
         for c in centers_v:
@@ -562,7 +578,6 @@ def main():
         ax.set_ylabel("Intensity (a.u.)")
         ax.legend(loc="upper right", ncol=1, fontsize=10)
 
-        # Residual panel
         axr = fig.add_subplot(gs[1]); style_axes(axr, light_grid=False)
         resid = res["yw"] - res["yfit"]
         axr.plot(res["xw"], resid, lw=1.0, color="0.2")
@@ -610,7 +625,6 @@ def main():
         fwhm_trk[f, :k]    = w[:k]
         height_trk[f, :k]  = h[:k]
 
-    # ---- Map plot (wide, legend removed) ----
     apply_pub_style()
     plt.rcParams.update({"figure.figsize": (11.5, 4.6)})
 
@@ -657,10 +671,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
