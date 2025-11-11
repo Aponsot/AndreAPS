@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+# Pixel-integrated Gaussian multi-peak fit with ONE mechanism:
+# FORCE-SPLIT tallest peak when residual is high, but NEVER exceed user seed count.
+# All peak centers (including split children) are bounded to the nearest seed's
+# [seed-DRIFT_NEG, seed+DRIFT_POS] window at every refit.
+# Provenance debug: every component is tagged as 'seed:k' or 'split:j->A/B'.
+#
+# CLI unchanged: --h5, --centers, --frame
 
 import argparse, os
 import numpy as np
@@ -24,7 +32,7 @@ PEAK_HEIGHT_MIN = 7000.0
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.001
-SIGMA_MAX_FIT = 0.1
+SIGMA_MAX_FIT = 0.12
 
 # Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.15
@@ -34,19 +42,29 @@ DRIFT_POS = 0.010
 MIN_SEP = 0.00040
 
 # Acceptance requirement (ΔAIC improvement)
-AIC_IMPROVE = 1
+AIC_IMPROVE = 1.0  # conservative
 
 # Plot title time scaling (0/None -> use frame index)
 SEC_PER_FRAME = 0.004
 
-# --- FORCE-SPLIT controls ---
-FORCE_SPLIT_NOISE_MULT      = 30.0   # trigger: max|resid| >= K*noise
-FORCE_SPLIT_DELTA_SIGMA_FRAC = 0.7   # child offset ~ frac * parent_sigma (clamped)
-FORCE_SPLIT_RESID_DROP_FRAC  = 0.20  # OR accept if RMS residual drops by >= 20%
-FORCE_SPLIT_SIGMA_FRAC_MIN   = 0.6
-FORCE_SPLIT_SIGMA_FRAC_MAX   = 2.2
+# --- FORCE-SPLIT (conservative) ---
+FORCE_SPLIT_NOISE_MULT        = 9.0   # trigger: max|resid| >= K*noise
+FORCE_SPLIT_DELTA_SIGMA_FRAC  = 0.5   # child offset ~ frac * parent_sigma (clamped)
+FORCE_SPLIT_RESID_DROP_FRAC   = 0.35  # require >=35% RMS residual drop OR ΔAIC pass
+FORCE_SPLIT_SIGMA_FRAC_MIN    = 0.7
+FORCE_SPLIT_SIGMA_FRAC_MAX    = 1.6
 
-DEBUG = False
+# Extra guards
+CHILD_HEIGHT_FRAC             = 0.25  # each child ≥ 25% of parent height
+AREA_CONSERVE_MIN_FRAC        = 0.70  # total child area within [70%,130%] of parent
+AREA_CONSERVE_MAX_FRAC        = 1.30
+SIDE_AREA_SNR_MULT            = 6.0   # side residual area ≥ K * noise * sqrt(N_side)
+DELTA_MIN_SIGMA_FRAC          = 0.40
+DELTA_MAX_SIGMA_FRAC          = 1.80
+
+# Debug toggles
+DEBUG = False                 # prints trigger/accept info
+DEBUG_PROVENANCE_TEXT = True  # annotate component source above peaks on plot when single-frame
 
 # ------------------------------
 # Pixel-integrated Gaussian model
@@ -120,7 +138,7 @@ def window_mask(x, centers, halfwidth):
 def _gaussian_y(x, amp_area, cen, sig):
     return pixint_gauss(x, amp_area, cen, sig)
 
-# ----- center bound utilities (key change) -----
+# ----- center bound utilities -----
 def nearest_seed_bounds(center_value, seeds):
     seed = float(seeds[np.argmin(np.abs(seeds - center_value))])
     return seed - DRIFT_NEG, seed + DRIFT_POS
@@ -128,6 +146,33 @@ def nearest_seed_bounds(center_value, seeds):
 def clamp_center_param(params, name, center_value, seeds):
     lo, hi = nearest_seed_bounds(center_value, seeds)
     params[name].set(min=lo, max=hi)
+
+# ------------------------------
+# Provenance utilities
+# ------------------------------
+def prov_new():
+    # mapping from component prefix 'g{i}_' -> string label ('seed:0', 'split:3->A', ...)
+    return {}
+
+def prov_reindex(prov_in, old_to_new):
+    prov_out = {}
+    for old_i, new_i in old_to_new.items():
+        old_key = f"g{old_i}_"
+        new_key = f"g{new_i}_"
+        prov_out[new_key] = prov_in.get(old_key, f"seed?")  # fallback
+    return prov_out
+
+def prov_add(prov_map, idx, label):
+    prov_map[f"g{idx}_"] = label
+
+def prov_list_from_params(result, prov_map):
+    # returns list of labels by component index order
+    out = []
+    i = 0
+    while f"g{i}_center" in result.params:
+        out.append(prov_map.get(f"g{i}_", "unk"))
+        i += 1
+    return out
 
 # ------------------------------
 # Model builders / extractors
@@ -141,6 +186,8 @@ def _build_seed_model(xw, yw, seeds):
 
     model = LinearModel(prefix="bkg_")
     params = model.make_params(bkg_slope=bkg_slope, bkg_intercept=bkg_intercept)
+
+    prov = prov_new()
 
     span = max(xw[-1] - xw[0], 1e-9)
     sigma0_base = max(span / (7.0 * len(seeds)), 1e-6)
@@ -160,7 +207,9 @@ def _build_seed_model(xw, yw, seeds):
         params[f"g{i}_amplitude"].set(min=0.0)
         # bound center to its OWN seed strictly
         params[f"g{i}_center"].set(min=c_seed - DRIFT_NEG, max=c_seed + DRIFT_POS)
-    return model, params
+
+        prov_add(prov, i, f"seed:{i}")
+    return model, params, prov
 
 def _extract_metrics(result, xw):
     bkg_slope = result.params.get("bkg_slope").value if "bkg_slope" in result.params else 0.0
@@ -195,7 +244,7 @@ def _extract_metrics(result, xw):
             comps.append(np.full_like(xw, np.nan, float))
     return bkg_line, centers, sigmas, amps, heights, fwhm, peak_at_center, comps
 
-def _rebuild_from_kept(xw, yw, result, keep_mask, seeds):
+def _rebuild_from_kept(xw, yw, result, keep_mask, seeds, prov_in):
     params_new = Parameters()
     model_new = LinearModel(prefix="bkg_")
     for nm in ["bkg_slope", "bkg_intercept"]:
@@ -205,6 +254,7 @@ def _rebuild_from_kept(xw, yw, result, keep_mask, seeds):
         else:
             params_new.add(nm, value=0.0)
 
+    old_to_new = {}
     next_idx = 0
     j = 0
     while f"g{j}_center" in result.params:
@@ -218,13 +268,15 @@ def _rebuild_from_kept(xw, yw, result, keep_mask, seeds):
             params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
             params_new[f"g{next_idx}_amplitude"].set(min=0.0)
             clamp_center_param(params_new, f"g{next_idx}_center", ccur, seeds)
+            old_to_new[j] = next_idx
             next_idx += 1
         j += 1
 
+    prov_new_map = prov_reindex(prov_in, old_to_new)
     refit = model_new.fit(yw, params_new, x=xw, nan_policy="omit")
-    return model_new, refit
+    return model_new, refit, prov_new_map
 
-def _build_params_from_result(res, seeds, drop_idx=None):
+def _build_params_from_result(res, seeds, prov_in, drop_idx=None):
     params_new = Parameters()
     model_expr = LinearModel(prefix="bkg_")
     for nm in ["bkg_slope","bkg_intercept"]:
@@ -233,6 +285,7 @@ def _build_params_from_result(res, seeds, drop_idx=None):
             params_new.add(nm, value=p.value, min=p.min, max=p.max, vary=p.vary)
         else:
             params_new.add(nm, value=0.0)
+    old_to_new = {}
     next_idx = 0
     j = 0
     while f"g{j}_center" in res.params:
@@ -247,8 +300,10 @@ def _build_params_from_result(res, seeds, drop_idx=None):
         params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
         params_new[f"g{next_idx}_amplitude"].set(min=0.0)
         clamp_center_param(params_new, f"g{next_idx}_center", ccur, seeds)
+        old_to_new[j] = next_idx
         next_idx += 1; j += 1
-    return model_expr, params_new, next_idx
+    prov_new_map = prov_reindex(prov_in, old_to_new)
+    return model_expr, params_new, next_idx, prov_new_map
 
 def sum_component_stack(xw, result):
     comps = []
@@ -265,15 +320,15 @@ def sum_component_stack(xw, result):
     return np.sum(np.vstack(comps), axis=0)
 
 # ------------------------------
-# FORCE-SPLIT of tallest peak (cap respected, seed-bounded centers)
+# FORCE-SPLIT of tallest peak (cap respected, seed-bounded centers, provenance)
 # ------------------------------
-def _force_split_if_needed(xw, yw, result, seed_cap, seeds):
+def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     # NEVER exceed seed_cap
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
     if n_now == 0 or n_now >= seed_cap:
-        return result, False
+        return result, False, prov_in
 
     # Extract current metrics
     bkg_line, centers, sigmas, amps, heights, _, _, _ = _extract_metrics(result, xw)
@@ -281,57 +336,68 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds):
     noise = robust_sigma(resid_vec)
     resid_max = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
     resid_rms0 = float(np.sqrt(np.mean(resid_vec**2))) if resid_vec.size else 0.0
-
-    if noise <= 0 or resid_max < FORCE_SPLIT_NOISE_MULT * noise:
-        return result, False
+    if (noise <= 0) or (resid_max < FORCE_SPLIT_NOISE_MULT * noise):
+        return result, False, prov_in
 
     # Tallest component
     j_main = int(np.nanargmax(heights))
     main_c = float(centers[j_main])
     main_s = max(float(sigmas[j_main]), 1e-12)
     main_a = max(float(amps[j_main]),   1e-12)
+    main_h = float(np.max(heights)) if heights.size else 0.0
 
-    # Residual centroid for direction
+    # Side area SNR gate
     rpos = np.maximum(resid_vec, 0.0)
     left_mask  = xw <  main_c
     right_mask = xw >  main_c
+    def side_area_snr(mask):
+        if not np.any(mask): return 0.0, 0, 0.0
+        w = rpos[mask]
+        n = int(np.sum(mask))
+        area = float(np.sum(w))
+        snr  = area / (max(noise,1e-12) * np.sqrt(max(n,1)))
+        return area, n, snr
+    areaL, nL, snrL = side_area_snr(left_mask)
+    areaR, nR, snrR = side_area_snr(right_mask)
+    if max(snrL, snrR) < SIDE_AREA_SNR_MULT:
+        return result, False, prov_in
 
+    # Residual centroid & delta
     def centroid(mask):
         if not np.any(mask): return None, 0.0
         w = rpos[mask]
         if np.sum(w) <= 0: return None, 0.0
         xs = xw[mask]
         return float(np.sum(xs*w)/np.sum(w)), float(np.sum(w))
-
-    xL, areaL = centroid(left_mask)
-    xR, areaR = centroid(right_mask)
-    if (xL is None) and (xR is None):
-        return result, False
-
+    xL, _ = centroid(left_mask)
+    xR, _ = centroid(right_mask)
     x_centroid = xR if (xR is not None and areaR >= areaL) or (xL is None) else xL
 
-    # Child centers (symmetric), nudged toward residual centroid
     delta0 = max(FORCE_SPLIT_DELTA_SIGMA_FRAC * main_s, MIN_SEP)
     if x_centroid is not None:
         delta0 = max(delta0, min(abs(x_centroid - main_c), 2.0*main_s))
-    delta = float(np.clip(delta0, MIN_SEP, 2.5*main_s))
+    delta = float(np.clip(
+        delta0,
+        max(DELTA_MIN_SIGMA_FRAC*main_s, MIN_SEP),
+        DELTA_MAX_SIGMA_FRAC*main_s
+    ))
     c1 = main_c - 0.5 * delta
     c2 = main_c + 0.5 * delta
     if abs(c2 - c1) < MIN_SEP:
         c1 = main_c - 0.5 * MIN_SEP
         c2 = main_c + 0.5 * MIN_SEP
 
-    # Children sigmas relative to parent
+    # Children σ relative to parent
     s_child = float(np.clip(main_s,
                             FORCE_SPLIT_SIGMA_FRAC_MIN*main_s,
                             FORCE_SPLIT_SIGMA_FRAC_MAX*main_s))
     s1 = s2 = float(np.clip(s_child, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
 
-    # Split area 50/50
+    # Split area 50/50; later we check area conservation
     a1 = a2 = 0.5 * main_a
 
     # Build model: drop main, add two children (count increases by +1; we already know n_now < seed_cap)
-    model_expr, params_new, next_idx = _build_params_from_result(result, seeds, drop_idx=j_main)
+    model_expr, params_new, next_idx, prov_after = _build_params_from_result(result, seeds, prov_in, drop_idx=j_main)
 
     g1 = Model(pixint_gauss, prefix=f"g{next_idx}_")
     model_expr = model_expr + g1
@@ -339,6 +405,7 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds):
     params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
     params_new[f"g{next_idx}_amplitude"].set(min=0.0)
     clamp_center_param(params_new, f"g{next_idx}_center", c1, seeds)
+    prov_add(prov_after, next_idx, f"split:{j_main}->A")
     next_idx += 1
 
     g2 = Model(pixint_gauss, prefix=f"g{next_idx}_")
@@ -347,18 +414,24 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds):
     params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
     params_new[f"g{next_idx}_amplitude"].set(min=0.0)
     clamp_center_param(params_new, f"g{next_idx}_center", c2, seeds)
+    prov_add(prov_after, next_idx, f"split:{j_main}->B")
 
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
 
     # Evaluate acceptance
-    bkg_line_t, _, _, _, h_all_t, _, _, comps_t = _extract_metrics(trial, xw)
+    bkg_line_t, _, _, amps_t, h_all_t, _, _, comps_t = _extract_metrics(trial, xw)
     child_heights_ok = np.sum(np.isfinite(h_all_t) & (h_all_t >= PEAK_HEIGHT_MIN)) >= 2
+    child_height_rel_ok = np.sum(np.isfinite(h_all_t) & (h_all_t >= max(PEAK_HEIGHT_MIN, CHILD_HEIGHT_FRAC*main_h))) >= 2
     daic_ok = (trial.aic <= result.aic - AIC_IMPROVE)
 
     comp_sum_t = bkg_line_t + (np.sum(np.vstack(comps_t), axis=0) if len(comps_t) else 0.0)
     resid_vec_t = yw - comp_sum_t
     resid_rms1 = float(np.sqrt(np.mean(resid_vec_t**2))) if resid_vec_t.size else 0.0
     resid_drop_ok = (resid_rms0 > 0.0) and ((resid_rms0 - resid_rms1) / resid_rms0 >= FORCE_SPLIT_RESID_DROP_FRAC)
+
+    # area conservation wrt parent
+    a_sum = float(np.nansum(amps_t))
+    area_ok = (a_sum >= AREA_CONSERVE_MIN_FRAC*main_a) and (a_sum <= AREA_CONSERVE_MAX_FRAC*main_a)
 
     # Ensure min separation post-refit
     _, centers_t, _, _, _, _, _, _ = _extract_metrics(trial, xw)
@@ -368,21 +441,22 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds):
         diffs += np.eye(centers_t.size) * 1e9
         minsep_ok = (np.min(diffs) >= MIN_SEP)
 
-    accept = child_heights_ok and minsep_ok and (daic_ok or resid_drop_ok)
+    accept = (daic_ok and resid_drop_ok and child_heights_ok and child_height_rel_ok and minsep_ok and area_ok)
 
     if DEBUG:
         print(f"[force-split] comps_before={n_now}, cap={seed_cap}, "
-              f"resid_max/noise={resid_max/noise:.2f}, ΔAIC={result.aic - trial.aic:.3g}, "
-              f"RMS drop={(resid_rms0 - resid_rms1)/max(resid_rms0,1e-9):.2%}, accept={accept}")
+              f"resid_max/noise={resid_max/max(noise,1e-12):.2f}, ΔAIC={result.aic - trial.aic:.3g}, "
+              f"RMS drop={(resid_rms0 - resid_rms1)/max(resid_rms0,1e-9):.2%}, "
+              f"area_ok={area_ok}, accept={accept}")
 
     if accept:
-        # As a final safety, verify we did not exceed cap
+        # sanity: still at or under cap
         n_after = 0
         while f"g{n_after}_center" in trial.params:
             n_after += 1
         if n_after <= seed_cap:
-            return trial, True
-    return result, False
+            return trial, True, prov_after
+    return result, False, prov_in
 
 # ------------------------------
 # Fit a single frame
@@ -395,7 +469,7 @@ def fit_frame(x, y, seeds, halfwidth):
     if xw.size < MIN_POINTS:
         return {"success": False}
 
-    base_model, params = _build_seed_model(xw, yw, seeds)
+    base_model, params, prov = _build_seed_model(xw, yw, seeds)
     try:
         result = base_model.fit(yw, params, x=xw, nan_policy="omit")
     except Exception:
@@ -405,14 +479,14 @@ def fit_frame(x, y, seeds, halfwidth):
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
     keep = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     if keep.size and not np.all(keep):
-        _, result = _rebuild_from_kept(xw, yw, result, keep, seeds)
+        _, result, prov = _rebuild_from_kept(xw, yw, result, keep, seeds, prov)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # FORCE-SPLIT if residual is high, honoring seed cap (== len(seeds))
-    result, _ = _force_split_if_needed(xw, yw, result, seed_cap=len(seeds), seeds=seeds)
+    # FORCE-SPLIT if residual is high, honoring seed cap
+    result, _, prov = _force_split_if_needed(xw, yw, result, seed_cap=len(seeds), seeds=seeds, prov_in=prov)
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # Final hard gate for outputs
+    # Final hard gate for outputs (reporting only)
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
@@ -424,12 +498,15 @@ def fit_frame(x, y, seeds, halfwidth):
     resid_vec = yw - comp_sum
     resid_max_abs = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
 
+    # Provenance list aligned to component index order
+    labels = prov_list_from_params(result, prov)
+
     return {
         "success": True,
         "xw": xw, "yw": yw, "yfit": result.best_fit, "bkg": bkg_line,
         "centers": centers_out, "fwhm": fwhm_out, "height_fit": height_out,
         "peak_fit": peakfit_out, "components": comps, "comp_sum": comp_sum,
-        "r2": r2, "result": result,
+        "labels": labels, "r2": r2, "result": result,
         "resid_max_abs": resid_max_abs
     }
 
@@ -474,7 +551,7 @@ COMP_COLORS = [
 # Main (CLI unchanged)
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, FORCE-SPLIT with seed-cap and seed-bounded centers).")
+    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, FORCE-SPLIT with cap & seed-bounded centers; provenance debug).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -484,7 +561,7 @@ def main():
     x, I_full = load_q_and_I(args.h5)
     nframes = I_full.shape[0]
 
-    # Single frame
+    # -------- Single frame --------
     if args.frame is not None:
         if not (0 <= args.frame < nframes):
             raise ValueError(f"--frame {args.frame} is out of range [0, {nframes-1}]")
@@ -494,36 +571,55 @@ def main():
             print("Fit failed for the requested frame.")
             return
 
-        # Terminal table
+        # Terminal table (add provenance)
         vis = np.isfinite(res["centers"])
         centers_v = res["centers"][vis]
         fwhm_v    = res["fwhm"][vis]
         hfit_v    = res["height_fit"][vis]
+        labels_v  = np.array(res["labels"])[np.where(vis)[0]]
+
         print("\nPEAKS (kept >= height floor):")
-        print("Index\tCenter\t\tFWHM\t\tHeight")
-        for i, (c, w, h) in enumerate(zip(centers_v, fwhm_v, hfit_v), start=1):
-            print(f"{i}\t{c:.6f}\t{w:.6f}\t{h:.6f}")
+        print("Idx\tCenter\t\tFWHM\t\tHeight\t\tSource")
+        for i, (c, w, h, lab) in enumerate(zip(centers_v, fwhm_v, hfit_v, labels_v), start=1):
+            print(f"{i}\t{c:.6f}\t{w:.6f}\t{h:.6f}\t{lab}")
         print(f"R2 = {res['r2']:.4f} | max|residual| = {res['resid_max_abs']:.3f}\n")
 
-        # Plot (blue data, orange fit, green dashed bkg, dashed components)
+        # Plot
         apply_pub_style()
         from matplotlib.gridspec import GridSpec
         plt.rcParams.update({"figure.figsize": (10.5, 5.2)})
+
         fig = plt.figure()
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.2], hspace=0.50)
+
         ax = fig.add_subplot(gs[0]); style_axes(ax, light_grid=True)
         ax.plot(res["xw"], res["yw"],  lw=1.2, color="tab:blue",   label="Data")
         ax.plot(res["xw"], res["yfit"], lw=1.8, color="tab:orange", label="Total fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.2, color="tab:green", alpha=0.7, label="Linear bkg")
+
+        # Each Gaussian: distinct color dashed, alpha 0.7 + optional provenance text
         for idx, comp in enumerate(res["components"]):
             ax.plot(res["xw"], comp, lw=1.0, linestyle="--",
                     color=COMP_COLORS[idx % len(COMP_COLORS)], alpha=0.7)
+            if DEBUG and DEBUG_PROVENANCE_TEXT and idx < len(labels_v):
+                # place label near the component's peak
+                ycomp = comp
+                imax = int(np.nanargmax(ycomp))
+                xpk = res["xw"][imax]
+                ypk = ycomp[imax]
+                ax.text(xpk, ypk*1.03, labels_v[idx],
+                        ha="center", va="bottom", fontsize=9, rotation=0, alpha=0.75)
+
+        # Composite sum (light)
         ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
+
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.35, lw=0.9, color="0.4")
+
         lo = float(np.min(seeds0) - HALF_WINDOW)
         hi = float(np.max(seeds0) + HALF_WINDOW)
         ax.set_xlim(lo, hi)
+
         title_prefix = (f"{args.frame*float(SEC_PER_FRAME):.1f} s | "
                         if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0)
                         else f"Frame {args.frame} | ")
@@ -531,17 +627,20 @@ def main():
         ax.set_xlabel("q (1/Å)")
         ax.set_ylabel("Intensity (a.u.)")
         ax.legend(loc="upper right", ncol=1, fontsize=10)
+
+        # Residual panel
         axr = fig.add_subplot(gs[1]); style_axes(axr, light_grid=False)
         resid = res["yw"] - res["yfit"]
         axr.plot(res["xw"], resid, lw=1.0, color="0.2")
         axr.axhline(0.0, color="0.25", lw=0.8)
         axr.set_xlabel("q (1/Å)")
         axr.set_ylabel("Residual")
+
         fig.tight_layout()
         plt.show()
         return
 
-    # Mapping (all frames)
+    # -------- Mapping (all frames) --------
     nuse = nframes
     npeaks = len(seeds0)
     centers_trk = np.full((nuse, npeaks), np.nan)
@@ -576,10 +675,13 @@ def main():
 
     apply_pub_style()
     plt.rcParams.update({"figure.figsize": (11.5, 4.6)})
+
     fig, ax = plt.subplots(); style_axes(ax, light_grid=True)
+
     frames = np.arange(nuse)
     xvals = (frames * float(SEC_PER_FRAME)) if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else frames
     xlabel = "Time (s)" if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else "Frame"
+
     any_plotted = False
     for j in range(npeaks):
         mask = (
@@ -599,24 +701,21 @@ def main():
             edgecolors="none",
         )
         any_plotted = True
+
     lo = float(np.min(seeds0) - HALF_WINDOW)
     hi = float(np.max(seeds0) + HALF_WINDOW)
     ax.set_ylim(lo, hi)
+
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Center (q or 2θ)")
     ax.set_title("Peak centers over frames (color = fitted height)")
+
     if any_plotted:
         cbar = fig.colorbar(sc, ax=ax, pad=0.02)
         cbar.set_label("Height (fit)")
+
     fig.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
