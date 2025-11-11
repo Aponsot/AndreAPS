@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Pixel-integrated Gaussian multi-peak fit with ONE mechanism:
-# FORCE-SPLIT tallest peak when residual is high, but NEVER exceed user seed count.
-# All peak centers (including split children) are bounded to the nearest seed's
-# [seed-DRIFT_NEG, seed+DRIFT_POS] window at every refit.
+# FORCE-SPLIT tallest peak when residual is high (absolute trigger supported),
+# but NEVER exceed user seed count. All peak centers (including split children)
+# are bounded to the nearest seed's [seed-DRIFT_NEG, seed+DRIFT_POS] window.
 # Provenance debug: every component is tagged as 'seed:k' or 'split:j->A/B'.
 #
 # CLI unchanged: --h5, --centers, --frame
@@ -28,7 +28,7 @@ HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
 # Height floor (admission + reporting)
-PEAK_HEIGHT_MIN = 7000.0
+PEAK_HEIGHT_MIN = 5.0
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.001
@@ -42,28 +42,35 @@ DRIFT_POS = 0.010
 MIN_SEP = 0.00040
 
 # Acceptance requirement (ΔAIC improvement)
-AIC_IMPROVE = 1.0  # conservative
+AIC_IMPROVE = 1.0  # conservative default
 
 # Plot title time scaling (0/None -> use frame index)
 SEC_PER_FRAME = 0.004
 
-# --- FORCE-SPLIT (conservative) ---
-FORCE_SPLIT_NOISE_MULT        = 20.0   # trigger: max|resid| >= K*noise
-FORCE_SPLIT_DELTA_SIGMA_FRAC  = 0.5   # child offset ~ frac * parent_sigma (clamped)
-FORCE_SPLIT_RESID_DROP_FRAC   = 0.50  # require >=35% RMS residual drop OR ΔAIC pass
+# --- FORCE-SPLIT triggers & guards ---
+# ABSOLUTE trigger (in same intensity units as your data). When set (not None),
+# it OVERRIDES the ratio trigger for clean testing.
+FORCE_SPLIT_ABS = 25.0     # <-- set this to the residual level you want; None disables absolute trigger
+
+# Ratio trigger (fallback if FORCE_SPLIT_ABS is None):
+FORCE_SPLIT_NOISE_MULT        = 9.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
+
+# Candidate geometry for children:
+FORCE_SPLIT_DELTA_SIGMA_FRAC  = 0.5   # child offset ~ frac * parent_sigma (clamped below)
 FORCE_SPLIT_SIGMA_FRAC_MIN    = 0.7
 FORCE_SPLIT_SIGMA_FRAC_MAX    = 1.6
-
-# Extra guards
-CHILD_HEIGHT_FRAC             = 0.25  # each child ≥ 25% of parent height
-AREA_CONSERVE_MIN_FRAC        = 0.70  # total child area within [70%,130%] of parent
-AREA_CONSERVE_MAX_FRAC        = 1.30
-SIDE_AREA_SNR_MULT            = 6.0   # side residual area ≥ K * noise * sqrt(N_side)
 DELTA_MIN_SIGMA_FRAC          = 0.40
 DELTA_MAX_SIGMA_FRAC          = 1.80
 
+# Acceptance gates:
+FORCE_SPLIT_RESID_DROP_FRAC   = 0.35  # require ≥35% RMS residual drop (AND ΔAIC pass)
+CHILD_HEIGHT_FRAC             = 0.25  # each child ≥ 25% of parent height
+AREA_CONSERVE_MIN_FRAC        = 0.70  # total child area within [70%,130%] of parent
+AREA_CONSERVE_MAX_FRAC        = 1.30
+SIDE_AREA_SNR_MULT            = 6.0   # side residual area ≥ K * noise * sqrt(N_side); set 0 to disable
+
 # Debug toggles
-DEBUG = False                 # prints trigger/accept info
+DEBUG = True                  # prints trigger/accept info (helpful while testing thresholds)
 DEBUG_PROVENANCE_TEXT = True  # annotate component source above peaks on plot when single-frame
 
 # ------------------------------
@@ -151,22 +158,19 @@ def clamp_center_param(params, name, center_value, seeds):
 # Provenance utilities
 # ------------------------------
 def prov_new():
-    # mapping from component prefix 'g{i}_' -> string label ('seed:0', 'split:3->A', ...)
     return {}
 
 def prov_reindex(prov_in, old_to_new):
     prov_out = {}
     for old_i, new_i in old_to_new.items():
-        old_key = f"g{old_i}_"
-        new_key = f"g{new_i}_"
-        prov_out[new_key] = prov_in.get(old_key, f"seed?")  # fallback
+        old_key = f"g{old_i}_"; new_key = f"g{new_i}_"
+        prov_out[new_key] = prov_in.get(old_key, "seed?")
     return prov_out
 
 def prov_add(prov_map, idx, label):
     prov_map[f"g{idx}_"] = label
 
 def prov_list_from_params(result, prov_map):
-    # returns list of labels by component index order
     out = []
     i = 0
     while f"g{i}_center" in result.params:
@@ -178,7 +182,6 @@ def prov_list_from_params(result, prov_map):
 # Model builders / extractors
 # ------------------------------
 def _build_seed_model(xw, yw, seeds):
-    # linear background init
     try:
         bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
     except Exception:
@@ -186,7 +189,6 @@ def _build_seed_model(xw, yw, seeds):
 
     model = LinearModel(prefix="bkg_")
     params = model.make_params(bkg_slope=bkg_slope, bkg_intercept=bkg_intercept)
-
     prov = prov_new()
 
     span = max(xw[-1] - xw[0], 1e-9)
@@ -205,9 +207,7 @@ def _build_seed_model(xw, yw, seeds):
         params.update(g.make_params(amplitude=amp0, center=c_seed, sigma=sigma0))
         params[f"g{i}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
         params[f"g{i}_amplitude"].set(min=0.0)
-        # bound center to its OWN seed strictly
         params[f"g{i}_center"].set(min=c_seed - DRIFT_NEG, max=c_seed + DRIFT_POS)
-
         prov_add(prov, i, f"seed:{i}")
     return model, params, prov
 
@@ -336,7 +336,11 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     noise = robust_sigma(resid_vec)
     resid_max = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
     resid_rms0 = float(np.sqrt(np.mean(resid_vec**2))) if resid_vec.size else 0.0
-    if (noise <= 0) or (resid_max < FORCE_SPLIT_NOISE_MULT * noise):
+
+    # ---------- TRIGGER: absolute OR ratio (absolute takes precedence if set) ----------
+    abs_trigger = (FORCE_SPLIT_ABS is not None) and (resid_max >= float(FORCE_SPLIT_ABS))
+    ratio_trigger = (FORCE_SPLIT_ABS is None) and (noise > 0) and (resid_max >= FORCE_SPLIT_NOISE_MULT * noise)
+    if not (abs_trigger or ratio_trigger):
         return result, False, prov_in
 
     # Tallest component
@@ -346,20 +350,19 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     main_a = max(float(amps[j_main]),   1e-12)
     main_h = float(np.max(heights)) if heights.size else 0.0
 
-    # Side area SNR gate
+    # Side area SNR gate (optional; disable by setting SIDE_AREA_SNR_MULT=0)
     rpos = np.maximum(resid_vec, 0.0)
     left_mask  = xw <  main_c
     right_mask = xw >  main_c
     def side_area_snr(mask):
         if not np.any(mask): return 0.0, 0, 0.0
-        w = rpos[mask]
-        n = int(np.sum(mask))
+        w = rpos[mask]; n = int(np.sum(mask))
         area = float(np.sum(w))
         snr  = area / (max(noise,1e-12) * np.sqrt(max(n,1)))
         return area, n, snr
     areaL, nL, snrL = side_area_snr(left_mask)
     areaR, nR, snrR = side_area_snr(right_mask)
-    if max(snrL, snrR) < SIDE_AREA_SNR_MULT:
+    if SIDE_AREA_SNR_MULT > 0 and max(snrL, snrR) < SIDE_AREA_SNR_MULT:
         return result, False, prov_in
 
     # Residual centroid & delta
@@ -444,10 +447,11 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     accept = (daic_ok and resid_drop_ok and child_heights_ok and child_height_rel_ok and minsep_ok and area_ok)
 
     if DEBUG:
-        print(f"[force-split] comps_before={n_now}, cap={seed_cap}, "
-              f"resid_max/noise={resid_max/max(noise,1e-12):.2f}, ΔAIC={result.aic - trial.aic:.3g}, "
-              f"RMS drop={(resid_rms0 - resid_rms1)/max(resid_rms0,1e-9):.2%}, "
-              f"area_ok={area_ok}, accept={accept}")
+        print(f"[trigger] resid_max={resid_max:.3f}, noise={noise:.3f}, "
+              f"abs_thr={FORCE_SPLIT_ABS}, ratio_thr={FORCE_SPLIT_NOISE_MULT}, "
+              f"abs_ok={abs_trigger}, ratio_ok={ratio_trigger}")
+        print(f"[force-split] comps_before={n_now}, cap={seed_cap}, ΔAIC={result.aic - trial.aic:.3g}, "
+              f"RMS drop={(resid_rms0 - resid_rms1)/max(resid_rms0,1e-9):.2%}, area_ok={area_ok}, accept={accept}")
 
     if accept:
         # sanity: still at or under cap
@@ -551,7 +555,7 @@ COMP_COLORS = [
 # Main (CLI unchanged)
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, FORCE-SPLIT with cap & seed-bounded centers; provenance debug).")
+    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, FORCE-SPLIT with ABS trigger; cap & seed-bounded centers; provenance).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -571,18 +575,22 @@ def main():
             print("Fit failed for the requested frame.")
             return
 
-        # Terminal table (add provenance)
+        # Terminal table (+ residual debug)
+        print(f"\n[debug] FORCE_SPLIT_ABS={FORCE_SPLIT_ABS}, FORCE_SPLIT_NOISE_MULT={FORCE_SPLIT_NOISE_MULT}")
+        print(f"[debug] resid_max={res['resid_max_abs']:.3f}\n")
+
         vis = np.isfinite(res["centers"])
         centers_v = res["centers"][vis]
         fwhm_v    = res["fwhm"][vis]
         hfit_v    = res["height_fit"][vis]
-        labels_v  = np.array(res["labels"])[np.where(vis)[0]]
+        labels_all = res["labels"]
+        labels_v  = np.array(labels_all)[np.where(vis)[0]]
 
-        print("\nPEAKS (kept >= height floor):")
+        print("PEAKS (kept >= height floor):")
         print("Idx\tCenter\t\tFWHM\t\tHeight\t\tSource")
         for i, (c, w, h, lab) in enumerate(zip(centers_v, fwhm_v, hfit_v, labels_v), start=1):
             print(f"{i}\t{c:.6f}\t{w:.6f}\t{h:.6f}\t{lab}")
-        print(f"R2 = {res['r2']:.4f} | max|residual| = {res['resid_max_abs']:.3f}\n")
+        print(f"R2 = {res['r2']:.4f}\n")
 
         # Plot
         apply_pub_style()
@@ -597,20 +605,16 @@ def main():
         ax.plot(res["xw"], res["yfit"], lw=1.8, color="tab:orange", label="Total fit")
         ax.plot(res["xw"], res["bkg"],  "--", lw=1.2, color="tab:green", alpha=0.7, label="Linear bkg")
 
-        # Each Gaussian: distinct color dashed, alpha 0.7 + optional provenance text
         for idx, comp in enumerate(res["components"]):
             ax.plot(res["xw"], comp, lw=1.0, linestyle="--",
                     color=COMP_COLORS[idx % len(COMP_COLORS)], alpha=0.7)
             if DEBUG and DEBUG_PROVENANCE_TEXT and idx < len(labels_v):
-                # place label near the component's peak
                 ycomp = comp
                 imax = int(np.nanargmax(ycomp))
-                xpk = res["xw"][imax]
-                ypk = ycomp[imax]
+                xpk = res["xw"][imax]; ypk = ycomp[imax]
                 ax.text(xpk, ypk*1.03, labels_v[idx],
                         ha="center", va="bottom", fontsize=9, rotation=0, alpha=0.75)
 
-        # Composite sum (light)
         ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
 
         for c in centers_v:
@@ -628,7 +632,6 @@ def main():
         ax.set_ylabel("Intensity (a.u.)")
         ax.legend(loc="upper right", ncol=1, fontsize=10)
 
-        # Residual panel
         axr = fig.add_subplot(gs[1]); style_axes(axr, light_grid=False)
         resid = res["yw"] - res["yfit"]
         axr.plot(res["xw"], resid, lw=1.0, color="0.2")
@@ -719,6 +722,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
