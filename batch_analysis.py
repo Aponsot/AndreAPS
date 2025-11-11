@@ -66,8 +66,8 @@ AREA_CONSERVE_MAX_FRAC      = 1.30
 SIDE_AREA_SNR_MULT          = 6.0   # side residual area ≥ K * noise * sqrt(N_side); set 0 to disable
 
 # Debug toggles
-DEBUG = True
-DEBUG_PROVENANCE_TEXT = True
+DEBUG = False
+DEBUG_PROVENANCE_TEXT = False
 
 # ------------------------------
 # Pixel-integrated Gaussian model
@@ -727,6 +727,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
