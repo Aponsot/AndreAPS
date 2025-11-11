@@ -16,7 +16,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.20
+HALF_WINDOW = 0.1
 MIN_POINTS  = 8
 
 # Height floor (admission + reporting)
@@ -741,6 +741,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
