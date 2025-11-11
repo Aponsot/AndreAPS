@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# Pixel-integrated Gaussian multi-peak fit with ONE mechanism:
-# FORCE-SPLIT tallest peak when residual is high (absolute trigger supported),
-# but NEVER exceed user seed count. All peak centers (including split children)
-# are bounded to the nearest seed's [seed-DRIFT_NEG, seed+DRIFT_POS] window.
-# Provenance debug: every component is tagged as 'seed:k' or 'split:j->A/B'.
-#
-# CLI unchanged: --h5, --centers, --frame
 
 import argparse, os
 import numpy as np
@@ -32,7 +24,7 @@ PEAK_HEIGHT_MIN = 7000.0
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.001
-SIGMA_MAX_FIT = 0.12
+SIGMA_MAX_FIT = 0.10
 
 # Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.15
@@ -722,4 +714,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
