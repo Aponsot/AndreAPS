@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse, os
 import numpy as np
 import h5py
@@ -18,8 +19,8 @@ except Exception:
 HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
-# Peak reporting/pruning floor (applied at the END when reporting/plotting)
-PEAK_HEIGHT_MIN = 5
+# Peak reporting/admission floor (applied when adding AND at the END)
+PEAK_HEIGHT_MIN = 5.0
 
 # Sigma bounds
 SIGMA_MIN_FIT = 0.001
@@ -29,25 +30,19 @@ SIGMA_MAX_FIT = 0.10
 DRIFT_NEG = 0.15
 DRIFT_POS = 0.010
 
-# Shoulder logic (both respect cap)
+# Residual-based additions (edge or spike); single SNR kept for spike detection
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.20
+RESIDUAL_SNR    = 0.20      # only used to detect a real residual spike vs noise
 MIN_SEP         = 0.00080
-AIC_IMPROVE     = 1
-
-# Admission looseners for adding components
-ADD_SNR_MIN       = 0.1
-EDGE_SNR_AREA_MIN = 0.05
+AIC_IMPROVE     = 1.0
 
 # Plot title time scaling
 SEC_PER_FRAME   = 0.004
 
-# --- NEW: residual-triggered double-peak rescue (never exceed seed cap) ---
+# --- Residual-triggered double-peak rescue (never exceed seed cap) ---
 RESIDUAL_TRIGGER_ABS = 15.0
 RESCUE_MAX_COMPONENTS = 2
-RESCUE_HEIGHT_FLOOR   = .05 * PEAK_HEIGHT_MIN
-RESCUE_ADD_SNR_MIN    = 0.05
-RESCUE_AIC_IMPROVE    = 0.0
+RESCUE_AIC_IMPROVE    = 0.0   # rescue often needs to be permissive on AIC improve
 
 # ------------------------------
 # Pixel-integrated Gaussian model
@@ -119,7 +114,6 @@ def window_mask(x, centers, halfwidth):
     hi = float(np.max(centers) + halfwidth)
     return (x >= lo) & (x <= hi)
 
-# lmfit GaussianModel used amplitude = AREA; we preserve that with pixint_gauss
 def _gaussian_y(x, amp_area, cen, sig):
     return pixint_gauss(x, amp_area, cen, sig)
 
@@ -214,15 +208,6 @@ def _rebuild_from_kept(xw, yw, result, keep_mask):
     refit = model_new.fit(yw, params_new, x=xw, nan_policy="omit")
     return model_new, refit
 
-def _accept_new_component(trial, base_aic, new_height, noise,
-                          height_floor=PEAK_HEIGHT_MIN,
-                          add_snr_min=ADD_SNR_MIN,
-                          aic_improve=AIC_IMPROVE):
-    daic_ok   = (trial.aic <= base_aic - aic_improve)
-    height_ok = (np.isfinite(new_height) and
-                 (new_height >= height_floor or new_height >= add_snr_min * max(noise, 1e-12)))
-    return daic_ok and height_ok
-
 def _build_params_from_result(res, drop_idx=None):
     params_new = Parameters()
     model_expr = LinearModel(prefix="bkg_")
@@ -250,10 +235,17 @@ def _build_params_from_result(res, drop_idx=None):
         next_idx += 1; j += 1
     return model_expr, params_new, next_idx
 
+def _accept_new_component(trial, base_aic, new_height,
+                          height_floor=PEAK_HEIGHT_MIN,
+                          aic_improve=AIC_IMPROVE):
+    daic_ok   = (trial.aic <= base_aic - aic_improve)
+    height_ok = np.isfinite(new_height) and (new_height >= height_floor)
+    return daic_ok and height_ok
+
 def _try_residual_add(xw, yw, result, max_n,
                       height_floor=PEAK_HEIGHT_MIN,
-                      add_snr_min=ADD_SNR_MIN,
                       aic_improve=AIC_IMPROVE):
+    # how many currently
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
@@ -264,11 +256,13 @@ def _try_residual_add(xw, yw, result, max_n,
         return result, False
 
     idx = int(np.argmax(resid))
+    # single remaining SNR: spike must exceed noise*RESIDUAL_SNR
     if resid[idx] < RESIDUAL_SNR * noise:
         return result, False
 
     x0 = float(xw[idx])
 
+    # spacing guard
     centers_old = []
     j = 0
     while f"g{j}_center" in result.params:
@@ -278,9 +272,11 @@ def _try_residual_add(xw, yw, result, max_n,
     if centers_old.size and np.min(np.abs(centers_old - x0)) < MIN_SEP:
         return result, False
 
+    # seed from average sigma or modest fraction of span
     span = max(xw[-1] - xw[0], 1e-9)
     mean_sigma = np.nanmean([result.params[f"g{k}_sigma"].value for k in range(n_now)]) if n_now else span/10.0
     sigma_seed = float(np.clip(min(max(mean_sigma, span/12.0), span/8.0), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
+    # convert residual spike to area seed conservatively
     amp_seed = max(resid[idx] * sigma_seed * np.sqrt(2.0 * np.pi), 1e-9)
 
     if n_now < max_n:
@@ -293,15 +289,15 @@ def _try_residual_add(xw, yw, result, max_n,
         params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
 
         trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
-        _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+        _, _, _, _, h, _, _, _ = _extract_metrics(trial, xw)
         new_h = h[-1] if h.size else -np.inf
-        if _accept_new_component(trial, result.aic, new_h, noise,
+        if _accept_new_component(trial, result.aic, new_h,
                                  height_floor=height_floor,
-                                 add_snr_min=add_snr_min,
                                  aic_improve=aic_improve):
             return trial, True
         return result, False
 
+    # replace weakest if at cap
     _, _, _, _, h0, _, _, _ = _extract_metrics(result, xw)
     if h0.size == 0:
         return result, False
@@ -314,18 +310,16 @@ def _try_residual_add(xw, yw, result, max_n,
     params_new[f"g{next_idx}_amplitude"].set(min=0.0)
     params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
-    _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+    _, _, _, _, h, _, _, _ = _extract_metrics(trial, xw)
     new_h = h[-1] if h.size else -np.inf
-    if _accept_new_component(trial, result.aic, new_h, noise,
+    if _accept_new_component(trial, result.aic, new_h,
                              height_floor=height_floor,
-                             add_snr_min=add_snr_min,
                              aic_improve=aic_improve):
         return trial, True
     return result, False
 
 def _try_edge_add(xw, yw, result, max_n,
                   height_floor=PEAK_HEIGHT_MIN,
-                  add_snr_min=ADD_SNR_MIN,
                   aic_improve=AIC_IMPROVE):
     _, centers, sigmas, amps, heights, fwhm, _, _ = _extract_metrics(result, xw)
     if centers.size == 0:
@@ -343,39 +337,50 @@ def _try_edge_add(xw, yw, result, max_n,
     right_mask = xw >  x_main
     rpos = np.maximum(resid, 0.0)
 
-    def side_stats(msk):
+    def side_seed(msk):
         if not np.any(msk):
-            return 0.0, np.nan, np.nan
-        area = np.sum(rpos[msk])
-        snr_area = area / (max(noise, 1e-12) * np.sqrt(int(np.sum(msk))))
+            return None
+        area = float(np.sum(rpos[msk]))
         if area <= 0:
-            return 0.0, np.nan, np.nan
+            return None
         x_side = xw[msk]; w = rpos[msk]
         xc = np.sum(x_side * w) / np.sum(w)
         var = max(np.sum(w * (x_side - xc)**2) / np.sum(w), 1e-12)
         sig = float(np.clip(np.sqrt(var), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
-        return snr_area, xc, sig
+        # convert area to peak height estimate
+        h_est = area / (np.sqrt(2.0*np.pi) * max(sig, 1e-12))
+        return (xc, sig, area, h_est)
 
-    snrL, xL, sL = side_stats(left_mask)
-    snrR, xR, sR = side_stats(right_mask)
+    left  = side_seed(left_mask)
+    right = side_seed(right_mask)
 
-    if snrL < EDGE_SNR_AREA_MIN and snrR < EDGE_SNR_AREA_MIN:
-        return result, False
-    if snrR > snrL:
-        x0, sigma_seed, side_mask = xR, sR, right_mask
+    # choose better side by larger height estimate
+    cand = None
+    if left and right:
+        cand = left if left[3] >= right[3] else right
+    elif left:
+        cand = left
+    elif right:
+        cand = right
     else:
-        x0, sigma_seed, side_mask = xL, sL, left_mask
+        return result, False
 
+    x0, sigma_seed, area_side, h_est = cand
+
+    # spacing guard
     if centers.size and np.min(np.abs(centers - x0)) < MIN_SEP:
         return result, False
+    # admission: require height estimate exceed floor; no separate SNR knob
+    if not (np.isfinite(h_est) and (h_est >= height_floor)):
+        return result, False
 
-    area_side = np.sum(rpos[side_mask])
+    # area→area (amp) already computed; we’ll use area proxy for amplitude seed
     amp_seed  = max(area_side / (np.sqrt(2.0*np.pi) * max(sigma_seed, 1e-12)), 1e-9)
 
+    # how many currently
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
-    n_now = int(n_now)
 
     if n_now < max_n:
         model_expr, params_new, next_idx = _build_params_from_result(result)
@@ -386,15 +391,15 @@ def _try_edge_add(xw, yw, result, max_n,
         params_new[f"g{next_idx}_amplitude"].set(min=0.0)
         params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
         trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
-        _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+        _, _, _, _, h, _, _, _ = _extract_metrics(trial, xw)
         new_h = h[-1] if h.size else -np.inf
-        if _accept_new_component(trial, result.aic, new_h, noise,
+        if _accept_new_component(trial, result.aic, new_h,
                                  height_floor=height_floor,
-                                 add_snr_min=add_snr_min,
                                  aic_improve=aic_improve):
             return trial, True
         return result, False
 
+    # replace weakest if at cap
     _, _, _, _, h0, _, _, _ = _extract_metrics(result, xw)
     if h0.size == 0:
         return result, False
@@ -407,11 +412,10 @@ def _try_edge_add(xw, yw, result, max_n,
     params_new[f"g{next_idx}_amplitude"].set(min=0.0)
     params_new[f"g{next_idx}_center"].set(min=xw[0], max=xw[-1])
     trial = model_expr.fit(yw, params_new, x=xw, nan_policy="omit")
-    _, c, s, a, h, _, _, _ = _extract_metrics(trial, xw)
+    _, _, _, _, h, _, _, _ = _extract_metrics(trial, xw)
     new_h = h[-1] if h.size else -np.inf
-    if _accept_new_component(trial, result.aic, new_h, noise,
+    if _accept_new_component(trial, result.aic, new_h,
                              height_floor=height_floor,
-                             add_snr_min=add_snr_min,
                              aic_improve=aic_improve):
         return trial, True
     return result, False
@@ -427,8 +431,7 @@ def _rescue_double_peak(xw, yw, result, seed_cap):
     changed = False
     trial, ok = _try_edge_add(
         xw, yw, result, max_n=target,
-        height_floor=RESCUE_HEIGHT_FLOOR,
-        add_snr_min=RESCUE_ADD_SNR_MIN,
+        height_floor=PEAK_HEIGHT_MIN,
         aic_improve=RESCUE_AIC_IMPROVE
     )
     if ok:
@@ -440,8 +443,7 @@ def _rescue_double_peak(xw, yw, result, seed_cap):
     if n_now2 < target:
         trial, ok = _try_residual_add(
             xw, yw, result, max_n=target,
-            height_floor=RESCUE_HEIGHT_FLOOR,
-            add_snr_min=RESCUE_ADD_SNR_MIN,
+            height_floor=PEAK_HEIGHT_MIN,
             aic_improve=RESCUE_AIC_IMPROVE
         )
         if ok:
@@ -463,6 +465,7 @@ def fit_frame(x, y, seeds, halfwidth):
     except Exception:
         return {"success": False}
 
+    # initial prune by height
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
     keep = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     if keep.size and not np.all(keep):
@@ -470,16 +473,19 @@ def fit_frame(x, y, seeds, halfwidth):
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
     max_allowed = len(seeds)
+
+    # edge add (height/AIC gate)
     result, _ = _try_edge_add(xw, yw, result, max_allowed)
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
+    # residual add (height/AIC gate)
     if ENABLE_RESIDUAL and max_allowed > 0:
         result, _ = _try_residual_add(xw, yw, result, max_allowed)
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
+    # rescue if big residual AND currently only one kept peak
     resid_vec = yw - (bkg_line + (np.sum(np.vstack(comps), axis=0) if len(comps) else 0.0))
     resid_max_abs = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
-
     kept_mask = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     n_kept = int(np.sum(kept_mask))
 
@@ -489,6 +495,7 @@ def fit_frame(x, y, seeds, halfwidth):
             result = result2
             bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
+    # final hard gate for outputs
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
@@ -511,7 +518,6 @@ def fit_frame(x, y, seeds, halfwidth):
 # ------------------------------
 def apply_pub_style():
     plt.rcParams.update({
-        # WIDER default aspect for all plots
         "figure.figsize": (9.6, 4.8),   # wide
         "figure.dpi": 160,
         "savefig.dpi": 300,
@@ -539,7 +545,6 @@ def style_axes(ax, light_grid=True):
     if light_grid:
         ax.grid(True, which="major", alpha=0.12, linestyle="-", linewidth=0.6)
 
-# Distinct colors for Gaussian components (avoid blue/orange/green used elsewhere)
 COMP_COLORS = [
     "tab:purple","tab:red","tab:brown","tab:pink","tab:olive","tab:cyan",
     "#7f7f7f","#9467bd","#8c564b"
@@ -549,7 +554,7 @@ COMP_COLORS = [
 # Main
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (linear background, height-prune, edge/residual adds, rescue).")
+    ap = argparse.ArgumentParser(description="Gaussian multi-peak tracker (pixel-integrated, linear bkg, height-prune, edge/residual adds, rescue).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -583,7 +588,6 @@ def main():
         # ---- Plot (single frame, wide) ----
         apply_pub_style()
         from matplotlib.gridspec import GridSpec
-        # Make single-frame slightly wider than default
         plt.rcParams.update({"figure.figsize": (10.5, 5.2)})
 
         fig = plt.figure()
@@ -605,13 +609,12 @@ def main():
             ax.plot(res["xw"], comp, lw=1.0, linestyle="--",
                     color=COMP_COLORS[idx % len(COMP_COLORS)], alpha=0.7)
 
-        # Optional composite sum (kept light so it doesn't fight with orange fit)
+        # Composite sum (light)
         ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
 
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.35, lw=0.9, color="0.4")
 
-        # Enforce same x-window as map: seeds ± HALF_WINDOW
         lo = float(np.min(seeds0) - HALF_WINDOW)
         hi = float(np.max(seeds0) + HALF_WINDOW)
         ax.set_xlim(lo, hi)
@@ -674,7 +677,6 @@ def main():
 
     # ---- Map plot (wide, legend removed) ----
     apply_pub_style()
-    # Force map even wider
     plt.rcParams.update({"figure.figsize": (11.5, 4.6)})
 
     fig, ax = plt.subplots(); style_axes(ax, light_grid=True)
@@ -683,7 +685,6 @@ def main():
     xvals = (frames * float(SEC_PER_FRAME)) if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else frames
     xlabel = "Time (s)" if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else "Frame"
 
-    # Plot each tracked peak index without a legend; color encodes height
     any_plotted = False
     for j in range(npeaks):
         mask = (
@@ -704,7 +705,6 @@ def main():
         )
         any_plotted = True
 
-    # Same y-window as single-frame
     lo = float(np.min(seeds0) - HALF_WINDOW)
     hi = float(np.max(seeds0) + HALF_WINDOW)
     ax.set_ylim(lo, hi)
@@ -713,7 +713,6 @@ def main():
     ax.set_ylabel("Center (q or 2θ)")
     ax.set_title("Peak centers over frames (color = fitted height)")
 
-    # Colorbar only (no legend)
     if any_plotted:
         cbar = fig.colorbar(sc, ax=ax, pad=0.02)
         cbar.set_label("Height (fit)")
@@ -723,8 +722,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
