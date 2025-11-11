@@ -29,8 +29,8 @@ MIN_POINTS  = 8
 PEAK_HEIGHT_MIN = 5000.0
 
 # Sigma bounds (per component)
-SIGMA_MIN_FIT = 0.001
-SIGMA_MAX_FIT = 0.12    # slight headroom helps in broad frames
+SIGMA_MIN_FIT = 0.005
+SIGMA_MAX_FIT = 0.10    # slight headroom helps in broad frames
 
 # Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.15
@@ -671,4 +671,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
