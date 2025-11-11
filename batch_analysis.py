@@ -20,7 +20,7 @@ HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
 # Height floor (admission + reporting)
-PEAK_HEIGHT_MIN = 5000.0
+PEAK_HEIGHT_MIN = 3000.0
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.0005
@@ -741,6 +741,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
