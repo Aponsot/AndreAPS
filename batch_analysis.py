@@ -16,7 +16,7 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.15
+HALF_WINDOW = 0.20
 MIN_POINTS  = 8
 
 # Height floor (admission + reporting)
@@ -27,7 +27,7 @@ SIGMA_MIN_FIT = 0.0005
 SIGMA_MAX_FIT = 0.15
 
 # Per-seed drift limits (asymmetric, relative to seed)
-DRIFT_NEG = 0.15
+DRIFT_NEG = 0.20
 DRIFT_POS = 0.090
 
 # Minimum separation
@@ -741,6 +741,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
