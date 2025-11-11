@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from lmfit.models import LinearModel
 from lmfit import Model, Parameters
 from numpy import sqrt
-from numpy.special import erf
+from scipy.special import erf
 
 try:
     from tqdm.auto import tqdm
@@ -723,3 +723,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
