@@ -28,7 +28,7 @@ HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
 # Height floor (admission + reporting)
-PEAK_HEIGHT_MIN = 5.0
+PEAK_HEIGHT_MIN = 7000.0
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.001
@@ -50,7 +50,7 @@ SEC_PER_FRAME = 0.004
 # --- FORCE-SPLIT triggers & guards ---
 # ABSOLUTE trigger (in same intensity units as your data). When set (not None),
 # it OVERRIDES the ratio trigger for clean testing.
-FORCE_SPLIT_ABS = 25.0     # <-- set this to the residual level you want; None disables absolute trigger
+FORCE_SPLIT_ABS = 15.0     # <-- set this to the residual level you want; None disables absolute trigger
 
 # Ratio trigger (fallback if FORCE_SPLIT_ABS is None):
 FORCE_SPLIT_NOISE_MULT        = 9.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
@@ -722,3 +722,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
