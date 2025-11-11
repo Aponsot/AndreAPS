@@ -45,7 +45,7 @@ SEC_PER_FRAME = 0.004
 FORCE_SPLIT_ABS = 15.0
 
 # Ratio trigger (fallback if FORCE_SPLIT_ABS is None)
-FORCE_SPLIT_NOISE_MULT = 20.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
+FORCE_SPLIT_NOISE_MULT = 6.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
 
 # NEW: Relative trigger for weak/late frames (both must hold)
 FORCE_SPLIT_REL_MAIN  = 0.1    # resid_max ≥ 30% of tallest peak height
@@ -727,6 +727,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
