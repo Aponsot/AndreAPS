@@ -24,7 +24,7 @@ PEAK_HEIGHT_MIN = 3000
 
 # Sigma bounds
 SIGMA_MIN_FIT = 0.001
-SIGMA_MAX_FIT = 0.10
+SIGMA_MAX_FIT = 0.08
 
 # Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.15
@@ -32,7 +32,7 @@ DRIFT_POS = 0.010
 
 # Residual-based additions (edge or spike); single SNR kept for spike detection
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.20      # only used to detect a real residual spike vs noise
+RESIDUAL_SNR    = 0.15      # only used to detect a real residual spike vs noise
 MIN_SEP         = 0.00080
 AIC_IMPROVE     = 1.0
 
@@ -722,4 +722,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
