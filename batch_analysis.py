@@ -26,7 +26,7 @@ HALF_WINDOW = 0.13
 MIN_POINTS  = 8
 
 # Peak reporting/admission floor (applied when adding AND at the END)
-PEAK_HEIGHT_MIN = 10
+PEAK_HEIGHT_MIN = 5000
 
 # Sigma bounds
 SIGMA_MIN_FIT = 0.001
@@ -47,8 +47,8 @@ SEC_PER_FRAME = 0.004
 
 # Area-based add/rescue behavior
 SIGMA_ADDED_MIN_FRAC = 0.7     # new comp sigma >= 0.7 * main_sigma
-SIGMA_ADDED_MAX_FRAC = 1.5     # and <= 1.5 * main_sigma
-NOISE_TRIGGER_MULT   = 10.0     # rescue fire level = NOISE_TRIGGER_MULT * noise
+SIGMA_ADDED_MAX_FRAC = 2.5     # and <= 1.5 * main_sigma
+NOISE_TRIGGER_MULT   = 4.0     # rescue fire level = NOISE_TRIGGER_MULT * noise
 
 DEBUG = True  # set True to print why adds are accepted/rejected
 
@@ -657,6 +657,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
