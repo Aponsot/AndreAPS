@@ -55,7 +55,7 @@ DELTA_MIN_SIGMA_FRAC          = 0.40
 DELTA_MAX_SIGMA_FRAC          = 1.80
 
 # Acceptance gates:
-FORCE_SPLIT_RESID_DROP_FRAC   = 0.35  # require ≥35% RMS residual drop (AND ΔAIC pass)
+FORCE_SPLIT_RESID_DROP_FRAC   = 0.50  # require ≥35% RMS residual drop (AND ΔAIC pass)
 CHILD_HEIGHT_FRAC             = 0.25  # each child ≥ 25% of parent height
 AREA_CONSERVE_MIN_FRAC        = 0.70  # total child area within [70%,130%] of parent
 AREA_CONSERVE_MAX_FRAC        = 1.30
@@ -714,5 +714,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
