@@ -31,7 +31,7 @@ DRIFT_NEG = 0.20
 DRIFT_POS = 0.090
 
 # Minimum separation
-MIN_SEP = 0.00040
+MIN_SEP = 0.0040
 
 # Acceptance requirement (ΔAIC improvement)
 AIC_IMPROVE = 1.0
@@ -741,6 +741,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
