@@ -45,11 +45,11 @@ SEC_PER_FRAME = 0.004
 FORCE_SPLIT_ABS = 15.0
 
 # Ratio trigger (fallback if FORCE_SPLIT_ABS is None)
-FORCE_SPLIT_NOISE_MULT = 6.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
+FORCE_SPLIT_NOISE_MULT = 20.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
 
-# NEW: Relative trigger for weak/late frames (both must hold)
-FORCE_SPLIT_REL_MAIN  = 0.1    # resid_max ≥ 30% of tallest peak height
-FORCE_SPLIT_NOISE_MIN = .5     # and resid_max ≥ 4×noise
+# Relative trigger for weak/late frames (both must hold)
+FORCE_SPLIT_REL_MAIN  = 0.30    # resid_max ≥ 30% of tallest peak height
+FORCE_SPLIT_NOISE_MIN = 4.0     # and resid_max ≥ 4×noise
 
 # Candidate geometry for children
 FORCE_SPLIT_DELTA_SIGMA_FRAC = 0.5   # child offset ~ frac * parent_sigma (clamped below)
@@ -66,8 +66,8 @@ AREA_CONSERVE_MAX_FRAC      = 1.30
 SIDE_AREA_SNR_MULT          = 6.0   # side residual area ≥ K * noise * sqrt(N_side); set 0 to disable
 
 # Debug toggles
-DEBUG = False
-DEBUG_PROVENANCE_TEXT = False
+DEBUG = True
+DEBUG_PROVENANCE_TEXT = True
 
 # ------------------------------
 # Pixel-integrated Gaussian model
@@ -85,6 +85,7 @@ def bin_edges_from_centers(x):
     return edges
 
 def pixint_gauss(x, amplitude, center, sigma):
+    # amplitude = integrated area under continuous Gaussian
     sigma = max(float(sigma), 1e-12)
     edges = bin_edges_from_centers(x)
     t1 = (edges[1:] - center) / (sigma * sqrt(2.0))
@@ -228,7 +229,7 @@ def _extract_metrics(result, xw):
     peak_at_center = np.full_like(centers, np.nan, float)
     for j in range(centers.size):
         if np.isfinite(sigmas[j]) and sigmas[j] > 0:
-            heights[j] = amps[j] / (sigmas[j] * np.sqrt(2.0 * np.pi))
+            heights[j] = amps[j] / (sigmas[j] * np.sqrt(2.0 * np.pi))   # area -> height
             fwhm[j] = sigma_to_fwhm(sigmas[j])
         peak_at_center[j] = bkg_slope * centers[j] + bkg_intercept + (heights[j] if np.isfinite(heights[j]) else 0.0)
 
@@ -318,7 +319,7 @@ def sum_component_stack(xw, result):
 # ------------------------------
 # FORCE-SPLIT of tallest peak (cap respected, seed-bounded centers, provenance)
 # ------------------------------
-def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
+def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in, debug=False):
     # NEVER exceed seed_cap
     n_now = 0
     while f"g{n_now}_center" in result.params:
@@ -346,7 +347,6 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     rel_trigger   = (main_h > 0) and (noise > 0) and \
                     (resid_max >= FORCE_SPLIT_REL_MAIN * main_h) and \
                     (resid_max >= FORCE_SPLIT_NOISE_MIN * noise)
-
     if not (abs_trigger or ratio_trigger or rel_trigger):
         return result, False, prov_in
 
@@ -449,7 +449,7 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
 
     accept = (daic_ok and resid_drop_ok and child_heights_ok and child_height_rel_ok and minsep_ok and area_ok)
 
-    if DEBUG:
+    if DEBUG and debug:
         print(f"[trigger] resid_max={resid_max:.3f}, noise={noise:.3f}, "
               f"abs_thr={FORCE_SPLIT_ABS}, ratio_thr={FORCE_SPLIT_NOISE_MULT}, "
               f"rel_main={FORCE_SPLIT_REL_MAIN}, rel_noise_min={FORCE_SPLIT_NOISE_MIN}, "
@@ -469,7 +469,7 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
 # ------------------------------
 # Fit a single frame
 # ------------------------------
-def fit_frame(x, y, seeds, halfwidth):
+def fit_frame(x, y, seeds, halfwidth, debug=False):
     m = window_mask(x, seeds, halfwidth)
     if not np.any(m):
         return {"success": False}
@@ -491,14 +491,17 @@ def fit_frame(x, y, seeds, halfwidth):
         bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
     # FORCE-SPLIT if residual is high, honoring seed cap
-    result, _, prov = _force_split_if_needed(xw, yw, result, seed_cap=len(seeds), seeds=seeds, prov_in=prov)
+    result, _, prov = _force_split_if_needed(xw, yw, result, seed_cap=len(seeds), seeds=seeds, prov_in=prov, debug=debug)
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
     # Final hard gate for outputs (reporting only)
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
+
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
     height_out  = h_all.copy(); height_out[~valid]  = np.nan
+    area_out    = a_all.copy(); area_out[~valid]    = np.nan   # NEW: expose area for mapping color
+
     peakfit_out = p_all.copy(); peakfit_out[~valid] = np.nan
 
     comp_sum = bkg_line + (np.sum(np.vstack(comps), axis=0) if len(comps) else 0.0)
@@ -513,6 +516,7 @@ def fit_frame(x, y, seeds, halfwidth):
         "success": True,
         "xw": xw, "yw": yw, "yfit": result.best_fit, "bkg": bkg_line,
         "centers": centers_out, "fwhm": fwhm_out, "height_fit": height_out,
+        "area_fit": area_out,  # NEW
         "peak_fit": peakfit_out, "components": comps, "comp_sum": comp_sum,
         "labels": labels, "r2": r2, "result": result,
         "resid_max_abs": resid_max_abs
@@ -574,7 +578,7 @@ def main():
         if not (0 <= args.frame < nframes):
             raise ValueError(f"--frame {args.frame} is out of range [0, {nframes-1}]")
         y = I_full[args.frame]
-        res = fit_frame(x, y, seeds0, HALF_WINDOW)
+        res = fit_frame(x, y, seeds0, HALF_WINDOW, debug=True)
         if not res["success"]:
             print("Fit failed for the requested frame.")
             return
@@ -653,7 +657,8 @@ def main():
     npeaks = len(seeds0)
     centers_trk = np.full((nuse, npeaks), np.nan)
     fwhm_trk    = np.full((nuse, npeaks), np.nan)
-    height_trk  = np.full((nuse, npeaks), np.nan)
+    height_trk  = np.full((nuse, npeaks), np.nan)  # height (not used for color)
+    area_trk    = np.full((nuse, npeaks), np.nan)  # NEW: integrated area for color
 
     iterator = range(nuse)
     if tqdm is not None:
@@ -661,7 +666,7 @@ def main():
 
     for f in iterator:
         y = I_full[f]
-        res = fit_frame(x, y, seeds0, HALF_WINDOW)
+        res = fit_frame(x, y, seeds0, HALF_WINDOW, debug=False)  # map: silent
         if not res["success"]:
             continue
         valid = np.isfinite(res["centers"]) & np.isfinite(res["height_fit"])
@@ -669,17 +674,19 @@ def main():
             c = res["centers"][valid]
             w = res["fwhm"][valid]
             h = res["height_fit"][valid]
+            a = res.get("area_fit", np.full_like(h, np.nan))[valid]  # NEW
             hi_mask = h >= PEAK_HEIGHT_MIN
-            c, w, h = c[hi_mask], w[hi_mask], h[hi_mask]
+            c, w, h, a = c[hi_mask], w[hi_mask], h[hi_mask], a[hi_mask]
         else:
-            c = w = h = np.array([])
+            c = w = h = a = np.array([])
         if c.size:
             order = np.argsort(c)
-            c, w, h = c[order], w[order], h[order]
+            c, w, h, a = c[order], w[order], h[order], a[order]
         k = min(c.size, npeaks)
         centers_trk[f, :k] = c[:k]
         fwhm_trk[f, :k]    = w[:k]
         height_trk[f, :k]  = h[:k]
+        area_trk[f, :k]    = a[:k]  # NEW
 
     apply_pub_style()
     plt.rcParams.update({"figure.figsize": (11.5, 4.6)})
@@ -690,11 +697,18 @@ def main():
     xvals = (frames * float(SEC_PER_FRAME)) if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else frames
     xlabel = "Time (s)" if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else "Frame"
 
+    # --- normalize fitted AREAS to 0–100 for color mapping (global) ---
+    area_norm = np.zeros_like(area_trk, float)
+    if np.any(np.isfinite(area_trk)):
+        global_max = np.nanmax(area_trk)
+        if global_max > 0:
+            area_norm = 100.0 * area_trk / global_max
+
     any_plotted = False
     for j in range(npeaks):
         mask = (
             np.isfinite(centers_trk[:, j]) &
-            np.isfinite(height_trk[:, j]) &
+            np.isfinite(area_norm[:, j]) &
             (height_trk[:, j] >= PEAK_HEIGHT_MIN)
         )
         if not np.any(mask):
@@ -702,11 +716,12 @@ def main():
         sc = ax.scatter(
             xvals[mask],
             centers_trk[mask, j],
-            c=height_trk[mask, j],
+            c=area_norm[mask, j],
             cmap="plasma",
             s=18,
             linewidths=0.0,
             edgecolors="none",
+            vmin=0, vmax=100,
         )
         any_plotted = True
 
@@ -716,20 +731,14 @@ def main():
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Center (q or 2θ)")
-    ax.set_title("Peak centers over frames (color = fitted height)")
+    ax.set_title("Peak centers over frames (color = normalized peak area)")
 
     if any_plotted:
         cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-        cbar.set_label("Height (fit)")
+        cbar.set_label("Normalized Peak Area (0–100)")
 
     fig.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
