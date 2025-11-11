@@ -23,7 +23,7 @@ PEAK_HEIGHT_MIN = 5
 
 # Sigma bounds
 SIGMA_MIN_FIT = 0.001
-SIGMA_MAX_FIT = 0.010
+SIGMA_MAX_FIT = 0.10
 
 # Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.15
@@ -46,7 +46,7 @@ SEC_PER_FRAME   = 0.004
 RESIDUAL_TRIGGER_ABS = 15.0
 RESCUE_MAX_COMPONENTS = 2
 RESCUE_HEIGHT_FLOOR   = .05 * PEAK_HEIGHT_MIN
-RESCUE_ADD_SNR_MIN    = 0.005
+RESCUE_ADD_SNR_MIN    = 0.05
 RESCUE_AIC_IMPROVE    = 0.0
 
 # ------------------------------
@@ -723,6 +723,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
