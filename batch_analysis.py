@@ -48,7 +48,7 @@ AIC_IMPROVE = 1.0  # conservative
 SEC_PER_FRAME = 0.004
 
 # --- FORCE-SPLIT (conservative) ---
-FORCE_SPLIT_NOISE_MULT        = 10000.0   # trigger: max|resid| >= K*noise
+FORCE_SPLIT_NOISE_MULT        = 20.0   # trigger: max|resid| >= K*noise
 FORCE_SPLIT_DELTA_SIGMA_FRAC  = 0.5   # child offset ~ frac * parent_sigma (clamped)
 FORCE_SPLIT_RESID_DROP_FRAC   = 0.50  # require >=35% RMS residual drop OR ΔAIC pass
 FORCE_SPLIT_SIGMA_FRAC_MIN    = 0.7
@@ -719,5 +719,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
