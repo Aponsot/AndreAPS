@@ -28,7 +28,7 @@ SIGMA_MAX_FIT = 0.5
 
 # Per-seed drift limits (asymmetric, relative to seed)
 DRIFT_NEG = 0.15
-DRIFT_POS = 0.010
+DRIFT_POS = 0.090
 
 # Minimum separation
 MIN_SEP = 0.00040
@@ -714,6 +714,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
