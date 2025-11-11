@@ -34,13 +34,13 @@ DRIFT_POS = 0.010
 MIN_SEP = 0.00040
 
 # Acceptance requirement (ΔAIC improvement)
-AIC_IMPROVE = 5
+AIC_IMPROVE = 1
 
 # Plot title time scaling (0/None -> use frame index)
 SEC_PER_FRAME = 0.004
 
 # --- FORCE-SPLIT controls ---
-FORCE_SPLIT_NOISE_MULT      = 15.0   # trigger: max|resid| >= K*noise
+FORCE_SPLIT_NOISE_MULT      = 30.0   # trigger: max|resid| >= K*noise
 FORCE_SPLIT_DELTA_SIGMA_FRAC = 0.7   # child offset ~ frac * parent_sigma (clamped)
 FORCE_SPLIT_RESID_DROP_FRAC  = 0.20  # OR accept if RMS residual drops by >= 20%
 FORCE_SPLIT_SIGMA_FRAC_MIN   = 0.6
@@ -613,6 +613,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
