@@ -34,7 +34,7 @@ DRIFT_POS = 0.010
 MIN_SEP = 0.00040
 
 # Acceptance requirement (ΔAIC improvement)
-AIC_IMPROVE = 0.3
+AIC_IMPROVE = 0.5
 
 # Plot title time scaling (0/None -> use frame index)
 SEC_PER_FRAME = 0.004
@@ -613,6 +613,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
