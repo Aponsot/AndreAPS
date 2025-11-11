@@ -527,7 +527,7 @@ def fit_frame(x, y, seeds, halfwidth, debug=False):
 # ------------------------------
 def apply_pub_style():
     plt.rcParams.update({
-        "figure.figsize": (8, 5),
+        "figure.figsize": (7, 5),
         "figure.dpi": 160,
         "savefig.dpi": 300,
         "font.size": 12,
@@ -621,8 +621,7 @@ def main():
                 ycomp = comp
                 imax = int(np.nanargmax(ycomp))
                 xpk = res["xw"][imax]; ypk = ycomp[imax]
-                ax.text(xpk, ypk*1.03, labels_v[idx],
-                        ha="center", va="bottom", fontsize=9, rotation=0, alpha=0.75)
+                
 
         ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
 
@@ -742,4 +741,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
