@@ -1,10 +1,11 @@
-#!/usr/bin/env python3
-# Core v1.7 — visuals, terminal table, and residual-triggered double-peak rescue (cap respected)
 import argparse, os
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
-from lmfit.models import GaussianModel, LinearModel
+from lmfit.models import LinearModel
+from lmfit import Model, Parameters
+from numpy import sqrt
+from numpy.special import erf
 
 try:
     from tqdm.auto import tqdm
@@ -49,6 +50,29 @@ RESCUE_ADD_SNR_MIN    = 0.005
 RESCUE_AIC_IMPROVE    = 0.0
 
 # ------------------------------
+# Pixel-integrated Gaussian model
+# ------------------------------
+def bin_edges_from_centers(x):
+    x = np.asarray(x, float)
+    if x.size < 2:
+        dx = 1.0
+        return np.array([x[0]-0.5*dx, x[0]+0.5*dx], float)
+    mids = 0.5 * (x[:-1] + x[1:])
+    edges = np.empty(x.size + 1, float)
+    edges[1:-1] = mids
+    edges[0]  = x[0] - (mids[0] - x[0])
+    edges[-1] = x[-1] + (x[-1] - mids[-1])
+    return edges
+
+# amplitude = total area under the continuous Gaussian
+def pixint_gauss(x, amplitude, center, sigma):
+    sigma = max(float(sigma), 1e-12)
+    edges = bin_edges_from_centers(x)
+    t1 = (edges[1:] - center) / (sigma * sqrt(2.0))
+    t0 = (edges[:-1] - center) / (sigma * sqrt(2.0))
+    return amplitude * 0.5 * (erf(t1) - erf(t0))
+
+# ------------------------------
 # Helpers
 # ------------------------------
 def parse_centers(s: str):
@@ -73,9 +97,12 @@ def r2_score(y_true, y_fit):
 
 def load_q_and_I(h5_path):
     with h5py.File(h5_path, "r") as f:
-        if "q" in f:     x = np.asarray(f["q"][:], float)
-        elif "tth" in f: x = np.asarray(f["tth"][:], float)
-        else: raise ValueError("HDF5 must contain 'q' or 'tth'.")
+        if "q" in f:
+            x = np.asarray(f["q"][:], float)
+        elif "tth" in f:
+            x = np.asarray(f["tth"][:], float)
+        else:
+            raise ValueError("HDF5 must contain 'q' or 'tth'.")
         I_full = np.asarray(f["int"][:], float)
 
     if I_full.ndim == 1:
@@ -92,10 +119,9 @@ def window_mask(x, centers, halfwidth):
     hi = float(np.max(centers) + halfwidth)
     return (x >= lo) & (x <= hi)
 
-# lmfit GaussianModel uses amplitude = AREA
+# lmfit GaussianModel used amplitude = AREA; we preserve that with pixint_gauss
 def _gaussian_y(x, amp_area, cen, sig):
-    sig = max(sig, 1e-12)
-    return (amp_area / (np.sqrt(2.0*np.pi)*sig)) * np.exp(-(x - cen)**2 / (2.0 * sig**2))
+    return pixint_gauss(x, amp_area, cen, sig)
 
 def _build_seed_model(xw, yw, seeds):
     # background init via linear fit
@@ -112,7 +138,7 @@ def _build_seed_model(xw, yw, seeds):
     sigma0 = float(np.clip(sigma0_base, SIGMA_MIN_FIT, SIGMA_MAX_FIT))
 
     for i, c_seed in enumerate(seeds):
-        g = GaussianModel(prefix=f"g{i}_")
+        g = Model(pixint_gauss, prefix=f"g{i}_")
         model = model + g
         idx = np.abs(xw - c_seed).argmin()
         y_at_seed = yw[idx]
@@ -120,7 +146,7 @@ def _build_seed_model(xw, yw, seeds):
         height0 = max(y_at_seed - y_bkg, np.std(yw) * 0.5)
         amp0 = max(height0 * sigma0 * np.sqrt(2.0 * np.pi), 0.0)
 
-        params.update(g.make_params(center=c_seed, sigma=sigma0, amplitude=amp0))
+        params.update(g.make_params(amplitude=amp0, center=c_seed, sigma=sigma0))
         params[f"g{i}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
         params[f"g{i}_amplitude"].set(min=0.0)
         params[f"g{i}_center"].set(min=c_seed - DRIFT_NEG, max=c_seed + DRIFT_POS)
@@ -159,7 +185,6 @@ def _extract_metrics(result, xw):
             comps.append(np.full_like(xw, np.nan, float))
     return bkg_line, centers, sigmas, amps, heights, fwhm, peak_at_center, comps
 
-from lmfit import Parameters
 def _rebuild_from_kept(xw, yw, result, keep_mask):
     params_new = Parameters()
     model_new = LinearModel(prefix="bkg_")
@@ -174,7 +199,7 @@ def _rebuild_from_kept(xw, yw, result, keep_mask):
     j = 0
     while f"g{j}_center" in result.params:
         if keep_mask[j]:
-            gk = GaussianModel(prefix=f"g{next_idx}_")
+            gk = Model(pixint_gauss, prefix=f"g{next_idx}_")
             model_new = model_new + gk
             ccur = result.params[f"g{j}_center"].value
             scur = result.params[f"g{j}_sigma"].value
@@ -212,7 +237,7 @@ def _build_params_from_result(res, drop_idx=None):
     while f"g{j}_center" in res.params:
         if drop_idx is not None and j == drop_idx:
             j += 1; continue
-        g = GaussianModel(prefix=f"g{next_idx}_")
+        g = Model(pixint_gauss, prefix=f"g{next_idx}_")
         model_expr = model_expr + g
         params_new.update(g.make_params(
             center=res.params[f"g{j}_center"].value,
@@ -260,7 +285,7 @@ def _try_residual_add(xw, yw, result, max_n,
 
     if n_now < max_n:
         model_expr, params_new, next_idx = _build_params_from_result(result)
-        gnew = GaussianModel(prefix=f"g{next_idx}_")
+        gnew = Model(pixint_gauss, prefix=f"g{next_idx}_")
         model_expr = model_expr + gnew
         params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
         params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
@@ -282,7 +307,7 @@ def _try_residual_add(xw, yw, result, max_n,
         return result, False
     weakest = int(np.nanargmin(h0))
     model_expr, params_new, next_idx = _build_params_from_result(result, drop_idx=weakest)
-    gnew = GaussianModel(prefix=f"g{next_idx}_")
+    gnew = Model(pixint_gauss, prefix=f"g{next_idx}_")
     model_expr = model_expr + gnew
     params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
     params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
@@ -328,7 +353,6 @@ def _try_edge_add(xw, yw, result, max_n,
         x_side = xw[msk]; w = rpos[msk]
         xc = np.sum(x_side * w) / np.sum(w)
         var = max(np.sum(w * (x_side - xc)**2) / np.sum(w), 1e-12)
-        # Single proper clip to enforce sigma bounds
         sig = float(np.clip(np.sqrt(var), SIGMA_MIN_FIT, SIGMA_MAX_FIT))
         return snr_area, xc, sig
 
@@ -355,7 +379,7 @@ def _try_edge_add(xw, yw, result, max_n,
 
     if n_now < max_n:
         model_expr, params_new, next_idx = _build_params_from_result(result)
-        gnew = GaussianModel(prefix=f"g{next_idx}_")
+        gnew = Model(pixint_gauss, prefix=f"g{next_idx}_")
         model_expr = model_expr + gnew
         params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
         params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
@@ -376,7 +400,7 @@ def _try_edge_add(xw, yw, result, max_n,
         return result, False
     weakest = int(np.nanargmin(h0))
     model_expr, params_new, next_idx = _build_params_from_result(result, drop_idx=weakest)
-    gnew = GaussianModel(prefix=f"g{next_idx}_")
+    gnew = Model(pixint_gauss, prefix=f"g{next_idx}_")
     model_expr = model_expr + gnew
     params_new.update(gnew.make_params(center=x0, sigma=sigma_seed, amplitude=amp_seed))
     params_new[f"g{next_idx}_sigma"].set(min=SIGMA_MIN_FIT, max=SIGMA_MAX_FIT)
@@ -669,7 +693,7 @@ def main():
         )
         if not np.any(mask):
             continue
-        ax.scatter(
+        sc = ax.scatter(
             xvals[mask],
             centers_trk[mask, j],
             c=height_trk[mask, j],
@@ -691,7 +715,7 @@ def main():
 
     # Colorbar only (no legend)
     if any_plotted:
-        cbar = fig.colorbar(ax.collections[0], ax=ax, pad=0.02)
+        cbar = fig.colorbar(sc, ax=ax, pad=0.02)
         cbar.set_label("Height (fit)")
 
     fig.tight_layout()
@@ -699,8 +723,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
