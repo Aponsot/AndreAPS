@@ -546,15 +546,17 @@ def fit_frame(x, y, seeds, halfwidth):
 
     # rescue if big residual AND currently only one kept peak
     resid_vec = yw - (bkg_line + (np.sum(np.vstack(comps), axis=0) if len(comps) else 0.0))
-    resid_max_abs = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
+    noise = robust_sigma(resid_vec)
+    trigger = max(RESIDUAL_TRIGGER_ABS, NOISE_TRIGGER_MULT * noise)
     kept_mask = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     n_kept = int(np.sum(kept_mask))
-
-    if (n_kept == 1) and (resid_max_abs >= RESIDUAL_TRIGGER_ABS) and (len(seeds) >= 2):
+    
+    if (n_kept == 1) and (np.max(np.abs(resid_vec)) >= trigger) and (len(seeds) >= 2):
         result2, changed = _rescue_double_peak(xw, yw, result, seed_cap=len(seeds))
         if changed:
             result = result2
             bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
+
 
     # final hard gate for outputs
     valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
@@ -783,6 +785,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
