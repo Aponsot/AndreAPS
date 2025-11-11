@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 import argparse, os
 import numpy as np
 import h5py
@@ -34,36 +34,40 @@ DRIFT_POS = 0.090
 MIN_SEP = 0.00040
 
 # Acceptance requirement (ΔAIC improvement)
-AIC_IMPROVE = 1.0  # conservative default
+AIC_IMPROVE = 1.0
 
 # Plot title time scaling (0/None -> use frame index)
 SEC_PER_FRAME = 0.004
 
 # --- FORCE-SPLIT triggers & guards ---
 # ABSOLUTE trigger (in same intensity units as your data). When set (not None),
-# it OVERRIDES the ratio trigger for clean testing.
-FORCE_SPLIT_ABS = 15.0     # <-- set this to the residual level you want; None disables absolute trigger
+# it OVERRIDES the ratio trigger for clean testing, but the relative trigger can still fire.
+FORCE_SPLIT_ABS = 15.0
 
-# Ratio trigger (fallback if FORCE_SPLIT_ABS is None):
-FORCE_SPLIT_NOISE_MULT        = 20.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
+# Ratio trigger (fallback if FORCE_SPLIT_ABS is None)
+FORCE_SPLIT_NOISE_MULT = 20.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
 
-# Candidate geometry for children:
-FORCE_SPLIT_DELTA_SIGMA_FRAC  = 0.5   # child offset ~ frac * parent_sigma (clamped below)
-FORCE_SPLIT_SIGMA_FRAC_MIN    = 0.7
-FORCE_SPLIT_SIGMA_FRAC_MAX    = 1.6
-DELTA_MIN_SIGMA_FRAC          = 0.40
-DELTA_MAX_SIGMA_FRAC          = 1.80
+# NEW: Relative trigger for weak/late frames (both must hold)
+FORCE_SPLIT_REL_MAIN  = 0.30    # resid_max ≥ 30% of tallest peak height
+FORCE_SPLIT_NOISE_MIN = 4.0     # and resid_max ≥ 4×noise
 
-# Acceptance gates:
-FORCE_SPLIT_RESID_DROP_FRAC   = 0.50  # require ≥35% RMS residual drop (AND ΔAIC pass)
-CHILD_HEIGHT_FRAC             = 0.25  # each child ≥ 25% of parent height
-AREA_CONSERVE_MIN_FRAC        = 0.70  # total child area within [70%,130%] of parent
-AREA_CONSERVE_MAX_FRAC        = 1.30
-SIDE_AREA_SNR_MULT            = 6.0   # side residual area ≥ K * noise * sqrt(N_side); set 0 to disable
+# Candidate geometry for children
+FORCE_SPLIT_DELTA_SIGMA_FRAC = 0.5   # child offset ~ frac * parent_sigma (clamped below)
+FORCE_SPLIT_SIGMA_FRAC_MIN   = 0.7
+FORCE_SPLIT_SIGMA_FRAC_MAX   = 1.6
+DELTA_MIN_SIGMA_FRAC         = 0.40
+DELTA_MAX_SIGMA_FRAC         = 1.80
+
+# Acceptance gates
+FORCE_SPLIT_RESID_DROP_FRAC = 0.50  # require ≥50% RMS residual drop (AND ΔAIC pass)
+CHILD_HEIGHT_FRAC           = 0.25  # each child ≥ 25% of parent height
+AREA_CONSERVE_MIN_FRAC      = 0.70  # total child area within [70%,130%] of parent
+AREA_CONSERVE_MAX_FRAC      = 1.30
+SIDE_AREA_SNR_MULT          = 6.0   # side residual area ≥ K * noise * sqrt(N_side); set 0 to disable
 
 # Debug toggles
-DEBUG = True                  # prints trigger/accept info (helpful while testing thresholds)
-DEBUG_PROVENANCE_TEXT = True  # annotate component source above peaks on plot when single-frame
+DEBUG = True
+DEBUG_PROVENANCE_TEXT = True
 
 # ------------------------------
 # Pixel-integrated Gaussian model
@@ -329,20 +333,24 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     resid_max = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
     resid_rms0 = float(np.sqrt(np.mean(resid_vec**2))) if resid_vec.size else 0.0
 
-    # ---------- TRIGGER: absolute OR ratio (absolute takes precedence if set) ----------
-    abs_trigger = (FORCE_SPLIT_ABS is not None) and (resid_max >= float(FORCE_SPLIT_ABS))
-    ratio_trigger = (FORCE_SPLIT_ABS is None) and (noise > 0) and (resid_max >= FORCE_SPLIT_NOISE_MULT * noise)
-    if not (abs_trigger or ratio_trigger):
-        return result, False, prov_in
-
-    # Tallest component
+    # Tallest component (needed for relative trigger)
     j_main = int(np.nanargmax(heights))
     main_c = float(centers[j_main])
     main_s = max(float(sigmas[j_main]), 1e-12)
     main_a = max(float(amps[j_main]),   1e-12)
     main_h = float(np.max(heights)) if heights.size else 0.0
 
-    # Side area SNR gate (optional; disable by setting SIDE_AREA_SNR_MULT=0)
+    # ---------- TRIGGERS ----------
+    abs_trigger   = (FORCE_SPLIT_ABS is not None) and (resid_max >= float(FORCE_SPLIT_ABS))
+    ratio_trigger = (FORCE_SPLIT_ABS is None) and (noise > 0) and (resid_max >= FORCE_SPLIT_NOISE_MULT * noise)
+    rel_trigger   = (main_h > 0) and (noise > 0) and \
+                    (resid_max >= FORCE_SPLIT_REL_MAIN * main_h) and \
+                    (resid_max >= FORCE_SPLIT_NOISE_MIN * noise)
+
+    if not (abs_trigger or ratio_trigger or rel_trigger):
+        return result, False, prov_in
+
+    # Side area SNR gate (optional; slightly relax when peak is weak)
     rpos = np.maximum(resid_vec, 0.0)
     left_mask  = xw <  main_c
     right_mask = xw >  main_c
@@ -354,7 +362,10 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
         return area, n, snr
     areaL, nL, snrL = side_area_snr(left_mask)
     areaR, nR, snrR = side_area_snr(right_mask)
-    if SIDE_AREA_SNR_MULT > 0 and max(snrL, snrR) < SIDE_AREA_SNR_MULT:
+    side_gate = SIDE_AREA_SNR_MULT
+    if (main_h > 0) and (noise > 0) and (main_h < 3.0 * noise):
+        side_gate = max(0.0, SIDE_AREA_SNR_MULT - 2.0)
+    if side_gate > 0 and max(snrL, snrR) < side_gate:
         return result, False, prov_in
 
     # Residual centroid & delta
@@ -422,7 +433,7 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     comp_sum_t = bkg_line_t + (np.sum(np.vstack(comps_t), axis=0) if len(comps_t) else 0.0)
     resid_vec_t = yw - comp_sum_t
     resid_rms1 = float(np.sqrt(np.mean(resid_vec_t**2))) if resid_vec_t.size else 0.0
-    resid_drop_ok = (resid_rms0 > 0.0) and ((resid_rms0 - resid_rms1) / resid_rms0 >= FORCE_SPLIT_RESID_DROP_FRAC)
+    resid_drop_ok = (resid_rms0 > 0.0) and ((resid_rms0 - resid_rms1) / max(resid_rms0,1e-12) >= FORCE_SPLIT_RESID_DROP_FRAC)
 
     # area conservation wrt parent
     a_sum = float(np.nansum(amps_t))
@@ -441,7 +452,8 @@ def _force_split_if_needed(xw, yw, result, seed_cap, seeds, prov_in):
     if DEBUG:
         print(f"[trigger] resid_max={resid_max:.3f}, noise={noise:.3f}, "
               f"abs_thr={FORCE_SPLIT_ABS}, ratio_thr={FORCE_SPLIT_NOISE_MULT}, "
-              f"abs_ok={abs_trigger}, ratio_ok={ratio_trigger}")
+              f"rel_main={FORCE_SPLIT_REL_MAIN}, rel_noise_min={FORCE_SPLIT_NOISE_MIN}, "
+              f"abs_ok={abs_trigger}, ratio_ok={ratio_trigger}, rel_ok={rel_trigger}")
         print(f"[force-split] comps_before={n_now}, cap={seed_cap}, ΔAIC={result.aic - trial.aic:.3g}, "
               f"RMS drop={(resid_rms0 - resid_rms1)/max(resid_rms0,1e-9):.2%}, area_ok={area_ok}, accept={accept}")
 
@@ -511,7 +523,7 @@ def fit_frame(x, y, seeds, halfwidth):
 # ------------------------------
 def apply_pub_style():
     plt.rcParams.update({
-        "figure.figsize": (9.6, 4.8),   # wide
+        "figure.figsize": (9.6, 4.8),
         "figure.dpi": 160,
         "savefig.dpi": 300,
         "font.size": 12,
@@ -547,7 +559,7 @@ COMP_COLORS = [
 # Main (CLI unchanged)
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, FORCE-SPLIT with ABS trigger; cap & seed-bounded centers; provenance).")
+    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, FORCE-SPLIT with ABS/REL/ratio triggers; cap & seed-bounded centers; provenance).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -568,7 +580,8 @@ def main():
             return
 
         # Terminal table (+ residual debug)
-        print(f"\n[debug] FORCE_SPLIT_ABS={FORCE_SPLIT_ABS}, FORCE_SPLIT_NOISE_MULT={FORCE_SPLIT_NOISE_MULT}")
+        print(f"\n[debug] ABS={FORCE_SPLIT_ABS}, NOISE_MULT={FORCE_SPLIT_NOISE_MULT}, "
+              f"REL_MAIN={FORCE_SPLIT_REL_MAIN}, NOISE_MIN={FORCE_SPLIT_NOISE_MIN}")
         print(f"[debug] resid_max={res['resid_max_abs']:.3f}\n")
 
         vis = np.isfinite(res["centers"])
@@ -607,7 +620,7 @@ def main():
                 ax.text(xpk, ypk*1.03, labels_v[idx],
                         ha="center", va="bottom", fontsize=9, rotation=0, alpha=0.75)
 
-        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
+        ax.plot(res()["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
 
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.35, lw=0.9, color="0.4")
@@ -714,13 +727,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
