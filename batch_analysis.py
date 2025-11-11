@@ -50,7 +50,7 @@ SIGMA_ADDED_MIN_FRAC = 0.7     # new comp sigma >= 0.7 * main_sigma
 SIGMA_ADDED_MAX_FRAC = 1.5     # and <= 1.5 * main_sigma
 NOISE_TRIGGER_MULT   = 10.0     # rescue fire level = NOISE_TRIGGER_MULT * noise
 
-DEBUG = False  # set True to print why adds are accepted/rejected
+DEBUG = true  # set True to print why adds are accepted/rejected
 
 # ------------------------------
 # Pixel-integrated Gaussian model
@@ -657,5 +657,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
