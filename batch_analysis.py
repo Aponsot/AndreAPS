@@ -32,7 +32,7 @@ DRIFT_POS = 0.010
 
 # Residual-based additions (edge or spike); single SNR kept for spike detection
 ENABLE_RESIDUAL = True
-RESIDUAL_SNR    = 0.15      # only used to detect a real residual spike vs noise
+RESIDUAL_SNR    = 0.1      # only used to detect a real residual spike vs noise
 MIN_SEP         = 0.00080
 AIC_IMPROVE     = 1.0
 
@@ -722,6 +722,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
