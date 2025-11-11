@@ -2,6 +2,8 @@
 # Pixel-integrated Gaussian multi-peak fit with ONE add-path:
 # area-based residual add (centroid + sigma tied to main sigma).
 # Linear background. Height floor governs both admission and reporting.
+#
+# CLI: --h5, --centers, --frame   (unchanged)
 
 import argparse, os
 import numpy as np
@@ -241,18 +243,11 @@ def _build_params_from_result(res, drop_idx=None):
         next_idx += 1; j += 1
     return model_expr, params_new, next_idx
 
+# ---- ONE add path: area-based residual add ----
 def _try_area_add(xw, yw, result, max_n,
                   height_floor=PEAK_HEIGHT_MIN,
                   aic_improve=AIC_IMPROVE):
-    """
-    ONE add path: area-based residual add.
-      - Compute positive residual area on left/right of main peak
-      - Choose side by larger height estimate (area/(sqrt(2π)*σ_est))
-      - Seed center at area-weighted centroid; σ tied to main σ
-      - Amplitude seed equals residual area (pixel-integrated amp == area)
-      - Accept only if ΔAIC >= aic_improve and new height >= height_floor
-    """
-    # count existing components
+    # count components
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
@@ -270,7 +265,6 @@ def _try_area_add(xw, yw, result, max_n,
     centers = np.asarray(centers, float)
     sigmas  = np.asarray(sigmas,  float)
     heights = np.asarray(heights, float)
-
     j_main  = int(np.nanargmax(heights))
     main_c  = float(centers[j_main])
     main_s  = float(sigmas[j_main])
@@ -299,7 +293,6 @@ def _try_area_add(xw, yw, result, max_n,
     left  = side_stats(xw <  main_c)
     right = side_stats(xw >  main_c)
 
-    # choose side by higher height estimate
     cand = None
     if left and right:
         cand = left if left[3] >= right[3] else right
@@ -384,12 +377,10 @@ def _rescue_double_peak(xw, yw, result, seed_cap):
      - only one kept peak after height floor, and
      - residual is large relative to noise
     """
-    # recompute residuals & noise
     resid = yw - result.best_fit
     noise = robust_sigma(resid)
     trigger = NOISE_TRIGGER_MULT * noise
 
-    # how many peaks pass the height floor right now?
     _, _, _, _, h_all, _, _, _ = _extract_metrics(result, xw)
     kept = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
     n_kept = int(np.sum(kept))
@@ -444,7 +435,7 @@ def fit_frame(x, y, seeds, halfwidth):
 
     comp_sum = bkg_line + (np.sum(np.vstack(comps), axis=0) if len(comps) else 0.0)
     r2 = r2_score(yw, result.best_fit)
-    resid_vec = yw - (bkg_line + (np.sum(np.vstack(comps), axis=0) if len(comps) else 0.0))
+    resid_vec = yw - comp_sum
     resid_max_abs = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
 
     return {
@@ -495,21 +486,14 @@ COMP_COLORS = [
 ]
 
 # ------------------------------
-# Main
+# Main (CLI unchanged)
 # ------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, single area-based add + rescue).")
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
-    ap.add_argument("--height-min", type=float, default=PEAK_HEIGHT_MIN, help="Height floor for admission and reporting.")
-    ap.add_argument("--aic-improve", type=float, default=AIC_IMPROVE, help="Minimum ΔAIC to accept added component.")
     args = ap.parse_args()
-
-    # allow CLI override of key gates
-    global PEAK_HEIGHT_MIN, AIC_IMPROVE
-    PEAK_HEIGHT_MIN = float(args.height_min)
-    AIC_IMPROVE     = float(args.aic_improve)
 
     seeds0 = parse_centers(args.centers)
     x, I_full = load_q_and_I(args.h5)
