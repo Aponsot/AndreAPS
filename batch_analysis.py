@@ -45,7 +45,7 @@ SEC_PER_FRAME = 0.004
 FORCE_SPLIT_ABS = 15.0     # <-- set this to the residual level you want; None disables absolute trigger
 
 # Ratio trigger (fallback if FORCE_SPLIT_ABS is None):
-FORCE_SPLIT_NOISE_MULT        = 9.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
+FORCE_SPLIT_NOISE_MULT        = 20.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
 
 # Candidate geometry for children:
 FORCE_SPLIT_DELTA_SIGMA_FRAC  = 0.5   # child offset ~ frac * parent_sigma (clamped below)
@@ -714,6 +714,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
