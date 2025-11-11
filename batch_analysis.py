@@ -16,11 +16,11 @@ except Exception:
 # ------------------------------
 # Tunables
 # ------------------------------
-HALF_WINDOW = 0.13
+HALF_WINDOW = 0.20
 MIN_POINTS  = 8
 
 # Height floor (admission + reporting)
-PEAK_HEIGHT_MIN = 3000.0
+PEAK_HEIGHT_MIN = 10.0
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.0001
@@ -741,6 +741,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
