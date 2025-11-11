@@ -42,7 +42,7 @@ SEC_PER_FRAME = 0.004
 # --- FORCE-SPLIT triggers & guards ---
 # ABSOLUTE trigger (in same intensity units as your data). When set (not None),
 # it OVERRIDES the ratio trigger for clean testing, but the relative trigger can still fire.
-FORCE_SPLIT_ABS = 15.0
+FORCE_SPLIT_ABS = 8.0
 
 # Ratio trigger (fallback if FORCE_SPLIT_ABS is None)
 FORCE_SPLIT_NOISE_MULT = 20.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
@@ -741,6 +741,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
