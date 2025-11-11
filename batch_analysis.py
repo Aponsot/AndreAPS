@@ -604,7 +604,7 @@ def main():
         # Plot
         apply_pub_style()
         from matplotlib.gridspec import GridSpec
-        plt.rcParams.update({"figure.figsize": (10.5, 5.2)})
+        plt.rcParams.update({"figure.figsize": (7, 5.2)})
 
         fig = plt.figure()
         gs = GridSpec(2, 1, height_ratios=[3.0, 1.2], hspace=0.50)
@@ -741,5 +741,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
