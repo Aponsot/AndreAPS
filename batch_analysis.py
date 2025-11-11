@@ -48,8 +48,8 @@ FORCE_SPLIT_ABS = 15.0
 FORCE_SPLIT_NOISE_MULT = 20.0   # split if max|resid| >= K * noise (noise = 1.4826*MAD)
 
 # NEW: Relative trigger for weak/late frames (both must hold)
-FORCE_SPLIT_REL_MAIN  = 0.15    # resid_max ≥ 30% of tallest peak height
-FORCE_SPLIT_NOISE_MIN = 2.0     # and resid_max ≥ 4×noise
+FORCE_SPLIT_REL_MAIN  = 0.1    # resid_max ≥ 30% of tallest peak height
+FORCE_SPLIT_NOISE_MIN = .5     # and resid_max ≥ 4×noise
 
 # Candidate geometry for children
 FORCE_SPLIT_DELTA_SIGMA_FRAC = 0.5   # child offset ~ frac * parent_sigma (clamped below)
@@ -727,6 +727,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
