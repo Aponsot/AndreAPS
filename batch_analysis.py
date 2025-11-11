@@ -620,7 +620,7 @@ def main():
                 ax.text(xpk, ypk*1.03, labels_v[idx],
                         ha="center", va="bottom", fontsize=9, rotation=0, alpha=0.75)
 
-        ax.plot(res()["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
+        ax.plot(res["xw"], res["comp_sum"], lw=1.0, color="k", alpha=0.35)
 
         for c in centers_v:
             ax.axvline(c, linestyle="--", alpha=0.35, lw=0.9, color="0.4")
@@ -727,3 +727,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
