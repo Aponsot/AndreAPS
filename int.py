@@ -290,7 +290,7 @@ def integrate_em(tiff_folder: str,
             time_axis = h5_file["time"][...]
         fig, ax = plt.subplots(figsize=(10, 6))
         im = ax.imshow(intensity_stack, aspect='auto',
-                       extent=[q_values.min(), q_values.max(), time_axis.max(), 0],
+                       extent=[q_values.min(), q_values.max(), time_axis.min(),time_axis.max()],
                        origin='upper', cmap='plasma')
         plt.colorbar(im, ax=ax, label='Intensity')
         ax.set_xlabel('q (Å⁻¹)')
@@ -317,3 +317,4 @@ if __name__ == "__main__":
 
     integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot,
                  args.max_workers, args.preload, args.preload_factor)
+
