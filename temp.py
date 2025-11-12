@@ -1,5 +1,4 @@
-
-
+#!/usr/bin/env python3
 import argparse
 import os
 import numpy as np
@@ -20,9 +19,9 @@ SEED_FRAMES = 30    # frames used to define baseline a0
 MAX_FRAMES = 200    # max frames processed
 
 # Frames of interest
-MELT_FRAME = 59   # where melting happened (intercept point)
-FIT_START  = 60    # start frame for exponential fit
-FIT_END    = 200    # end frame for exponential fit (capped by available nframes)
+MELT_FRAME = 59
+FIT_START  = 60
+FIT_END    = 200
 
 # Reflection (set to your peak)
 h, k, l = 2, 0, 0
@@ -92,7 +91,8 @@ def build_window(x, yfull, center, width):
 
 def fit_peak_single(xw, yw, seed_center):
     """
-    Single Gaussian + linear baseline. Return absolute center (q) and FWHM.
+    Single Gaussian + linear baseline. 
+    Returns center (q), FWHM, AREA, HEIGHT.  # NEW: include area & height
     """
     if len(xw) < MIN_POINTS:
         return None
@@ -102,14 +102,15 @@ def fit_peak_single(xw, yw, seed_center):
     except Exception:
         bkg_slope, bkg_intercept = 0.0, np.median(yw)
 
-    y_detr = yw - (bkg_slope * xw + bkg_intercept)
+    y_bkg = (bkg_slope * xw + bkg_intercept)
+    y_detr = yw - y_bkg
     noise = robust_sigma(y_detr)
 
     peak_idx = np.abs(xw - seed_center).argmin()
     height0 = max(yw[peak_idx] - (bkg_slope * xw[peak_idx] + bkg_intercept), 0.5 * noise)
     span = max(xw[-1] - xw[0], 1e-9)
     sigma0 = max(span / 7.0, 1e-6)
-    amp0 = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)
+    amp0 = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)  # amplitude == AREA  # CHG: comment clarified
 
     # Build model
     from lmfit.models import GaussianModel, LinearModel
@@ -119,7 +120,7 @@ def fit_peak_single(xw, yw, seed_center):
         bkg_intercept=bkg_intercept,
         g_center=xw[peak_idx],
         g_sigma=sigma0,
-        g_amplitude=amp0,
+        g_amplitude=amp0,   # this is AREA in lmfit's GaussianModel
     )
     params["g_sigma"].set(min=1e-6, max=max(span, 1.0))
     params["g_amplitude"].set(min=0.0)
@@ -129,8 +130,10 @@ def fit_peak_single(xw, yw, seed_center):
         p = result.params
         center_fit = p["g_center"].value
         sigma_fit  = p["g_sigma"].value
+        area_fit   = p["g_amplitude"].value             # NEW: AREA straight from lmfit
+        height_fit = area_fit / (sigma_fit * sqrt(2.0*np.pi)) if (np.isfinite(sigma_fit) and sigma_fit > 0) else np.nan  # NEW
         fwhm_fit   = sigma_to_fwhm(sigma_fit) if np.isfinite(sigma_fit) else np.nan
-        return {"center": center_fit, "fwhm": fwhm_fit}
+        return {"center": center_fit, "fwhm": fwhm_fit, "area": area_fit, "height": height_fit}  # NEW
     except Exception:
         return None
 
@@ -148,7 +151,7 @@ def load_q_and_I_q_only(h5_path):
 def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_progress=True):
     """
     Fit absolute peak centers per frame (in q). Compute baseline a0 from first SEED_FRAMES.
-    Returns centers (q), fwhms, a0, frames_count.
+    Returns centers (q), fwhms, a0, nframes, AREAS.  # NEW: return areas
     """
     x, I_full = load_q_and_I_q_only(h5_path)
     nframes = min(I_full.shape[0], nframes_limit)
@@ -156,6 +159,7 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
 
     centers = np.full(nframes, np.nan)
     fwhms   = np.full(nframes, np.nan)
+    areas   = np.full(nframes, np.nan)   # NEW
 
     iterator = range(nframes)
     if show_progress and tqdm is not None:
@@ -172,6 +176,7 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
         if res is not None:
             centers[frame] = res["center"]
             fwhms[frame]   = res["fwhm"]
+            areas[frame]   = res["area"]    # NEW
             seed = res["center"]
 
     # Baseline q0 and a0 from early frames
@@ -185,7 +190,7 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
     G_norm = sqrt(h**2 + k**2 + l**2)
     a0 = (2.0 * pi / q0) * G_norm
 
-    return centers, fwhms, a0, nframes
+    return centers, fwhms, a0, nframes, areas  # NEW
 
 # Bi-exponential model: fast + slow components
 def exp_bi(x, c, A1, tau1, A2, tau2):
@@ -213,10 +218,14 @@ def main():
     if tqdm is not None:
         dataset_iter = tqdm(dataset_iter, desc="Datasets")
 
+    all_area_series = []  # NEW: collect for optional normalization across sets
+
     for i in dataset_iter:
-        centers, fwhms, a0, nframes = process_dataset(
+        centers, fwhms, a0, nframes, areas = process_dataset(  # CHG: receive areas
             args.h5[i], args.center[i], nframes_limit=MAX_FRAMES, show_progress=True
         )
+        all_area_series.append(areas)  # NEW
+
         frames = np.arange(nframes)
         valid_centers = np.isfinite(centers) & (centers > 0)
 
@@ -249,46 +258,28 @@ def main():
         y_fit = T_full_C[fit_idx]
 
         print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
-        # Build fit window and fit bi-exponential decay (weighted to emphasize early times)
-        max_frame_for_fit = min(nframes - 1, FIT_END)
-        fit_mask = finite_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
-        fit_idx = np.where(fit_mask)[0]
-        x_fit = frames[fit_idx]
-        y_fit = T_full_C[fit_idx]
-
-        print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
         if y_fit.size >= 8 and np.ptp(x_fit) > 0:
             # Initial guesses
             last_n = max(3, min(10, y_fit.size))
             c0 = float(np.nanmedian(y_fit[-last_n:]))
             A_total = float(y_fit[0] - c0)
-            # Ensure positive total amplitude (cooling)
             if A_total < 0:
-                # If initial guess suggests heating (unlikely), flip sign to enforce cooling
                 A_total = abs(A_total)
 
-            # Split amplitude between fast and slow components
-            A1_0 = 0.6 * A_total  # more weight to fast component
+            A1_0 = 0.6 * A_total
             A2_0 = 0.4 * A_total
 
             span = float(x_fit[-1] - x_fit[0])
-            # Fast component should be small compared to span
             tau1_0 = max(2.0, span / 15.0)
-            # Slow component noticeably larger
             tau2_0 = max(10.0, span / 3.0)
 
-            # Bounds:
-            # - c near late-time median (± 2*|A_total|)
-            # - A1, A2 >= 0 (monotonic decay)
-            # - tau1 small-ish; tau2 larger
             c_lo = c0 - 2.0 * abs(A_total)
             c_hi = c0 + 2.0 * abs(A_total)
-            tau1_hi = max(5.0, span / 10.0)     # tighten upper bound for fast time constant
-            tau2_lo = max(8.0, span / 6.0)     # ensure slow time constant is not too small
+            tau1_hi = max(5.0, span / 10.0)
+            tau2_lo = max(8.0, span / 6.0)
 
-            # Weight early points more: sigma small near FIT_START -> higher weight
-            # curve_fit minimizes sum((resid/sigma)^2), so smaller sigma increases weight.
-            w_strength = 0.6  # increase to 1.0 for stronger emphasis on early points
+            # Weight early points more
+            w_strength = 0.6
             sigma = 1.0 / (1.0 + w_strength * (x_fit - FIT_START))
 
             try:
@@ -306,28 +297,17 @@ def main():
                 # Extrapolate from MELT_FRAME onward
                 x_line = np.arange(MELT_FRAME, nframes)
                 y_line = exp_bi(x_line, *popt)
-                line = ['-', '--', ':'][i % 3]  # different line style per dataset
-                # Plot fit line (same color, label only depth)
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0,linestyle=line,  
+                line = ['-', '--', ':'][i % 3]
+                ax.plot(x_line, y_line, color=Color, linewidth=2.0, linestyle=line,
                         label=f"{depth_label} μm")
 
-                # Intercept at MELT_FRAME for console info
                 T_melt = float(exp_bi(MELT_FRAME, *popt))
                 print(f"Depth {depth_label} μm: T@{MELT_FRAME} = {T_melt:.1f} °C; τ_fast={tau1_fit:.1f}, τ_slow={tau2_fit:.1f}")
             except Exception as e:
                 print(f"DS{i}: bi-exponential curve_fit failed: {e}")
         else:
             print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
-            # Initial guesses
-            last_n = max(3, min(10, y_fit.size))
-            c0 = float(np.nanmedian(y_fit[-last_n:]))
-            A_total = float(y_fit[0] - c0)
-            # Split amplitude between fast and slow components
-            A1_0 = 0.5* A_total
-            A2_0 = 0.5* A_total
-            span = float(x_fit[-1] - x_fit[0])
-            tau1_0 = max(1.0, span / 15.0)  # fast component
-            tau2_0 = max(8.0, span / 3.0)    # slow component
+
     # Decorate single plot
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("Frame")
@@ -335,12 +315,16 @@ def main():
     ax.set_title(f"Raw temperature scatter and bi-exponential decay fits (fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})")
     ax.axvline(MELT_FRAME, color='0.5', linestyle='--', linewidth=1.0)
     ax.axvline(FIT_START, color='0.6', linestyle=':', linewidth=1.0)
-
-    # Legend: only shows which curve corresponds to which depth
     ax.legend(ncol=1, fontsize=10)
-
     fig.tight_layout()
     plt.show()
+
+    # --- OPTIONAL: if you want the areas in 0–100 across ALL datasets, uncomment:
+    # all_areas = np.hstack([a[np.isfinite(a)] for a in all_area_series if a is not None])
+    # if all_areas.size:
+    #     global_max = np.nanmax(all_areas)
+    #     norm_series = [ (100.0 * a / global_max) for a in all_area_series ]
+    #     # do whatever you’d like with norm_series[...]
 
 if __name__ == "__main__":
     main()
