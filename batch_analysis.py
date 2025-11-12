@@ -40,6 +40,9 @@ MAP_FRAME_START = 0      # inclusive start frame for map
 MAP_FRAME_END   = None   # inclusive end frame; None -> last frame
 MAP_STEP        = 1      # step between frames (e.g., 1, 5, 10)
 
+# Save map arrays to HDF5 for later temperature analysis
+SAVE_MAP_TO_H5 = False   # set True to write <inputbasename>_peakmap.h5
+
 # Pixel-integrated Gaussian
 # ------------------------------
 def bin_edges_from_centers(x):
@@ -526,6 +529,23 @@ def main():
         fwhm_trk[i_row, :k]    = w[:k]
         height_trk[i_row, :k]  = h[:k]
         area_trk[i_row, :k]    = a[:k]
+
+    # Optional: save map arrays to HDF5 for temperature analysis
+    if SAVE_MAP_TO_H5:
+        base_dir = os.path.dirname(os.path.abspath(args.h5))
+        base_name = os.path.splitext(os.path.basename(args.h5))[0]
+        out_path = os.path.join(base_dir, base_name + "_peakmap.h5")
+        with h5py.File(out_path, "w") as hf:
+            hf.create_dataset("frame_index", data=frames_used, compression="gzip")
+            if SEC_PER_FRAME is not None and SEC_PER_FRAME > 0:
+                hf.create_dataset("time", data=frames_used * float(SEC_PER_FRAME), compression="gzip")
+            hf.create_dataset("centers", data=centers_trk, compression="gzip")
+            hf.create_dataset("fwhm",    data=fwhm_trk,    compression="gzip")
+            hf.create_dataset("height",  data=height_trk,  compression="gzip")
+            hf.create_dataset("area",    data=area_trk,    compression="gzip")
+            hf.attrs["seeds0"] = seeds0
+            hf.attrs["sec_per_frame"] = float(SEC_PER_FRAME) if SEC_PER_FRAME is not None else -1.0
+        print(f"Saved peak map to {out_path}")
 
     # Visualization: centers vs time/frame, color = normalized area (0–100)
     apply_pub_style()
