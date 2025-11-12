@@ -12,9 +12,6 @@ try:
     from tqdm.auto import tqdm
 except Exception:
     tqdm = None
-
-# ------------------------------
-# Tunables (slimmed)
 # ------------------------------
 HALF_WINDOW   = 0.20
 MIN_POINTS    = 8
@@ -37,7 +34,6 @@ SPLIT_DELTA_SIGMA_FRAC = 0.6    # child offset ≈ frac * parent_sigma (clamped 
 # Plot title time scaling (0/None -> use frame index)
 SEC_PER_FRAME = 0.004
 
-# ------------------------------
 # Pixel-integrated Gaussian
 # ------------------------------
 def bin_edges_from_centers(x):
@@ -116,8 +112,7 @@ def nearest_seed_bounds(center_value, seeds):
 def clamp_center_param(params, name, center_value, seeds):
     lo, hi = nearest_seed_bounds(center_value, seeds)
     params[name].set(min=lo, max=hi)
-
-# ------------------------------
+    
 # Model build / metrics
 # ------------------------------
 def _build_seed_model(xw, yw, seeds):
@@ -197,7 +192,6 @@ def _sum_components(xw, result):
         i += 1
     return np.sum(np.vstack(comps), axis=0) if comps else np.zeros_like(xw, float)
 
-# ------------------------------
 # Simplified FORCE-SPLIT (honors seed cap and min-sep)
 # ------------------------------
 def _try_split_once(xw, yw, result, seed_cap, seeds):
@@ -289,7 +283,6 @@ def _try_split_once(xw, yw, result, seed_cap, seeds):
 
     return trial, True
 
-# ------------------------------
 # Fit a single frame
 # ------------------------------
 def fit_frame(x, y, seeds, halfwidth):
@@ -358,7 +351,6 @@ def fit_frame(x, y, seeds, halfwidth):
         "comp_sum": comp_sum, "r2": r2_score(yw, result.best_fit)
     }
 
-# ------------------------------
 # Visual style
 # ------------------------------
 def apply_pub_style():
@@ -390,7 +382,6 @@ def style_axes(ax, light_grid=True):
     if light_grid:
         ax.grid(True, which="major", alpha=0.12, linestyle="-", linewidth=0.6)
 
-# ------------------------------
 # Main (CLI)
 # ------------------------------
 def main():
@@ -559,3 +550,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
