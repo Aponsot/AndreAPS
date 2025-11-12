@@ -12,6 +12,7 @@ try:
     from tqdm.auto import tqdm
 except Exception:
     tqdm = None
+
 # ------------------------------
 HALF_WINDOW   = 0.20
 MIN_POINTS    = 8
@@ -33,6 +34,11 @@ SPLIT_DELTA_SIGMA_FRAC = 0.6    # child offset ≈ frac * parent_sigma (clamped 
 
 # Plot title time scaling (0/None -> use frame index)
 SEC_PER_FRAME = 0.004
+
+# Mapping frame controls
+MAP_FRAME_START = 0      # inclusive start frame for map
+MAP_FRAME_END   = None   # inclusive end frame; None -> last frame
+MAP_STEP        = 1      # step between frames (e.g., 1, 5, 10)
 
 # Pixel-integrated Gaussian
 # ------------------------------
@@ -461,9 +467,32 @@ def main():
         plt.show()
         return
 
-    # -------- Mapping (all frames) --------
-    nuse = nframes
+    # -------- Mapping (subset of frames with step) --------
+    # Determine frame range [start, end] inclusive
+    start = int(MAP_FRAME_START)
+    if start < 0:
+        start = 0
+    if start >= nframes:
+        raise ValueError(f"MAP_FRAME_START {MAP_FRAME_START} is >= total frames {nframes}")
+
+    if MAP_FRAME_END is None:
+        end = nframes - 1
+    else:
+        end = int(MAP_FRAME_END)
+        if end < 0:
+            end = nframes - 1
+        if end >= nframes:
+            end = nframes - 1
+
+    if end < start:
+        raise ValueError(f"MAP_FRAME_END ({end}) < MAP_FRAME_START ({start})")
+
+    step = int(MAP_STEP) if MAP_STEP is not None and MAP_STEP > 0 else 1
+
+    frames_used = np.arange(start, end + 1, step)
+    nuse = frames_used.size
     npeaks = len(seeds0)
+
     centers_trk = np.full((nuse, npeaks), np.nan)
     fwhm_trk    = np.full((nuse, npeaks), np.nan)
     height_trk  = np.full((nuse, npeaks), np.nan)
@@ -473,11 +502,13 @@ def main():
     if tqdm is not None:
         iterator = tqdm(iterator, desc="Fitting frames", ncols=80)
 
-    for f in iterator:
+    for i_row in iterator:
+        f = frames_used[i_row]
         y = I_full[f]
         res = fit_frame(x, y, seeds0, HALF_WINDOW)
         if not res["success"]:
             continue
+
         valid = np.isfinite(res["centers"]) & np.isfinite(res["height_fit"])
         if np.any(valid):
             c = res["centers"][valid]
@@ -491,10 +522,10 @@ def main():
             order = np.argsort(c)
             c, w, h, a = c[order], w[order], h[order], a[order]
         k = min(c.size, npeaks)
-        centers_trk[f, :k] = c[:k]
-        fwhm_trk[f, :k]    = w[:k]
-        height_trk[f, :k]  = h[:k]
-        area_trk[f, :k]    = a[:k]
+        centers_trk[i_row, :k] = c[:k]
+        fwhm_trk[i_row, :k]    = w[:k]
+        height_trk[i_row, :k]  = h[:k]
+        area_trk[i_row, :k]    = a[:k]
 
     # Visualization: centers vs time/frame, color = normalized area (0–100)
     apply_pub_style()
@@ -502,9 +533,13 @@ def main():
 
     fig, ax = plt.subplots(); style_axes(ax, light_grid=True)
 
-    frames = np.arange(nuse)
-    xvals = (frames * float(SEC_PER_FRAME)) if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else frames
-    xlabel = "Time (s)" if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0) else "Frame"
+    # Use actual frame indices or time for x-axis
+    if SEC_PER_FRAME is not None and SEC_PER_FRAME > 0:
+        xvals = frames_used * float(SEC_PER_FRAME)
+        xlabel = "Time (s)"
+    else:
+        xvals = frames_used
+        xlabel = "Frame"
 
     area_norm = np.zeros_like(area_trk, float)
     if np.any(np.isfinite(area_trk)):
@@ -550,4 +585,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
