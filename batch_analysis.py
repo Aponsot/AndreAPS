@@ -16,7 +16,7 @@ except Exception:
 # ------------------------------
 HALF_WINDOW   = 0.20
 MIN_POINTS    = 8
-PEAK_HEIGHT_MIN = 1000          # admission + reporting floor (height at center)
+PEAK_HEIGHT_MIN = 6000          # admission + reporting floor (height at center)
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.0005
@@ -27,12 +27,12 @@ DRIFT_NEG = 0.11
 DRIFT_POS = 0.020
 
 # Component geometry/acceptance
-MIN_SEP      = 0.0050           # min separation between component centers
+MIN_SEP      = 0.0020           # min separation between component centers
 AIC_IMPROVE  = 1.0              # require at least this ΔAIC improvement to accept split
 
 # NEW: residual-based split trigger (absolute threshold)
 # Set > 0 to enable: split if max|resid| >= RESIDUAL_SPLIT_THRESH
-RESIDUAL_SPLIT_THRESH = 0.0
+RESIDUAL_SPLIT_THRESH = 15
 
 SPLIT_DELTA_SIGMA_FRAC = 0.6    # child offset ≈ frac * parent_sigma (clamped by MIN_SEP)
 
@@ -42,7 +42,7 @@ SEC_PER_FRAME = 0.004
 # Mapping frame controls
 MAP_FRAME_START = 0      # inclusive start frame for map
 MAP_FRAME_END   = None   # inclusive end frame; None -> last frame
-MAP_STEP        = 1      # step between frames (e.g., 1, 5, 10)
+MAP_STEP        = 2     # step between frames (e.g., 1, 5, 10)
 
 # Save map arrays to HDF5 for later temperature analysis
 SAVE_MAP_TO_H5 = False   # set True to write <inputbasename>_peakmap.h5
@@ -505,7 +505,7 @@ def main():
                         if (SEC_PER_FRAME is not None and SEC_PER_FRAME > 0)
                         else f"Frame {args.frame} | ")
         ax.set_title(title_prefix + f"R²={res['r2']:.4f}", pad=6)
-        ax.set_xlabel("q (1/Å)")
+        ax.set_xlabel("q (Å⁻¹)")
         ax.set_ylabel("Intensity (a.u.)")
         ax.legend(loc="upper right", ncol=1, fontsize=10)
 
@@ -641,7 +641,7 @@ def main():
     ax.set_ylim(lo, hi)
 
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Center (q or 2θ)")
+    ax.set_ylabel("q (Å⁻¹)")
     ax.set_title("Peak centers over frames (color = normalized peak area)")
 
     if any_plotted:
@@ -653,3 +653,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
