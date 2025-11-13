@@ -16,7 +16,7 @@ except Exception:
 # ------------------------------
 HALF_WINDOW   = 0.20
 MIN_POINTS    = 8
-PEAK_HEIGHT_MIN = 6000          # admission + reporting floor (height at center)
+PEAK_HEIGHT_MIN = 2000          # admission + reporting floor (height at center)
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.0005
@@ -32,7 +32,7 @@ AIC_IMPROVE  = 1.0              # require at least this ΔAIC improvement to acc
 
 # NEW: residual-based split trigger (absolute threshold)
 # Set > 0 to enable: split if max|resid| >= RESIDUAL_SPLIT_THRESH
-RESIDUAL_SPLIT_THRESH = 15
+RESIDUAL_SPLIT_THRESH = 10
 
 SPLIT_DELTA_SIGMA_FRAC = 0.6    # child offset ≈ frac * parent_sigma (clamped by MIN_SEP)
 
@@ -653,5 +653,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
