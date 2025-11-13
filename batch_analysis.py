@@ -23,13 +23,17 @@ SIGMA_MIN_FIT = 0.0005
 SIGMA_MAX_FIT = 0.15
 
 # Asymmetric per-seed drift (relative to each seed)
-DRIFT_NEG = 0.20
-DRIFT_POS = 0.090
+DRIFT_NEG = 0.11
+DRIFT_POS = 0.020
 
 # Component geometry/acceptance
 MIN_SEP      = 0.0050           # min separation between component centers
 AIC_IMPROVE  = 1.0              # require at least this ΔAIC improvement to accept split
-SPLIT_NOISE_MULT = 20.0         # trigger split if max|resid| >= K * noise (noise = 1.4826*MAD)
+
+# NEW: residual-based split trigger (absolute threshold)
+# Set > 0 to enable: split if max|resid| >= RESIDUAL_SPLIT_THRESH
+RESIDUAL_SPLIT_THRESH = 0.0
+
 SPLIT_DELTA_SIGMA_FRAC = 0.6    # child offset ≈ frac * parent_sigma (clamped by MIN_SEP)
 
 # Plot title time scaling (0/None -> use frame index)
@@ -121,7 +125,46 @@ def nearest_seed_bounds(center_value, seeds):
 def clamp_center_param(params, name, center_value, seeds):
     lo, hi = nearest_seed_bounds(center_value, seeds)
     params[name].set(min=lo, max=hi)
-    
+
+# NEW: global min-sep enforcement on reported peaks
+def apply_min_sep_mask(centers, heights, base_mask):
+    """
+    Enforce MIN_SEP on the peaks we plan to report.
+
+    centers, heights: 1D arrays
+    base_mask: boolean mask (e.g., height >= PEAK_HEIGHT_MIN)
+    Returns: new mask with MIN_SEP enforced (drops weaker in too-close pairs).
+    """
+    centers = np.asarray(centers, float)
+    heights = np.asarray(heights, float)
+    mask = np.asarray(base_mask, bool) & np.isfinite(centers) & np.isfinite(heights)
+
+    idx = np.where(mask)[0]
+    if idx.size <= 1:
+        return mask
+
+    # sort by center
+    centers_sub = centers[idx]
+    heights_sub = heights[idx]
+    order = np.argsort(centers_sub)
+    idx_sorted = idx[order]
+
+    keep = [idx_sorted[0]]
+    for i in idx_sorted[1:]:
+        # compare to all kept peaks; if too close, keep the higher peak
+        too_close_to = [j for j in keep if abs(centers[i] - centers[j]) < MIN_SEP]
+        if not too_close_to:
+            keep.append(i)
+        else:
+            # compare to the closest offending one
+            j = min(too_close_to, key=lambda jj: abs(centers[i] - centers[jj]))
+            if heights[i] > heights[j]:
+                keep[keep.index(j)] = i  # replace weaker with stronger
+
+    newmask = np.zeros_like(mask)
+    newmask[keep] = True
+    return newmask
+
 # Model build / metrics
 # ------------------------------
 def _build_seed_model(xw, yw, seeds):
@@ -206,17 +249,20 @@ def _sum_components(xw, result):
 def _try_split_once(xw, yw, result, seed_cap, seeds):
     # respect seed cap
     n_now = 0
+    while f"g(n_now)_center" in result.params:
+        n_now += 1
+    n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
     if n_now == 0 or n_now >= seed_cap:
         return result, False
 
-    # residual-based trigger
+    # residual-based trigger (now absolute threshold)
     bkg_line, centers, sigmas, amps, heights, _, _, _ = _extract_metrics(result, xw)
     resid_vec = yw - (bkg_line + _sum_components(xw, result))
-    noise = robust_sigma(resid_vec)
     resid_max = float(np.max(np.abs(resid_vec))) if resid_vec.size else 0.0
-    if not (noise > 0 and resid_max >= SPLIT_NOISE_MULT * noise):
+
+    if RESIDUAL_SPLIT_THRESH <= 0 or resid_max < RESIDUAL_SPLIT_THRESH:
         return result, False
 
     # split tallest peak
@@ -342,8 +388,10 @@ def fit_frame(x, y, seeds, halfwidth):
     result, _ = _try_split_once(xw, yw, result, seed_cap=len(seeds), seeds=seeds)
     bkg_line, c_all, s_all, a_all, h_all, w_all, p_all, comps = _extract_metrics(result, xw)
 
-    # reporting mask
-    valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
+    # reporting mask: height floor + MIN_SEP across all reported peaks
+    base_valid = np.isfinite(h_all) & (h_all >= PEAK_HEIGHT_MIN)
+    valid = apply_min_sep_mask(c_all, h_all, base_valid)
+
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
     fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
     height_out  = h_all.copy(); height_out[~valid]  = np.nan
@@ -394,7 +442,9 @@ def style_axes(ax, light_grid=True):
 # Main (CLI)
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, optional residual-based split, seed-bounded centers).")
+    ap = argparse.ArgumentParser(
+        description="Pixel-integrated Gaussian tracker (linear bkg, height-prune, optional residual-based split, seed-bounded centers)."
+    )
     ap.add_argument("--h5", required=True, help="HDF5 with 'q' (or 'tth') and 'int'")
     ap.add_argument("--centers", required=True, help="Comma-separated initial peak centers (e.g., 2.975,3.124)")
     ap.add_argument("--frame", type=int, default=None, help="Fit a single frame index. Omit to track all frames.")
@@ -420,7 +470,7 @@ def main():
         fwhm_v    = res["fwhm"][vis]
         hfit_v    = res["height_fit"][vis]
 
-        print("PEAKS (kept >= height floor):")
+        print("PEAKS (kept >= height floor and MIN_SEP):")
         print("Idx\tCenter\t\tFWHM\t\tHeight")
         for i, (c, w, h) in enumerate(zip(centers_v, fwhm_v, hfit_v), start=1):
             print(f"{i}\t{c:.6f}\t{w:.6f}\t{h:.6f}")
@@ -471,7 +521,6 @@ def main():
         return
 
     # -------- Mapping (subset of frames with step) --------
-    # Determine frame range [start, end] inclusive
     start = int(MAP_FRAME_START)
     if start < 0:
         start = 0
@@ -530,7 +579,7 @@ def main():
         height_trk[i_row, :k]  = h[:k]
         area_trk[i_row, :k]    = a[:k]
 
-    # Optional: save map arrays to HDF5 for temperature analysis
+    # Optional: save map arrays to HDF5
     if SAVE_MAP_TO_H5:
         base_dir = os.path.dirname(os.path.abspath(args.h5))
         base_name = os.path.splitext(os.path.basename(args.h5))[0]
@@ -553,7 +602,6 @@ def main():
 
     fig, ax = plt.subplots(); style_axes(ax, light_grid=True)
 
-    # Use actual frame indices or time for x-axis
     if SEC_PER_FRAME is not None and SEC_PER_FRAME > 0:
         xvals = frames_used * float(SEC_PER_FRAME)
         xlabel = "Time (s)"
