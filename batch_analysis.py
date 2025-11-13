@@ -44,7 +44,7 @@ MAP_STEP        = 1      # step between frames (e.g., 1, 5, 10)
 
 
 SAVE_MAP_TO_H5 = True   # set True to write a peakmap HDF5
-OUTPUT_H5_PATH = r"~/Data/h5/"
+OUTPUT_H5_PATH = r"~/Data/h5"
 
 
 # Pixel-integrated Gaussian
@@ -652,3 +652,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
