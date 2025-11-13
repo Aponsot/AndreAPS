@@ -412,7 +412,7 @@ def fit_frame(x, y, seeds, halfwidth):
 # ------------------------------
 def apply_pub_style():
     plt.rcParams.update({
-        "figure.figsize": (7, 5),
+        "figure.figsize": (6, 5),
         "figure.dpi": 160,
         "savefig.dpi": 300,
         "font.size": 12,
@@ -653,4 +653,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
