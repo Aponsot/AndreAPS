@@ -30,10 +30,8 @@ DRIFT_POS = 0.020
 MIN_SEP      = 0.0020           # min separation between component centers
 AIC_IMPROVE  = 1.0              # require at least this ΔAIC improvement to accept split
 
-# NEW: residual-based split trigger (absolute threshold)
-# Set > 0 to enable: split if max|resid| >= RESIDUAL_SPLIT_THRESH
+#residual-based split trigger (absolute threshold)
 RESIDUAL_SPLIT_THRESH = 10
-
 SPLIT_DELTA_SIGMA_FRAC = 0.6    # child offset ≈ frac * parent_sigma (clamped by MIN_SEP)
 
 # Plot title time scaling (0/None -> use frame index)
@@ -41,11 +39,13 @@ SEC_PER_FRAME = 0.004
 
 # Mapping frame controls
 MAP_FRAME_START = 0      # inclusive start frame for map
-MAP_FRAME_END   = 180   # inclusive end frame; None -> last frame
-MAP_STEP        = 1     # step between frames (e.g., 1, 5, 10)
+MAP_FRAME_END   = 180    # inclusive end frame; None -> last frame
+MAP_STEP        = 1      # step between frames (e.g., 1, 5, 10)
 
-# Save map arrays to HDF5 for later temperature analysis
-SAVE_MAP_TO_H5 = true   # set True to write <inputbasename>_peakmap.h5
+
+SAVE_MAP_TO_H5 = True   # set True to write a peakmap HDF5
+OUTPUT_H5_PATH = r"~/Data/h5/"
+
 
 # Pixel-integrated Gaussian
 # ------------------------------
@@ -247,10 +247,7 @@ def _sum_components(xw, result):
 # Simplified FORCE-SPLIT (honors seed cap and min-sep)
 # ------------------------------
 def _try_split_once(xw, yw, result, seed_cap, seeds):
-    # respect seed cap
-    n_now = 0
-    while f"g(n_now)_center" in result.params:
-        n_now += 1
+    # count current peaks
     n_now = 0
     while f"g{n_now}_center" in result.params:
         n_now += 1
@@ -393,10 +390,10 @@ def fit_frame(x, y, seeds, halfwidth):
     valid = apply_min_sep_mask(c_all, h_all, base_valid)
 
     centers_out = c_all.copy(); centers_out[~valid] = np.nan
-    fwhm_out    = w_all.copy(); fwhm_out[~valid]    = np.nan
-    height_out  = h_all.copy(); height_out[~valid]  = np.nan
-    area_out    = a_all.copy(); area_out[~valid]    = np.nan
-    peakfit_out = p_all.copy(); peakfit_out[~valid] = np.nan
+    fwhm_out    = w_all.copy();  fwhm_out[~valid]  = np.nan
+    height_out  = h_all.copy();  height_out[~valid]= np.nan
+    area_out    = a_all.copy();  area_out[~valid]  = np.nan
+    peakfit_out = p_all.copy();  peakfit_out[~valid]=np.nan
 
     comp_sum = bkg_line + _sum_components(xw, result)
 
@@ -581,9 +578,11 @@ def main():
 
     # Optional: save map arrays to HDF5
     if SAVE_MAP_TO_H5:
-        base_dir = os.path.dirname(os.path.abspath(args.h5))
-        base_name = os.path.splitext(os.path.basename(args.h5))[0]
-        out_path = '~/Data/h5/'
+        out_path = os.path.abspath(os.path.expanduser(OUTPUT_H5_PATH))
+        out_dir = os.path.dirname(out_path)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+
         with h5py.File(out_path, "w") as hf:
             hf.create_dataset("frame_index", data=frames_used, compression="gzip")
             if SEC_PER_FRAME is not None and SEC_PER_FRAME > 0:
@@ -653,8 +652,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
