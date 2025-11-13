@@ -16,7 +16,7 @@ except Exception:
 # ------------------------------
 HALF_WINDOW   = 0.20
 MIN_POINTS    = 8
-PEAK_HEIGHT_MIN = 2000          # admission + reporting floor (height at center)
+PEAK_HEIGHT_MIN = 1000          # admission + reporting floor (height at center)
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.0005
@@ -653,6 +653,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
