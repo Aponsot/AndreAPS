@@ -41,11 +41,11 @@ SEC_PER_FRAME = 0.004
 
 # Mapping frame controls
 MAP_FRAME_START = 0      # inclusive start frame for map
-MAP_FRAME_END   = None   # inclusive end frame; None -> last frame
-MAP_STEP        = 2     # step between frames (e.g., 1, 5, 10)
+MAP_FRAME_END   = 180   # inclusive end frame; None -> last frame
+MAP_STEP        = 1     # step between frames (e.g., 1, 5, 10)
 
 # Save map arrays to HDF5 for later temperature analysis
-SAVE_MAP_TO_H5 = False   # set True to write <inputbasename>_peakmap.h5
+SAVE_MAP_TO_H5 = true   # set True to write <inputbasename>_peakmap.h5
 
 # Pixel-integrated Gaussian
 # ------------------------------
@@ -415,7 +415,7 @@ def apply_pub_style():
         "figure.figsize": (6, 5),
         "figure.dpi": 160,
         "savefig.dpi": 300,
-        "font.size": 12,
+        "font.size": 14,
         "axes.labelsize": 14,
         "legend.fontsize": 11,
         "legend.frameon": False,
@@ -583,7 +583,7 @@ def main():
     if SAVE_MAP_TO_H5:
         base_dir = os.path.dirname(os.path.abspath(args.h5))
         base_name = os.path.splitext(os.path.basename(args.h5))[0]
-        out_path = os.path.join(base_dir, base_name + "_peakmap.h5")
+        out_path = '~/Data/h5/'
         with h5py.File(out_path, "w") as hf:
             hf.create_dataset("frame_index", data=frames_used, compression="gzip")
             if SEC_PER_FRAME is not None and SEC_PER_FRAME > 0:
@@ -653,6 +653,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
