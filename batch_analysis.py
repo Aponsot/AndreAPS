@@ -597,7 +597,7 @@ def main():
 
     # Visualization: centers vs time/frame, color = normalized area (0–100)
     apply_pub_style()
-    plt.rcParams.update({"figure.figsize": (11.5, 4.6)})
+    plt.rcParams.update({"figure.figsize": (10, 5)})
 
     fig, ax = plt.subplots(); style_axes(ax, light_grid=True)
 
@@ -641,16 +641,17 @@ def main():
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel("q (Å⁻¹)")
-    ax.set_title("Peak centers over frames (color = normalized peak area)")
+    
 
     if any_plotted:
         cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-        cbar.set_label("Normalized Peak Area (0–100)")
+        cbar.set_label("Normalized Peak Intensity")
 
     fig.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
     main()
+
 
 
