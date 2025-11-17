@@ -16,7 +16,7 @@ except Exception:
 # ------------------------------
 HALF_WINDOW   = 0.20
 MIN_POINTS    = 8
-PEAK_HEIGHT_MIN = 1000          # admission + reporting floor (height at center)
+PEAK_HEIGHT_MIN = 6000          # admission + reporting floor (height at center)
 
 # Sigma bounds (per component)
 SIGMA_MIN_FIT = 0.0005
@@ -31,7 +31,7 @@ MIN_SEP      = 0.0020           # min separation between component centers
 AIC_IMPROVE  = 1.0              # require at least this ΔAIC improvement to accept split
 
 #residual-based split trigger (absolute threshold)
-RESIDUAL_SPLIT_THRESH = 10
+RESIDUAL_SPLIT_THRESH = 15
 SPLIT_DELTA_SIGMA_FRAC = 0.6    # child offset ≈ frac * parent_sigma (clamped by MIN_SEP)
 
 # Plot title time scaling (0/None -> use frame index)
@@ -43,7 +43,7 @@ MAP_FRAME_END   = None    # inclusive end frame; None -> last frame
 MAP_STEP        = 2      # step between frames (e.g., 1, 5, 10)
 
 
-SAVE_MAP_TO_H5 = True   # set True to write a peakmap HDF5
+SAVE_MAP_TO_H5 = False   # set True to write a peakmap HDF5
 OUTPUT_H5_PATH = r"~/Data/h5/220-melt.h5"
 
 
@@ -652,6 +652,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
