@@ -39,8 +39,8 @@ SEC_PER_FRAME = 0.004
 
 # Mapping frame controls
 MAP_FRAME_START = 0      # inclusive start frame for map
-MAP_FRAME_END   = 180    # inclusive end frame; None -> last frame
-MAP_STEP        = 1      # step between frames (e.g., 1, 5, 10)
+MAP_FRAME_END   = None    # inclusive end frame; None -> last frame
+MAP_STEP        = 2      # step between frames (e.g., 1, 5, 10)
 
 
 SAVE_MAP_TO_H5 = True   # set True to write a peakmap HDF5
@@ -652,6 +652,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
