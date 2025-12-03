@@ -92,7 +92,7 @@ def build_window(x, yfull, center, width):
 def fit_peak_single(xw, yw, seed_center):
     """
     Single Gaussian + linear baseline. 
-    Returns center (q), FWHM, AREA, HEIGHT.  # NEW: include area & height
+    Returns center (q), FWHM, AREA, HEIGHT.
     """
     if len(xw) < MIN_POINTS:
         return None
@@ -110,9 +110,8 @@ def fit_peak_single(xw, yw, seed_center):
     height0 = max(yw[peak_idx] - (bkg_slope * xw[peak_idx] + bkg_intercept), 0.5 * noise)
     span = max(xw[-1] - xw[0], 1e-9)
     sigma0 = max(span / 7.0, 1e-6)
-    amp0 = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)  # amplitude == AREA  # CHG: comment clarified
+    amp0 = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)  # amplitude == AREA
 
-    # Build model
     from lmfit.models import GaussianModel, LinearModel
     model = LinearModel(prefix="bkg_") + GaussianModel(prefix="g_")
     params = model.make_params(
@@ -130,10 +129,10 @@ def fit_peak_single(xw, yw, seed_center):
         p = result.params
         center_fit = p["g_center"].value
         sigma_fit  = p["g_sigma"].value
-        area_fit   = p["g_amplitude"].value             # NEW: AREA straight from lmfit
-        height_fit = area_fit / (sigma_fit * sqrt(2.0*np.pi)) if (np.isfinite(sigma_fit) and sigma_fit > 0) else np.nan  # NEW
+        area_fit   = p["g_amplitude"].value
+        height_fit = area_fit / (sigma_fit * sqrt(2.0*np.pi)) if (np.isfinite(sigma_fit) and sigma_fit > 0) else np.nan
         fwhm_fit   = sigma_to_fwhm(sigma_fit) if np.isfinite(sigma_fit) else np.nan
-        return {"center": center_fit, "fwhm": fwhm_fit, "area": area_fit, "height": height_fit}  # NEW
+        return {"center": center_fit, "fwhm": fwhm_fit, "area": area_fit, "height": height_fit}
     except Exception:
         return None
 
@@ -151,7 +150,7 @@ def load_q_and_I_q_only(h5_path):
 def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_progress=True):
     """
     Fit absolute peak centers per frame (in q). Compute baseline a0 from first SEED_FRAMES.
-    Returns centers (q), fwhms, a0, nframes, AREAS.  # NEW: return areas
+    Returns centers (q), fwhms, a0, nframes, AREAS.
     """
     x, I_full = load_q_and_I_q_only(h5_path)
     nframes = min(I_full.shape[0], nframes_limit)
@@ -159,7 +158,7 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
 
     centers = np.full(nframes, np.nan)
     fwhms   = np.full(nframes, np.nan)
-    areas   = np.full(nframes, np.nan)   # NEW
+    areas   = np.full(nframes, np.nan)
 
     iterator = range(nframes)
     if show_progress and tqdm is not None:
@@ -176,7 +175,7 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
         if res is not None:
             centers[frame] = res["center"]
             fwhms[frame]   = res["fwhm"]
-            areas[frame]   = res["area"]    # NEW
+            areas[frame]   = res["area"]
             seed = res["center"]
 
     # Baseline q0 and a0 from early frames
@@ -190,16 +189,20 @@ def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_prog
     G_norm = sqrt(h**2 + k**2 + l**2)
     a0 = (2.0 * pi / q0) * G_norm
 
-    return centers, fwhms, a0, nframes, areas  # NEW
+    return centers, fwhms, a0, nframes, areas
 
-# Bi-exponential model: fast + slow components
-def exp_bi(x, c, A1, tau1, A2, tau2):
-    return c + A1 * np.exp(-(x - FIT_START) / tau1) + A2 * np.exp(-(x - FIT_START) / tau2)
+# --- Single-exponential model: f(x) = c + A * exp(-alpha * (x - FIT_START)) ---
+def exp_single(x, A, alpha, c):
+    return c + A * np.exp(-alpha * (x - FIT_START))
 
 def main():
-    ap = argparse.ArgumentParser(description="Raw temperature scatter with bi-exponential decay fits and extrapolated intercept at frame 58.")
-    ap.add_argument("--h5", nargs='+', required=True, help="HDF5 files (one per dataset), must contain 'q' and 'int'")
-    ap.add_argument("--center", nargs='+', type=float, required=True, help="Initial peak center guesses (in q units, 1/Å)")
+    ap = argparse.ArgumentParser(
+        description="Raw temperature scatter with single-exponential decay fits and extrapolated intercept at MELT_FRAME."
+    )
+    ap.add_argument("--h5", nargs='+', required=True,
+                    help="HDF5 files (one per dataset), must contain 'q' and 'int'")
+    ap.add_argument("--center", nargs='+', type=float, required=True,
+                    help="Initial peak center guesses (in q units, 1/Å)")
     args = ap.parse_args()
 
     if len(args.h5) != len(args.center):
@@ -209,8 +212,8 @@ def main():
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
     fig, ax = plt.subplots(1, 1, figsize=(7, 5))
 
-    # Plot styling (do not change calculations)
-    Color = 'C6' # single hue for all datasets
+    # Plot styling
+    Color = 'C6'  # single hue for all datasets
     markers = ['o', 's', 'D', '^', 'v', 'p', 'X']  # different marker per dataset
     depths_um = [50, 100, 150]  # known depths
 
@@ -218,13 +221,13 @@ def main():
     if tqdm is not None:
         dataset_iter = tqdm(dataset_iter, desc="Datasets")
 
-    all_area_series = []  # NEW: collect for optional normalization across sets
+    all_area_series = []
 
     for i in dataset_iter:
-        centers, fwhms, a0, nframes, areas = process_dataset(  # CHG: receive areas
+        centers, fwhms, a0, nframes, areas = process_dataset(
             args.h5[i], args.center[i], nframes_limit=MAX_FRAMES, show_progress=True
         )
-        all_area_series.append(areas)  # NEW
+        all_area_series.append(areas)
 
         frames = np.arange(nframes)
         valid_centers = np.isfinite(centers) & (centers > 0)
@@ -241,16 +244,18 @@ def main():
 
         # Convert to temperature (°C), aligned to frames
         T_full_K = np.full(nframes, np.nan)
-        T_full_K[valid_centers] = T_from_delta_poly_lookup_K(delta_full[valid_centers], Tref_K=T_REF_K)
+        T_full_K[valid_centers] = T_from_delta_poly_lookup_K(
+            delta_full[valid_centers], Tref_K=T_REF_K
+        )
         T_full_C = T_full_K - 273.15
 
-        # Scatter raw temperatures (small points, alpha ~0.8), same color, different marker
+        # Scatter raw temperatures
         finite_mask = np.isfinite(T_full_C)
         depth_label = depths_um[i % len(depths_um)]
         ax.scatter(frames[finite_mask], T_full_C[finite_mask],
                    s=8, alpha=0.3, color=Color, marker=markers[i % len(markers)])
 
-        # Build fit window and fit bi-exponential decay
+        # Build fit window and fit single exponential decay
         max_frame_for_fit = min(nframes - 1, FIT_END)
         fit_mask = finite_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
         fit_idx = np.where(fit_mask)[0]
@@ -258,53 +263,53 @@ def main():
         y_fit = T_full_C[fit_idx]
 
         print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
-        if y_fit.size >= 8 and np.ptp(x_fit) > 0:
+        if y_fit.size >= 5 and np.ptp(x_fit) > 0:
             # Initial guesses
             last_n = max(3, min(10, y_fit.size))
-            c0 = float(np.nanmedian(y_fit[-last_n:]))
-            A_total = float(y_fit[0] - c0)
-            if A_total < 0:
-                A_total = abs(A_total)
-
-            A1_0 = 0.6 * A_total
-            A2_0 = 0.4 * A_total
+            c0 = float(np.nanmedian(y_fit[-last_n:]))          # baseline at long times
+            A0 = float(y_fit[0] - c0)                          # initial amplitude
+            if A0 < 0:
+                A0 = abs(A0)
 
             span = float(x_fit[-1] - x_fit[0])
-            tau1_0 = max(2.0, span / 15.0)
-            tau2_0 = max(10.0, span / 3.0)
+            # alpha ~ 1 / characteristic_frames
+            alpha0 = 1.0 / max(span / 5.0, 1.0)
 
-            c_lo = c0 - 2.0 * abs(A_total)
-            c_hi = c0 + 2.0 * abs(A_total)
-            tau1_hi = max(5.0, span / 10.0)
-            tau2_lo = max(8.0, span / 6.0)
+            # Bounds
+            c_lo = c0 - 2.0 * abs(A0)
+            c_hi = c0 + 2.0 * abs(A0)
+            A_hi = 1e6
+            alpha_lo = 1e-5
+            alpha_hi = 10.0
 
-            # Weight early points more
+            # Weight early points more (same idea as before)
             w_strength = 0.6
             sigma = 1.0 / (1.0 + w_strength * (x_fit - FIT_START))
 
             try:
                 popt, pcov = curve_fit(
-                    exp_bi, x_fit, y_fit,
-                    p0=(c0, A1_0, tau1_0, A2_0, tau2_0),
-                    bounds=([c_lo, 0.0, 1e-3, 0.0, tau2_lo],
-                            [c_hi, 1e6, tau1_hi, 1e6, 1e6]),
+                    exp_single, x_fit, y_fit,
+                    p0=(A0, alpha0, c0),
+                    bounds=([0.0, alpha_lo, c_lo],
+                            [A_hi, alpha_hi, c_hi]),
                     sigma=sigma,
                     absolute_sigma=True,
                     maxfev=10000
                 )
-                c_fit, A1_fit, tau1_fit, A2_fit, tau2_fit = popt
+                A_fit, alpha_fit, c_fit = popt
 
                 # Extrapolate from MELT_FRAME onward
                 x_line = np.arange(MELT_FRAME, nframes)
-                y_line = exp_bi(x_line, *popt)
+                y_line = exp_single(x_line, *popt)
                 line = ['-', '--', ':'][i % 3]
                 ax.plot(x_line, y_line, color=Color, linewidth=2.0, linestyle=line,
                         label=f"{depth_label} μm")
 
-                T_melt = float(exp_bi(MELT_FRAME, *popt))
-                print(f"Depth {depth_label} μm: T@{MELT_FRAME} = {T_melt:.1f} °C; τ_fast={tau1_fit:.1f}, τ_slow={tau2_fit:.1f}")
+                T_melt = float(exp_single(MELT_FRAME, *popt))
+                print(f"Depth {depth_label} μm: T@{MELT_FRAME} = {T_melt:.1f} °C; "
+                      f"A={A_fit:.1f}, alpha={alpha_fit:.4f}, c={c_fit:.1f}")
             except Exception as e:
-                print(f"DS{i}: bi-exponential curve_fit failed: {e}")
+                print(f"DS{i}: single-exponential curve_fit failed: {e}")
         else:
             print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
 
@@ -312,14 +317,17 @@ def main():
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("Frame")
     ax.set_ylabel("Temperature (°C)")
-    ax.set_title(f"Raw temperature scatter and bi-exponential decay fits (fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})")
+    ax.set_title(
+        f"Raw temperature scatter and single-exponential decay fits "
+        f"(fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})"
+    )
     ax.axvline(MELT_FRAME, color='0.5', linestyle='--', linewidth=1.0)
     ax.axvline(FIT_START, color='0.6', linestyle=':', linewidth=1.0)
     ax.legend(ncol=1, fontsize=10)
     fig.tight_layout()
     plt.show()
 
-    # --- OPTIONAL: if you want the areas in 0–100 across ALL datasets, uncomment:
+    # --- OPTIONAL: global area normalization example ---
     # all_areas = np.hstack([a[np.isfinite(a)] for a in all_area_series if a is not None])
     # if all_areas.size:
     #     global_max = np.nanmax(all_areas)
