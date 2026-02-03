@@ -5,334 +5,293 @@ import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from math import pi, sqrt
-from scipy.optimize import curve_fit
 
 try:
     from tqdm.auto import tqdm
-except ImportError:
+except Exception:
     tqdm = None
 
-# --- Tunables ---
-WINDOW = 0.50       # fitting window width (in q units)
-MIN_POINTS = 5      # minimum points in window to try a fit
-SEED_FRAMES = 30    # frames used to define baseline a0
-MAX_FRAMES = 200    # max frames processed
+# ------------------------------
+# Tunables (edit defaults here)
+# ------------------------------
+WINDOW      = 0.50   # q-window width around seed center (1/Å)
+MIN_POINTS  = 8      # min points in window for a fit
+SEED_FRAMES = 30     # frames used for baseline (q0 -> a0)
+MAX_FRAMES  = 400    # cap frames processed (set to your run length)
 
-# Frames of interest
-MELT_FRAME = 59
-FIT_START  = 60
-FIT_END    = 200
+# ------------------------------
+# Reflection: Tungsten bcc (110)
+# q_hkl = (2π/a) * sqrt(h^2+k^2+l^2)  =>  a = (2π * sqrt(..))/q
+# ------------------------------
+H, K, L = 1, 1, 0
 
-# Reflection (set to your peak)
-h, k, l = 2, 0, 0
+# ------------------------------
+# Tungsten CTE polynomial (NIST SRM 737) for linear expansivity:
+#   alpha(T) = (1/L_293) dL/dT  [1/K]
+# The certificate provides piecewise cubic polynomials for:
+#   (1/L_293)(dL/dT) * 1e6   over 80–1800 K
+# Valid: 80–1800 K
+# ------------------------------
+T_REF_K = 293.0  # reference in SRM 737
 
-# Thermal expansion polynomial (fractional units)
-# Δa/a0 = C0 + C1*T + C2*T^2 + C3*T^3
-C0 = -0.358 / 100.0
-C1 =  9.472e-4 / 100.0
-C2 =  1.031e-6 / 100.0
-C3 = -2.978e-10 / 100.0
-
-# Reference temperature (Kelvin) for anchoring (set to your baseline)
-T_REF_K = 300.0
-
-def f_poly_C(Tc):
-    """Raw polynomial (fractional) with Tc in °C."""
-    return C0 + C1*Tc + C2*(Tc**2) + C3*(Tc**3)
-
-def f_rel_K(T_K, Tref_K=T_REF_K):
-    """Fractional expansion relative to Kelvin reference."""
-    Tc     = T_K     - 273.15
-    Tc_ref = Tref_K  - 273.15
-    return f_poly_C(Tc) - f_poly_C(Tc_ref)
-
-def r_T_K(T_K, Tref_K=T_REF_K):
-    """Lattice ratio r(T) = 1 + f_rel(T). r(Tref)=1 by construction."""
-    return 1.0 + f_rel_K(T_K, Tref_K)
-
-def T_from_delta_poly_lookup_K(delta_array, Tref_K=T_REF_K, Tmin_K=250.0, Tmax_K=3000.0, npts=7501):
+def alpha_W(TK):
     """
-    Robust inversion in Kelvin:
-    Solve r(T_K) = (1 + delta), since r(Tref_K)=1.
-    Returns temperatures in Kelvin (NaN if target out of range).
+    Tungsten linear expansivity α(T) [1/K] from NIST SRM 737 (80–1800 K).
+    Piecewise fits for (α * 1e6):
+      80–160 K:  -2.383 + 8.870e-2*T - 4.4114e-4*T^2 + 8.03e-7*T^3
+      160–235 K:  0.225 + 3.982e-2*T - 1.3562e-4*T^2 + 1.667e-7*T^3
+      235–330 K:  1.736 + 2.052e-2*T - 5.3494e-5*T^2 + 5.03e-8*T^3
+      330–550 K:  3.353 + 5.816e-3*T - 8.9484e-6*T^2 + 5.26e-9*T^3
+      550–1800 K: 4.1598 + 1.4179e-3*T - 9.5104e-7*T^2 + 4.176e-10*T^3
     """
-    Tgrid = np.linspace(Tmin_K, Tmax_K, npts)
-    rgrid = r_T_K(Tgrid, Tref_K)
-
-    # enforce monotonic for interp
-    if not np.all(np.diff(rgrid) > 0):
-        idx = np.argsort(rgrid)
-        r_sorted = rgrid[idx]
-        T_sorted = Tgrid[idx]
+    T = float(TK)
+    if 80.0 <= T < 160.0:
+        alpha_micro = (-2.383
+                       + 8.870e-2*T
+                       - 4.4114e-4*T*T
+                       + 8.03e-7*T*T*T)
+    elif 160.0 <= T < 235.0:
+        alpha_micro = (0.225
+                       + 3.982e-2*T
+                       - 1.3562e-4*T*T
+                       + 1.667e-7*T*T*T)
+    elif 235.0 <= T < 330.0:
+        alpha_micro = (1.736
+                       + 2.052e-2*T
+                       - 5.3494e-5*T*T
+                       + 5.03e-8*T*T*T)
+    elif 330.0 <= T < 550.0:
+        alpha_micro = (3.353
+                       + 5.816e-3*T
+                       - 8.9484e-6*T*T
+                       + 5.26e-9*T*T*T)
+    elif 550.0 <= T <= 1800.0:
+        alpha_micro = (4.1598
+                       + 1.4179e-3*T
+                       - 9.5104e-7*T*T
+                       + 4.176e-10*T*T*T)
     else:
-        r_sorted = rgrid
-        T_sorted = Tgrid
+        return np.nan
 
-    target = 1.0 + np.asarray(delta_array, dtype=float)
-    T_out = np.full_like(target, np.nan, dtype=float)
-    m = (target >= r_sorted[0]) & (target <= r_sorted[-1])
-    T_out[m] = np.interp(target[m], r_sorted, T_sorted)
-    return T_out
+    return alpha_micro * 1e-6  # [1/K]
 
-# --- Helpers ---
+def delta_from_T(TK, Tref_K=T_REF_K, n=2000):
+    """
+    Predict fractional change relative to Tref:
+      delta = (a(T) - a(Tref))/a(Tref) ≈ ∫_{Tref}^{T} α(T') dT'
+    (Numerical trapezoid integration)
+    """
+    T = float(TK)
+    Tref = float(Tref_K)
+    if not np.isfinite(T) or not np.isfinite(Tref):
+        return np.nan
+    if T == Tref:
+        return 0.0
+
+    lo, hi = (Tref, T) if T > Tref else (T, Tref)
+    grid = np.linspace(lo, hi, int(n))
+    a = np.array([alpha_W(t) for t in grid], dtype=float)
+    if not np.all(np.isfinite(a)):
+        return np.nan
+    integ = np.trapz(a, grid)
+    return integ if T > Tref else -integ
+
+# ------------------------------
+# Peak-fit helpers
+# ------------------------------
 def robust_sigma(y):
+    y = np.asarray(y)
     med = np.median(y)
     return 1.4826 * np.median(np.abs(y - med)) + 1e-12
 
-def sigma_to_fwhm(sigma):
-    return 2.354820045 * sigma
-
-def build_window(x, yfull, center, width):
-    half = width / 2.0
+def build_window(x, y, center, width):
+    half = 0.5 * width
     m = (x >= center - half) & (x <= center + half)
-    xw, yw = x[m], yfull[m]
-    mfin = np.isfinite(xw) & np.isfinite(yw)
-    return xw[mfin], yw[mfin]
+    xw, yw = x[m], y[m]
+    m2 = np.isfinite(xw) & np.isfinite(yw)
+    return xw[m2], yw[m2]
 
-def fit_peak_single(xw, yw, seed_center):
+def fit_peak_lmfit(xw, yw, seed_center, model="pvoigt"):
     """
-    Single Gaussian + linear baseline. 
-    Returns center (q), FWHM, AREA, HEIGHT.
+    Fit: linear background + (Gaussian or Pseudo-Voigt)
+    Returns dict with center, fwhm_proxy, area
     """
     if len(xw) < MIN_POINTS:
         return None
 
+    # background seed
     try:
         bkg_slope, bkg_intercept = np.polyfit(xw, yw, 1)
     except Exception:
-        bkg_slope, bkg_intercept = 0.0, np.median(yw)
+        bkg_slope, bkg_intercept = 0.0, float(np.median(yw))
 
-    y_bkg = (bkg_slope * xw + bkg_intercept)
+    y_bkg = bkg_slope * xw + bkg_intercept
     y_detr = yw - y_bkg
     noise = robust_sigma(y_detr)
 
-    peak_idx = np.abs(xw - seed_center).argmin()
-    height0 = max(yw[peak_idx] - (bkg_slope * xw[peak_idx] + bkg_intercept), 0.5 * noise)
-    span = max(xw[-1] - xw[0], 1e-9)
-    sigma0 = max(span / 7.0, 1e-6)
-    amp0 = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)  # amplitude == AREA
+    i0 = int(np.abs(xw - seed_center).argmin())
+    x0 = float(xw[i0])
+    height0 = max(float(yw[i0] - (bkg_slope * x0 + bkg_intercept)), 0.5 * noise)
 
-    from lmfit.models import GaussianModel, LinearModel
-    model = LinearModel(prefix="bkg_") + GaussianModel(prefix="g_")
-    params = model.make_params(
-        bkg_slope=bkg_slope,
-        bkg_intercept=bkg_intercept,
-        g_center=xw[peak_idx],
-        g_sigma=sigma0,
-        g_amplitude=amp0,   # this is AREA in lmfit's GaussianModel
-    )
-    params["g_sigma"].set(min=1e-6, max=max(span, 1.0))
-    params["g_amplitude"].set(min=0.0)
+    span = max(float(xw[-1] - xw[0]), 1e-9)
+    sigma0 = max(span / 7.0, 1e-6)
+    area0  = max(height0 * sigma0 * 2.5066, noise * sigma0 * 2.5066)
+
+    from lmfit.models import LinearModel, GaussianModel, PseudoVoigtModel
+
+    bkg = LinearModel(prefix="bkg_")
+    if model == "gauss":
+        peak = GaussianModel(prefix="p_")
+        mdl = bkg + peak
+        params = mdl.make_params(
+            bkg_slope=bkg_slope,
+            bkg_intercept=bkg_intercept,
+            p_center=x0,
+            p_sigma=sigma0,
+            p_amplitude=area0,  # area in lmfit GaussianModel
+        )
+        params["p_sigma"].set(min=1e-6, max=max(span, 1.0))
+        params["p_amplitude"].set(min=0.0)
+
+    else:
+        peak = PseudoVoigtModel(prefix="p_")
+        mdl = bkg + peak
+        params = mdl.make_params(
+            bkg_slope=bkg_slope,
+            bkg_intercept=bkg_intercept,
+            p_center=x0,
+            p_sigma=sigma0,
+            p_amplitude=area0,   # area in lmfit PseudoVoigtModel
+            p_fraction=0.5,      # 0=Gaussian, 1=Lorentzian
+        )
+        params["p_sigma"].set(min=1e-6, max=max(span, 1.0))
+        params["p_amplitude"].set(min=0.0)
+        params["p_fraction"].set(min=0.0, max=1.0)
 
     try:
-        result = model.fit(yw, params, x=xw, nan_policy="omit")
-        p = result.params
-        center_fit = p["g_center"].value
-        sigma_fit  = p["g_sigma"].value
-        area_fit   = p["g_amplitude"].value
-        height_fit = area_fit / (sigma_fit * sqrt(2.0*np.pi)) if (np.isfinite(sigma_fit) and sigma_fit > 0) else np.nan
-        fwhm_fit   = sigma_to_fwhm(sigma_fit) if np.isfinite(sigma_fit) else np.nan
-        return {"center": center_fit, "fwhm": fwhm_fit, "area": area_fit, "height": height_fit}
+        out = mdl.fit(yw, params, x=xw, nan_policy="omit")
+        p = out.params
+        center = float(p["p_center"].value)
+        sigma  = float(p["p_sigma"].value)
+        area   = float(p["p_amplitude"].value)
+
+        # simple width proxy (good enough for debugging / QC)
+        fwhm_proxy = 2.354820045 * sigma
+
+        return {"center": center, "fwhm": fwhm_proxy, "area": area}
     except Exception:
         return None
 
-def load_q_and_I_q_only(h5_path):
-    """
-    Load q and intensity from HDF5. Requires 'q' (1/Å) to be present.
-    """
+# ------------------------------
+# I/O + processing
+# ------------------------------
+def load_q_int(h5_path):
     with h5py.File(h5_path, "r") as f:
-        if "q" not in f:
-            raise ValueError(f"{h5_path} does not contain 'q'. This script expects q data already.")
-        x = f["q"][:]
-        I_full = f["int"][:]
-    return x, I_full
+        if "q" not in f or "int" not in f:
+            raise ValueError(f"{h5_path} must contain datasets 'q' and 'int'")
+        q = f["q"][:]
+        I = f["int"][:]
+    return q, I
 
-def process_dataset(h5_path, initial_center, nframes_limit=MAX_FRAMES, show_progress=True):
-    """
-    Fit absolute peak centers per frame (in q). Compute baseline a0 from first SEED_FRAMES.
-    Returns centers (q), fwhms, a0, nframes, AREAS.
-    """
-    x, I_full = load_q_and_I_q_only(h5_path)
-    nframes = min(I_full.shape[0], nframes_limit)
+def process_dataset(h5_path, initial_center, model="pvoigt",
+                    nframes_limit=MAX_FRAMES, show_progress=True):
+    q, I_full = load_q_int(h5_path)
+    nframes = min(I_full.shape[0], int(nframes_limit))
     I = I_full[:nframes]
 
     centers = np.full(nframes, np.nan)
-    fwhms   = np.full(nframes, np.nan)
     areas   = np.full(nframes, np.nan)
 
-    iterator = range(nframes)
+    it = range(nframes)
     if show_progress and tqdm is not None:
-        iterator = tqdm(iterator, desc=f"{h5_path}: fit", leave=False)
+        it = tqdm(it, desc=os.path.basename(h5_path), leave=False)
 
-    seed = initial_center
-    for frame in iterator:
-        xw, yw = build_window(x, I[frame], seed, WINDOW)
-        res = fit_peak_single(xw, yw, seed)
+    seed = float(initial_center)
+    for fr in it:
+        xw, yw = build_window(q, I[fr], seed, WINDOW)
+        res = fit_peak_lmfit(xw, yw, seed, model=model)
         if res is None:
-            # fallback: widen window once
-            xw2, yw2 = build_window(x, I[frame], seed, 2 * WINDOW)
-            res = fit_peak_single(xw2, yw2, seed)
+            xw2, yw2 = build_window(q, I[fr], seed, 2 * WINDOW)
+            res = fit_peak_lmfit(xw2, yw2, seed, model=model)
+
         if res is not None:
-            centers[frame] = res["center"]
-            fwhms[frame]   = res["fwhm"]
-            areas[frame]   = res["area"]
+            centers[fr] = res["center"]
+            areas[fr]   = res["area"]
             seed = res["center"]
 
-    # Baseline q0 and a0 from early frames
-    valid = np.isfinite(centers)
-    idx_valid = np.where(valid)[0]
-    if idx_valid.size == 0:
-        raise RuntimeError("No valid peak centers found.")
-    early_idx = idx_valid[idx_valid < min(SEED_FRAMES, nframes)]
-    q0 = np.nanmedian(centers[early_idx]) if early_idx.size > 0 else np.nanmedian(centers[valid])
+    valid = np.isfinite(centers) & (centers > 0)
+    if not np.any(valid):
+        raise RuntimeError(f"{h5_path}: no valid peak centers found.")
 
-    G_norm = sqrt(h**2 + k**2 + l**2)
-    a0 = (2.0 * pi / q0) * G_norm
+    idx = np.where(valid)[0]
+    early = idx[idx < min(SEED_FRAMES, nframes)]
+    q0 = float(np.nanmedian(centers[early])) if early.size else float(np.nanmedian(centers[valid]))
 
-    return centers, fwhms, a0, nframes, areas
+    Gnorm = sqrt(H*H + K*K + L*L)
+    a0 = (2.0 * pi * Gnorm) / q0
 
-# --- Single-exponential model: f(x) = c + A * exp(-alpha * (x - FIT_START)) ---
-def exp_single(x, A, alpha, c):
-    return c + A * np.exp(-alpha * (x - FIT_START))
+    a = np.full(nframes, np.nan)
+    a[valid] = (2.0 * pi * Gnorm) / centers[valid]
+    delta = (a - a0) / a0
 
+    return centers, areas, delta, q0, a0, nframes
+
+# ------------------------------
+# Main
+# ------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Raw temperature scatter with single-exponential decay fits and extrapolated intercept at MELT_FRAME."
+        description="Track W(110) peak center per frame and plot relative lattice shift (Δa/a0)."
     )
-    ap.add_argument("--h5", nargs='+', required=True,
-                    help="HDF5 files (one per dataset), must contain 'q' and 'int'")
-    ap.add_argument("--center", nargs='+', type=float, required=True,
-                    help="Initial peak center guesses (in q units, 1/Å)")
+    ap.add_argument("--h5", nargs="+", required=True,
+                    help="HDF5 files containing 'q' and 'int'")
+    ap.add_argument("--center", nargs="+", type=float, required=True,
+                    help="Initial peak center guesses (q, 1/Å), one per dataset (try ~2.8 for W110)")
+    ap.add_argument("--model", choices=["gauss", "pvoigt"], default="pvoigt",
+                    help="Peak model: gauss or pvoigt (pseudo-Voigt). Default: pvoigt")
+    ap.add_argument("--max_frames", type=int, default=MAX_FRAMES)
+    ap.add_argument("--window", type=float, default=WINDOW)
+    ap.add_argument("--seed_frames", type=int, default=SEED_FRAMES)
     args = ap.parse_args()
 
     if len(args.h5) != len(args.center):
-        raise ValueError("Number of --h5 files must match number of --center guesses.")
+        raise ValueError("Number of --h5 files must match number of --center values.")
 
-    # Plotting config
+    global WINDOW, SEED_FRAMES
+    WINDOW = float(args.window)
+    SEED_FRAMES = int(args.seed_frames)
+
     plt.rcParams.update({"figure.dpi": 160, "savefig.dpi": 300, "font.size": 12})
-    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 5))
 
-    # Plot styling
-    Color = 'C6'  # single hue for all datasets
-    markers = ['o', 's', 'D', '^', 'v', 'p', 'X']  # different marker per dataset
-    depths_um = [50, 100, 150]  # known depths
+    markers = ['o', 's', 'D', '^', 'v', 'p', 'X', '*', '<', '>']
+    lines   = ['-', '--', ':', '-.']
 
-    dataset_iter = range(len(args.h5))
-    if tqdm is not None:
-        dataset_iter = tqdm(dataset_iter, desc="Datasets")
-
-    all_area_series = []
-
-    for i in dataset_iter:
-        centers, fwhms, a0, nframes, areas = process_dataset(
-            args.h5[i], args.center[i], nframes_limit=MAX_FRAMES, show_progress=True
+    for i, (h5_path, c0) in enumerate(zip(args.h5, args.center)):
+        centers, areas, delta, q0, a0, nframes = process_dataset(
+            h5_path, c0, model=args.model, nframes_limit=args.max_frames, show_progress=True
         )
-        all_area_series.append(areas)
 
         frames = np.arange(nframes)
-        valid_centers = np.isfinite(centers) & (centers > 0)
+        m = np.isfinite(delta)
+        label = os.path.splitext(os.path.basename(h5_path))[0]
 
-        if not np.any(valid_centers):
-            print(f"DS{i}: No valid centers; skipping.")
-            continue
+        ax.plot(frames[m], delta[m],
+                linestyle=lines[i % len(lines)],
+                marker=markers[i % len(markers)],
+                markersize=3,
+                linewidth=1.5,
+                label=label)
 
-        # Compute lattice parameter and fractional delta (full-length)
-        G_norm = sqrt(h**2 + k**2 + l**2)
-        a_full = np.full(nframes, np.nan)
-        a_full[valid_centers] = (2.0 * pi / centers[valid_centers]) * G_norm
-        delta_full = (a_full - a0) / a0
+        print(f"[{i}] {label}: model={args.model}, q0={q0:.6f} 1/Å, a0={a0:.6f} Å, valid={m.sum()}/{nframes}")
 
-        # Convert to temperature (°C), aligned to frames
-        T_full_K = np.full(nframes, np.nan)
-        T_full_K[valid_centers] = T_from_delta_poly_lookup_K(
-            delta_full[valid_centers], Tref_K=T_REF_K
-        )
-        T_full_C = T_full_K - 273.15
-
-        # Scatter raw temperatures
-        finite_mask = np.isfinite(T_full_C)
-        depth_label = depths_um[i % len(depths_um)]
-        ax.scatter(frames[finite_mask], T_full_C[finite_mask],
-                   s=8, alpha=0.3, color=Color, marker=markers[i % len(markers)])
-
-        # Build fit window and fit single exponential decay
-        max_frame_for_fit = min(nframes - 1, FIT_END)
-        fit_mask = finite_mask & (frames >= FIT_START) & (frames <= max_frame_for_fit)
-        fit_idx = np.where(fit_mask)[0]
-        x_fit = frames[fit_idx]
-        y_fit = T_full_C[fit_idx]
-
-        print(f"DS{i}: fit window [{FIT_START}..{max_frame_for_fit}], finite points = {y_fit.size}")
-        if y_fit.size >= 5 and np.ptp(x_fit) > 0:
-            # Initial guesses
-            last_n = max(3, min(10, y_fit.size))
-            c0 = float(np.nanmedian(y_fit[-last_n:]))          # baseline at long times
-            A0 = float(y_fit[0] - c0)                          # initial amplitude
-            if A0 < 0:
-                A0 = abs(A0)
-
-            span = float(x_fit[-1] - x_fit[0])
-            # alpha ~ 1 / characteristic_frames
-            alpha0 = 1.0 / max(span / 5.0, 1.0)
-
-            # Bounds
-            c_lo = c0 - 2.0 * abs(A0)
-            c_hi = c0 + 2.0 * abs(A0)
-            A_hi = 1e6
-            alpha_lo = 1e-5
-            alpha_hi = 10.0
-
-            # Weight early points more (same idea as before)
-            w_strength = 0.6
-            sigma = 1.0 / (1.0 + w_strength * (x_fit - FIT_START))
-
-            try:
-                popt, pcov = curve_fit(
-                    exp_single, x_fit, y_fit,
-                    p0=(A0, alpha0, c0),
-                    bounds=([0.0, alpha_lo, c_lo],
-                            [A_hi, alpha_hi, c_hi]),
-                    sigma=sigma,
-                    absolute_sigma=True,
-                    maxfev=10000
-                )
-                A_fit, alpha_fit, c_fit = popt
-
-                # Extrapolate from MELT_FRAME onward
-                x_line = np.arange(MELT_FRAME, nframes)
-                y_line = exp_single(x_line, *popt)
-                line = ['-', '--', ':'][i % 3]
-                ax.plot(x_line, y_line, color=Color, linewidth=2.0, linestyle=line,
-                        label=f"{depth_label} μm")
-
-                T_melt = float(exp_single(MELT_FRAME, *popt))
-                print(f"Depth {depth_label} μm: T@{MELT_FRAME} = {T_melt:.1f} °C; "
-                      f"A={A_fit:.1f}, alpha={alpha_fit:.4f}, c={c_fit:.1f}")
-            except Exception as e:
-                print(f"DS{i}: single-exponential curve_fit failed: {e}")
-        else:
-            print(f"DS{i}: Not enough finite points to fit in [{FIT_START}..{max_frame_for_fit}].")
-
-    # Decorate single plot
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("Frame")
-    ax.set_ylabel("Temperature (°C)")
-    ax.set_title(
-        f"Raw temperature scatter and single-exponential decay fits "
-        f"(fit window {FIT_START}–{FIT_END}, intercept at {MELT_FRAME})"
-    )
-    ax.axvline(MELT_FRAME, color='0.5', linestyle='--', linewidth=1.0)
-    ax.axvline(FIT_START, color='0.6', linestyle=':', linewidth=1.0)
-    ax.legend(ncol=1, fontsize=10)
+    ax.set_ylabel("Relative lattice shift Δa/a₀")
+    ax.set_title(f"W(110) peak tracking ({args.model}) | window={WINDOW} | baseline frames={SEED_FRAMES}")
+    ax.legend(fontsize=9, ncol=1)
     fig.tight_layout()
     plt.show()
-
-    # --- OPTIONAL: global area normalization example ---
-    # all_areas = np.hstack([a[np.isfinite(a)] for a in all_area_series if a is not None])
-    # if all_areas.size:
-    #     global_max = np.nanmax(all_areas)
-    #     norm_series = [ (100.0 * a / global_max) for a in all_area_series ]
-    #     # do whatever you’d like with norm_series[...]
 
 if __name__ == "__main__":
     main()
