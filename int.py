@@ -5,7 +5,6 @@ from typing import Tuple, List, Optional
 
 import numpy as np
 import h5py
-import tifffile as tiff
 import yaml
 from scipy.ndimage import median_filter
 import concurrent.futures
@@ -41,26 +40,39 @@ DEFAULT_OUTPUT_DIR = "/home/beams/PONSOT/Data/h5"
 # Preload chunk factor: frames per worker per chunk when preload="chunk"
 DEFAULT_PRELOAD_FACTOR = 2
 
+# Where the raw 2D image lives in each per-frame h5
+H5_IMAGE_DATASET = "exchange/data"
+
 
 def calculate_wavelength(energy_kev: float) -> float:
     wavelength_cm = (PLANCK_CONSTANT * SPEED_OF_LIGHT) / energy_kev
     return wavelength_cm * CM_TO_ANGSTROM
 
 
-def load_tiff_files(tiff_folder: str) -> Tuple[List[str], str]:
-    tiff_files = sorted([
-        f for f in os.listdir(tiff_folder)
-        if f.lower().endswith(('.tiff', '.tif'))
+def load_h5_frame_files(h5_folder: str) -> Tuple[List[str], str]:
+    h5_files = sorted([
+        f for f in os.listdir(h5_folder)
+        if f.lower().endswith(('.h5', '.hdf5'))
     ])
-    if not tiff_files:
-        raise ValueError(f"No TIFF files found in {tiff_folder}")
-    experiment_name = os.path.commonprefix(tiff_files).rstrip('_-') or "experiment"
-    return tiff_files, experiment_name
+    if not h5_files:
+        raise ValueError(f"No H5/HDF5 files found in {h5_folder}")
+
+    # Similar behavior to the old TIFF prefix logic
+    experiment_name = os.path.commonprefix(h5_files).rstrip('_-.') or "experiment"
+    return h5_files, experiment_name
 
 
 def tth_to_q(tth_degrees: np.ndarray, wavelength_angstrom: float) -> np.ndarray:
     theta_radians = np.radians(tth_degrees / 2)
     return (4 * np.pi * np.sin(theta_radians)) / wavelength_angstrom
+
+
+def read_frame_image_from_h5(path: str, dataset_path: str = H5_IMAGE_DATASET) -> np.ndarray:
+    with h5py.File(path, "r") as f:
+        if dataset_path not in f:
+            raise KeyError(f"Dataset '{dataset_path}' not found in file: {path}")
+        img = f[dataset_path][...]
+    return img
 
 
 def process_and_write_from_image(idx: int,
@@ -79,7 +91,6 @@ def process_and_write_from_image(idx: int,
 
     # Background subtraction (median filter allocates)
     background = median_filter(image, size=MEDIAN_FILTER_SIZE)
-    # In-place subtract; free background
     np.subtract(image, background, out=image)
     background = None
     image[mask] = 0.0
@@ -113,19 +124,20 @@ def process_and_write_from_path(idx: int,
                                 pv: PolarView,
                                 det_keys: List[str],
                                 d_int,
-                                writer_lock: threading.Lock) -> None:
-    # Read TIFF
-    img = tiff.imread(path)
+                                writer_lock: threading.Lock,
+                                dataset_path: str = H5_IMAGE_DATASET) -> None:
+    img = read_frame_image_from_h5(path, dataset_path=dataset_path)
     process_and_write_from_image(idx, img, pv, det_keys, d_int, writer_lock)
 
 
-def integrate_em(tiff_folder: str,
+def integrate_em(h5_folder: str,
                  instr_file: str,
                  output_dir: str = DEFAULT_OUTPUT_DIR,
                  plot: bool = False,
                  max_workers: Optional[int] = None,
                  preload: str = "none",
-                 preload_factor: int = DEFAULT_PRELOAD_FACTOR) -> str:
+                 preload_factor: int = DEFAULT_PRELOAD_FACTOR,
+                 dataset_path: str = H5_IMAGE_DATASET) -> str:
 
     print("=" * 70)
     print("POLAR INTEGRATION WORKFLOW")
@@ -139,9 +151,10 @@ def integrate_em(tiff_folder: str,
     instr = instrument.HEDMInstrument(instr_cfg)
     det_keys = list(instr.detectors.keys())
 
-    tiff_files, experiment_name = load_tiff_files(tiff_folder)
-    nframes = len(tiff_files)
+    h5_files, experiment_name = load_h5_frame_files(h5_folder)
+    nframes = len(h5_files)
     print(f"Found {nframes} frames | Experiment: {experiment_name}")
+    print(f"Reading per-frame images from dataset: '{dataset_path}'")
 
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"{experiment_name}.h5")
@@ -181,6 +194,7 @@ def integrate_em(tiff_folder: str,
         h5_file.attrs["nframes"] = nframes
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
+        h5_file.attrs["input_frame_dataset"] = dataset_path
 
         # Concurrency
         if max_workers is None:
@@ -197,13 +211,15 @@ def integrate_em(tiff_folder: str,
             print(f"Unknown preload mode '{preload}', defaulting to 'none'")
             preload = "none"
 
+        paths = [os.path.join(h5_folder, f) for f in h5_files]
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             if preload == "all":
                 # Load all images up front (fastest; requires large RAM)
                 print("Preloading all frames into memory...")
                 images = []
-                for i, fname in enumerate(tiff_files):
-                    img = tiff.imread(os.path.join(tiff_folder, fname))
+                for i, p in enumerate(paths):
+                    img = read_frame_image_from_h5(p, dataset_path=dataset_path)
                     images.append(img)
                 print("Submitting all tasks...")
                 futures = [
@@ -219,7 +235,6 @@ def integrate_em(tiff_folder: str,
                         elapsed = time.time() - processing_start
                         rate = completed / max(elapsed, 1e-6)
                         print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
-                # Free preloaded images
                 del images
                 gc.collect()
 
@@ -231,7 +246,7 @@ def integrate_em(tiff_folder: str,
                     end = min(start + chunk_size, nframes)
                     preload_buf = []
                     for i in range(start, end):
-                        img = tiff.imread(os.path.join(tiff_folder, tiff_files[i]))
+                        img = read_frame_image_from_h5(paths[i], dataset_path=dataset_path)
                         preload_buf.append((i, img))
                     futures = [
                         executor.submit(
@@ -249,22 +264,23 @@ def integrate_em(tiff_folder: str,
                     gc.collect()
 
             else:
-                # No preloading: each worker reads its own TIFF (simplest; lowest RAM)
-                paths = [os.path.join(tiff_folder, f) for f in tiff_files]
-                # Keep at most max_workers tasks in-flight (no big backlog)
+                # No preloading: each worker reads its own H5 (simplest; lowest RAM)
                 next_i = 0
                 in_flight = {}
-                # Pre-submit up to max_workers
                 initial = min(max_workers, nframes)
                 for _ in range(initial):
                     fut = executor.submit(
-                        process_and_write_from_path, next_i, paths[next_i], pv, det_keys, d_int, writer_lock
+                        process_and_write_from_path,
+                        next_i, paths[next_i], pv, det_keys, d_int, writer_lock, dataset_path
                     )
                     in_flight[fut] = next_i
                     next_i += 1
 
                 while in_flight:
-                    done, _ = concurrent.futures.wait(in_flight.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                    done, _ = concurrent.futures.wait(
+                        in_flight.keys(),
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
                     for f in done:
                         in_flight.pop(f)
                         f.result()
@@ -273,10 +289,10 @@ def integrate_em(tiff_folder: str,
                             elapsed = time.time() - processing_start
                             rate = completed / max(elapsed, 1e-6)
                             print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
-                        # Submit next task
                         if next_i < nframes:
                             nfut = executor.submit(
-                                process_and_write_from_path, next_i, paths[next_i], pv, det_keys, d_int, writer_lock
+                                process_and_write_from_path,
+                                next_i, paths[next_i], pv, det_keys, d_int, writer_lock, dataset_path
                             )
                             in_flight[nfut] = next_i
                             next_i += 1
@@ -289,9 +305,13 @@ def integrate_em(tiff_folder: str,
             q_values = h5_file["q"][...]
             time_axis = h5_file["time"][...]
         fig, ax = plt.subplots(figsize=(10, 6))
-        im = ax.imshow(intensity_stack, aspect='auto',
-                       extent=[q_values.min(), q_values.max(), time_axis.min(),time_axis.max()],
-                       origin='lower', cmap='plasma')
+        im = ax.imshow(
+            intensity_stack,
+            aspect='auto',
+            extent=[q_values.min(), q_values.max(), time_axis.min(), time_axis.max()],
+            origin='lower',
+            cmap='plasma'
+        )
         plt.colorbar(im, ax=ax, label='Intensity')
         ax.set_xlabel('q (Å⁻¹)')
         ax.set_ylabel('Time (s)')
@@ -303,8 +323,10 @@ def integrate_em(tiff_folder: str,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Polar integration of diffraction TIFF images")
-    parser.add_argument("tiff_folder", help="TIFF folder path")
+    parser = argparse.ArgumentParser(
+        description="Polar integration of diffraction frames stored as per-frame HDF5 files"
+    )
+    parser.add_argument("h5_folder", help="Folder containing per-frame .h5/.hdf5 files")
     parser.add_argument("--instr_file", required=True, help="Instrument YAML file")
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help="Output directory")
     parser.add_argument("--plot", action="store_true", help="Show plot")
@@ -313,9 +335,17 @@ if __name__ == "__main__":
                         help="Preloading mode: none (workers read), chunk (small batches), all (load all frames)")
     parser.add_argument("--preload_factor", type=int, default=DEFAULT_PRELOAD_FACTOR,
                         help="Frames per worker per chunk when preload='chunk'")
+    parser.add_argument("--dataset_path", default=H5_IMAGE_DATASET,
+                        help="Dataset path inside each per-frame H5 (default: exchange/data)")
     args = parser.parse_args()
 
-    integrate_em(args.tiff_folder, args.instr_file, args.output_dir, args.plot,
-                 args.max_workers, args.preload, args.preload_factor)
-
-
+    integrate_em(
+        args.h5_folder,
+        args.instr_file,
+        args.output_dir,
+        args.plot,
+        args.max_workers,
+        args.preload,
+        args.preload_factor,
+        args.dataset_path
+    )
