@@ -40,7 +40,7 @@ DEFAULT_OUTPUT_DIR = "/home/beams/PONSOT/Data/h5"
 # Preload chunk factor: frames per worker per chunk when preload="chunk"
 DEFAULT_PRELOAD_FACTOR = 2
 
-# Where the raw 2D image lives in each per-frame h5
+# Where the raw 2D image(s) lives in each per-frame h5
 H5_IMAGE_DATASET = "exchange/data"
 
 
@@ -57,7 +57,6 @@ def load_h5_frame_files(h5_folder: str) -> Tuple[List[str], str]:
     if not h5_files:
         raise ValueError(f"No H5/HDF5 files found in {h5_folder}")
 
-    # Similar behavior to the old TIFF prefix logic
     experiment_name = os.path.commonprefix(h5_files).rstrip('_-.') or "experiment"
     return h5_files, experiment_name
 
@@ -89,7 +88,7 @@ def process_and_write_from_image(idx: int,
     for val in BACKGROUND_VALUES:
         mask |= (np.abs(image - val) <= BACKGROUND_TOLERANCE)
 
-    # Background subtraction (median filter allocates)
+    # Background subtraction
     background = median_filter(image, size=MEDIAN_FILTER_SIZE)
     np.subtract(image, background, out=image)
     background = None
@@ -100,7 +99,7 @@ def process_and_write_from_image(idx: int,
     image[idx_low] = 0.0
     np.multiply(image, INFLATE_FACTOR, out=image, where=image > 0)
 
-    # Polar warp
+    # Polar warp (same image for all detectors)
     local_imsd = {det_key: image for det_key in det_keys}
     polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
 
@@ -119,6 +118,60 @@ def process_and_write_from_image(idx: int,
     gc.collect()
 
 
+def process_and_write_from_multidet_images(idx: int,
+                                          images_3d: np.ndarray,
+                                          pv: PolarView,
+                                          det_keys: List[str],
+                                          d_int,
+                                          writer_lock: threading.Lock) -> None:
+    """
+    images_3d: shape (n_det, ny, nx) where n_det == len(det_keys)
+    Process each detector panel independently, then warp+integrate.
+    """
+    if images_3d.ndim != 3:
+        raise ValueError(f"Expected 3D array (n_det, ny, nx), got shape {images_3d.shape}")
+
+    if images_3d.shape[0] != len(det_keys):
+        raise ValueError(
+            f"First dimension of image stack ({images_3d.shape[0]}) "
+            f"does not match number of detectors ({len(det_keys)}). "
+            f"Image shape={images_3d.shape}, det_keys={det_keys}"
+        )
+
+    local_imsd = {}
+
+    for det_i, det_key in enumerate(det_keys):
+        image = images_3d[det_i].astype(np.float32, copy=False)
+
+        mask = (image == SATURATION_VALUE) | (image <= 0)
+        for val in BACKGROUND_VALUES:
+            mask |= (np.abs(image - val) <= BACKGROUND_TOLERANCE)
+
+        background = median_filter(image, size=MEDIAN_FILTER_SIZE)
+        np.subtract(image, background, out=image)
+        background = None
+        image[mask] = 0.0
+
+        idx_low = image <= INTENSITY_THRESHOLD
+        image[idx_low] = 0.0
+        np.multiply(image, INFLATE_FACTOR, out=image, where=image > 0)
+
+        local_imsd[det_key] = image
+
+    polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
+
+    if np.ma.isMaskedArray(polar_image):
+        integrated_intensity = np.array(np.ma.average(polar_image, axis=0), dtype=np.float32)
+    else:
+        integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
+
+    with writer_lock:
+        d_int[idx, :] = integrated_intensity
+
+    del local_imsd, polar_image, integrated_intensity
+    gc.collect()
+
+
 def process_and_write_from_path(idx: int,
                                 path: str,
                                 pv: PolarView,
@@ -127,7 +180,20 @@ def process_and_write_from_path(idx: int,
                                 writer_lock: threading.Lock,
                                 dataset_path: str = H5_IMAGE_DATASET) -> None:
     img = read_frame_image_from_h5(path, dataset_path=dataset_path)
-    process_and_write_from_image(idx, img, pv, det_keys, d_int, writer_lock)
+
+    # Common cases:
+    # - 2D (ny, nx): single assembled image
+    # - 3D (n_det, ny, nx): per-detector panels (e.g., 11 panels)
+    # - 3D (1, ny, nx): single image stored with leading singleton dim
+    if img.ndim == 3 and img.shape[0] == 1:
+        img = img[0]
+
+    if img.ndim == 2:
+        process_and_write_from_image(idx, img, pv, det_keys, d_int, writer_lock)
+    elif img.ndim == 3:
+        process_and_write_from_multidet_images(idx, img, pv, det_keys, d_int, writer_lock)
+    else:
+        raise ValueError(f"Unsupported image ndim={img.ndim} for file {path} with shape {img.shape}")
 
 
 def integrate_em(h5_folder: str,
@@ -215,19 +281,28 @@ def integrate_em(h5_folder: str,
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             if preload == "all":
-                # Load all images up front (fastest; requires large RAM)
                 print("Preloading all frames into memory...")
                 images = []
-                for i, p in enumerate(paths):
+                for p in paths:
                     img = read_frame_image_from_h5(p, dataset_path=dataset_path)
+                    if img.ndim == 3 and img.shape[0] == 1:
+                        img = img[0]
                     images.append(img)
+
                 print("Submitting all tasks...")
-                futures = [
-                    executor.submit(
-                        process_and_write_from_image, i, images[i], pv, det_keys, d_int, writer_lock
-                    )
-                    for i in range(nframes)
-                ]
+                futures = []
+                for i in range(nframes):
+                    if images[i].ndim == 2:
+                        futures.append(executor.submit(
+                            process_and_write_from_image, i, images[i], pv, det_keys, d_int, writer_lock
+                        ))
+                    elif images[i].ndim == 3:
+                        futures.append(executor.submit(
+                            process_and_write_from_multidet_images, i, images[i], pv, det_keys, d_int, writer_lock
+                        ))
+                    else:
+                        raise ValueError(f"Unsupported preloaded image ndim={images[i].ndim} shape={images[i].shape}")
+
                 for f in concurrent.futures.as_completed(futures):
                     f.result()
                     completed += 1
@@ -235,11 +310,11 @@ def integrate_em(h5_folder: str,
                         elapsed = time.time() - processing_start
                         rate = completed / max(elapsed, 1e-6)
                         print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
+
                 del images
                 gc.collect()
 
             elif preload == "chunk":
-                # Preload limited-size chunks for good I/O locality while capping RAM
                 chunk_size = max(1, preload_factor * max_workers)
                 print(f"Chunked preloading with chunk_size={chunk_size} (factor={preload_factor})")
                 for start in range(0, nframes, chunk_size):
@@ -247,12 +322,23 @@ def integrate_em(h5_folder: str,
                     preload_buf = []
                     for i in range(start, end):
                         img = read_frame_image_from_h5(paths[i], dataset_path=dataset_path)
+                        if img.ndim == 3 and img.shape[0] == 1:
+                            img = img[0]
                         preload_buf.append((i, img))
-                    futures = [
-                        executor.submit(
-                            process_and_write_from_image, idx, arr, pv, det_keys, d_int, writer_lock
-                        ) for (idx, arr) in preload_buf
-                    ]
+
+                    futures = []
+                    for (idx, arr) in preload_buf:
+                        if arr.ndim == 2:
+                            futures.append(executor.submit(
+                                process_and_write_from_image, idx, arr, pv, det_keys, d_int, writer_lock
+                            ))
+                        elif arr.ndim == 3:
+                            futures.append(executor.submit(
+                                process_and_write_from_multidet_images, idx, arr, pv, det_keys, d_int, writer_lock
+                            ))
+                        else:
+                            raise ValueError(f"Unsupported preloaded image ndim={arr.ndim} shape={arr.shape}")
+
                     for f in concurrent.futures.as_completed(futures):
                         f.result()
                         completed += 1
@@ -260,14 +346,15 @@ def integrate_em(h5_folder: str,
                             elapsed = time.time() - processing_start
                             rate = completed / max(elapsed, 1e-6)
                             print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
+
                     del preload_buf
                     gc.collect()
 
             else:
-                # No preloading: each worker reads its own H5 (simplest; lowest RAM)
                 next_i = 0
                 in_flight = {}
                 initial = min(max_workers, nframes)
+
                 for _ in range(initial):
                     fut = executor.submit(
                         process_and_write_from_path,
@@ -289,6 +376,7 @@ def integrate_em(h5_folder: str,
                             elapsed = time.time() - processing_start
                             rate = completed / max(elapsed, 1e-6)
                             print(f"  {completed}/{nframes} frames ({rate:.1f} fps)")
+
                         if next_i < nframes:
                             nfut = executor.submit(
                                 process_and_write_from_path,
