@@ -35,12 +35,9 @@ MEDIAN_FILTER_SIZE = 5
 INTENSITY_THRESHOLD = 0.7
 INFLATE_FACTOR = 20
 
-DEFAULT_OUTPUT_DIR = "/home/beams/PONSOT/Data/h5"
-
-# Preload chunk factor: frames per worker per chunk when preload="chunk"
+DEFAULT_OUTPUT_DIR = "/home/beams/PONSOT/Data/Feb26"
 DEFAULT_PRELOAD_FACTOR = 2
 
-# Where the raw 2D image(s) lives in each per-frame h5
 H5_IMAGE_DATASET = "exchange/data"
 
 
@@ -56,7 +53,6 @@ def load_h5_frame_files(h5_folder: str) -> Tuple[List[str], str]:
     ])
     if not h5_files:
         raise ValueError(f"No H5/HDF5 files found in {h5_folder}")
-
     experiment_name = os.path.commonprefix(h5_files).rstrip('_-.') or "experiment"
     return h5_files, experiment_name
 
@@ -74,46 +70,55 @@ def read_frame_image_from_h5(path: str, dataset_path: str = H5_IMAGE_DATASET) ->
     return img
 
 
+def collapse_stack_to_2d(img3d: np.ndarray, mode: str = "mean") -> np.ndarray:
+    """
+    Collapse a (n, ny, nx) stack into a single (ny, nx) image.
+    mode: 'mean' (default), 'sum', 'max', 'first'
+    """
+    mode = mode.lower()
+    if mode == "mean":
+        return np.mean(img3d, axis=0)
+    if mode == "sum":
+        return np.sum(img3d, axis=0)
+    if mode == "max":
+        return np.max(img3d, axis=0)
+    if mode == "first":
+        return img3d[0]
+    raise ValueError(f"Unknown stack collapse mode '{mode}'")
+
+
 def process_and_write_from_image(idx: int,
                                  image: np.ndarray,
                                  pv: PolarView,
                                  det_keys: List[str],
                                  d_int,
                                  writer_lock: threading.Lock) -> None:
-    # Ensure float32
     image = image.astype(np.float32, copy=False)
 
-    # Boolean mask
     mask = (image == SATURATION_VALUE) | (image <= 0)
     for val in BACKGROUND_VALUES:
         mask |= (np.abs(image - val) <= BACKGROUND_TOLERANCE)
 
-    # Background subtraction
     background = median_filter(image, size=MEDIAN_FILTER_SIZE)
     np.subtract(image, background, out=image)
     background = None
     image[mask] = 0.0
 
-    # Threshold + inflation
     idx_low = image <= INTENSITY_THRESHOLD
     image[idx_low] = 0.0
     np.multiply(image, INFLATE_FACTOR, out=image, where=image > 0)
 
-    # Polar warp (same image for all detectors)
     local_imsd = {det_key: image for det_key in det_keys}
     polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
 
-    # Integrate over full azimuthal (eta)
     if np.ma.isMaskedArray(polar_image):
         integrated_intensity = np.array(np.ma.average(polar_image, axis=0), dtype=np.float32)
     else:
         integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
 
-    # Thread-safe write
     with writer_lock:
         d_int[idx, :] = integrated_intensity
 
-    # Cleanup
     del local_imsd, polar_image, image, integrated_intensity
     gc.collect()
 
@@ -126,11 +131,9 @@ def process_and_write_from_multidet_images(idx: int,
                                           writer_lock: threading.Lock) -> None:
     """
     images_3d: shape (n_det, ny, nx) where n_det == len(det_keys)
-    Process each detector panel independently, then warp+integrate.
     """
     if images_3d.ndim != 3:
         raise ValueError(f"Expected 3D array (n_det, ny, nx), got shape {images_3d.shape}")
-
     if images_3d.shape[0] != len(det_keys):
         raise ValueError(
             f"First dimension of image stack ({images_3d.shape[0]}) "
@@ -139,7 +142,6 @@ def process_and_write_from_multidet_images(idx: int,
         )
 
     local_imsd = {}
-
     for det_i, det_key in enumerate(det_keys):
         image = images_3d[det_i].astype(np.float32, copy=False)
 
@@ -178,22 +180,26 @@ def process_and_write_from_path(idx: int,
                                 det_keys: List[str],
                                 d_int,
                                 writer_lock: threading.Lock,
-                                dataset_path: str = H5_IMAGE_DATASET) -> None:
+                                dataset_path: str = H5_IMAGE_DATASET,
+                                stack_mode: str = "mean") -> None:
     img = read_frame_image_from_h5(path, dataset_path=dataset_path)
 
-    # Common cases:
-    # - 2D (ny, nx): single assembled image
-    # - 3D (n_det, ny, nx): per-detector panels (e.g., 11 panels)
-    # - 3D (1, ny, nx): single image stored with leading singleton dim
+    # Normalize possible leading singleton
     if img.ndim == 3 and img.shape[0] == 1:
         img = img[0]
 
+    # If YAML has 1 detector but file contains a stack (e.g., 31 repeats), collapse to 2D
+    if img.ndim == 3 and len(det_keys) == 1 and img.shape[0] != len(det_keys):
+        img = collapse_stack_to_2d(img, mode=stack_mode)
+
     if img.ndim == 2:
         process_and_write_from_image(idx, img, pv, det_keys, d_int, writer_lock)
-    elif img.ndim == 3:
+    elif img.ndim == 3 and img.shape[0] == len(det_keys):
         process_and_write_from_multidet_images(idx, img, pv, det_keys, d_int, writer_lock)
     else:
-        raise ValueError(f"Unsupported image ndim={img.ndim} for file {path} with shape {img.shape}")
+        raise ValueError(
+            f"Unsupported image shape for file {path}: shape={img.shape}, det_keys={det_keys}"
+        )
 
 
 def integrate_em(h5_folder: str,
@@ -203,7 +209,8 @@ def integrate_em(h5_folder: str,
                  max_workers: Optional[int] = None,
                  preload: str = "none",
                  preload_factor: int = DEFAULT_PRELOAD_FACTOR,
-                 dataset_path: str = H5_IMAGE_DATASET) -> str:
+                 dataset_path: str = H5_IMAGE_DATASET,
+                 stack_mode: str = "mean") -> str:
 
     print("=" * 70)
     print("POLAR INTEGRATION WORKFLOW")
@@ -221,11 +228,11 @@ def integrate_em(h5_folder: str,
     nframes = len(h5_files)
     print(f"Found {nframes} frames | Experiment: {experiment_name}")
     print(f"Reading per-frame images from dataset: '{dataset_path}'")
+    print(f"Stack collapse mode (when needed): '{stack_mode}'")
 
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"{experiment_name}.h5")
 
-    # Pixel resolution (degrees)
     tth_stats, eta_stats = np.degrees(instrument.hedm_instrument.pixel_resolution(instr))
 
     pv = PolarView(
@@ -240,7 +247,6 @@ def integrate_em(h5_folder: str,
     print(f"2θ: {TTH_MIN}-{TTH_MAX}° | η: {ETA_MIN}-{ETA_MAX}°")
     print(f"Polar image shape (eta, tth): {pv.shape}")
 
-    # Axes
     tth = np.linspace(pv.tth_min, pv.tth_max, pv.shape[1]) * 180 / np.pi
     q_values = tth_to_q(tth, wavelength)
     time_axis = np.arange(nframes) * FRAME_DURATION_MS / 1000.0
@@ -261,8 +267,8 @@ def integrate_em(h5_folder: str,
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
         h5_file.attrs["input_frame_dataset"] = dataset_path
+        h5_file.attrs["stack_mode"] = stack_mode
 
-        # Concurrency
         if max_workers is None:
             max_workers = min(16, os.cpu_count() or 1)
         print(f"Processing with {max_workers} workers...")
@@ -271,7 +277,6 @@ def integrate_em(h5_folder: str,
         processing_start = time.time()
         completed = 0
 
-        # Normalize preload mode
         preload = preload.lower()
         if preload not in ("none", "chunk", "all"):
             print(f"Unknown preload mode '{preload}', defaulting to 'none'")
@@ -287,6 +292,8 @@ def integrate_em(h5_folder: str,
                     img = read_frame_image_from_h5(p, dataset_path=dataset_path)
                     if img.ndim == 3 and img.shape[0] == 1:
                         img = img[0]
+                    if img.ndim == 3 and len(det_keys) == 1 and img.shape[0] != len(det_keys):
+                        img = collapse_stack_to_2d(img, mode=stack_mode)
                     images.append(img)
 
                 print("Submitting all tasks...")
@@ -296,12 +303,12 @@ def integrate_em(h5_folder: str,
                         futures.append(executor.submit(
                             process_and_write_from_image, i, images[i], pv, det_keys, d_int, writer_lock
                         ))
-                    elif images[i].ndim == 3:
+                    elif images[i].ndim == 3 and images[i].shape[0] == len(det_keys):
                         futures.append(executor.submit(
                             process_and_write_from_multidet_images, i, images[i], pv, det_keys, d_int, writer_lock
                         ))
                     else:
-                        raise ValueError(f"Unsupported preloaded image ndim={images[i].ndim} shape={images[i].shape}")
+                        raise ValueError(f"Unsupported preloaded image shape={images[i].shape}")
 
                 for f in concurrent.futures.as_completed(futures):
                     f.result()
@@ -317,6 +324,7 @@ def integrate_em(h5_folder: str,
             elif preload == "chunk":
                 chunk_size = max(1, preload_factor * max_workers)
                 print(f"Chunked preloading with chunk_size={chunk_size} (factor={preload_factor})")
+
                 for start in range(0, nframes, chunk_size):
                     end = min(start + chunk_size, nframes)
                     preload_buf = []
@@ -324,20 +332,22 @@ def integrate_em(h5_folder: str,
                         img = read_frame_image_from_h5(paths[i], dataset_path=dataset_path)
                         if img.ndim == 3 and img.shape[0] == 1:
                             img = img[0]
+                        if img.ndim == 3 and len(det_keys) == 1 and img.shape[0] != len(det_keys):
+                            img = collapse_stack_to_2d(img, mode=stack_mode)
                         preload_buf.append((i, img))
 
                     futures = []
-                    for (idx, arr) in preload_buf:
+                    for (ii, arr) in preload_buf:
                         if arr.ndim == 2:
                             futures.append(executor.submit(
-                                process_and_write_from_image, idx, arr, pv, det_keys, d_int, writer_lock
+                                process_and_write_from_image, ii, arr, pv, det_keys, d_int, writer_lock
                             ))
-                        elif arr.ndim == 3:
+                        elif arr.ndim == 3 and arr.shape[0] == len(det_keys):
                             futures.append(executor.submit(
-                                process_and_write_from_multidet_images, idx, arr, pv, det_keys, d_int, writer_lock
+                                process_and_write_from_multidet_images, ii, arr, pv, det_keys, d_int, writer_lock
                             ))
                         else:
-                            raise ValueError(f"Unsupported preloaded image ndim={arr.ndim} shape={arr.shape}")
+                            raise ValueError(f"Unsupported preloaded image shape={arr.shape}")
 
                     for f in concurrent.futures.as_completed(futures):
                         f.result()
@@ -358,7 +368,8 @@ def integrate_em(h5_folder: str,
                 for _ in range(initial):
                     fut = executor.submit(
                         process_and_write_from_path,
-                        next_i, paths[next_i], pv, det_keys, d_int, writer_lock, dataset_path
+                        next_i, paths[next_i], pv, det_keys, d_int, writer_lock,
+                        dataset_path, stack_mode
                     )
                     in_flight[fut] = next_i
                     next_i += 1
@@ -380,7 +391,8 @@ def integrate_em(h5_folder: str,
                         if next_i < nframes:
                             nfut = executor.submit(
                                 process_and_write_from_path,
-                                next_i, paths[next_i], pv, det_keys, d_int, writer_lock, dataset_path
+                                next_i, paths[next_i], pv, det_keys, d_int, writer_lock,
+                                dataset_path, stack_mode
                             )
                             in_flight[nfut] = next_i
                             next_i += 1
@@ -425,6 +437,8 @@ if __name__ == "__main__":
                         help="Frames per worker per chunk when preload='chunk'")
     parser.add_argument("--dataset_path", default=H5_IMAGE_DATASET,
                         help="Dataset path inside each per-frame H5 (default: exchange/data)")
+    parser.add_argument("--stack_mode", default="mean", choices=["mean", "sum", "max", "first"],
+                        help="How to collapse a (n,ny,nx) stack when YAML has 1 detector (default: mean)")
     args = parser.parse_args()
 
     integrate_em(
@@ -435,5 +449,6 @@ if __name__ == "__main__":
         args.max_workers,
         args.preload,
         args.preload_factor,
-        args.dataset_path
+        args.dataset_path,
+        args.stack_mode
     )
