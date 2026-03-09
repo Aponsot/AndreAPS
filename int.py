@@ -26,6 +26,7 @@ TTH_MIN = 1.0
 TTH_MAX = 14.0
 ETA_MIN = -180.0
 ETA_MAX = 180.0
+ETA_BIN_SIZE = 1.0   # 1 degree cakes
 NDIV = 3
 
 SATURATION_VALUE = 2**32 - 1
@@ -87,6 +88,23 @@ def collapse_stack_to_2d(img3d: np.ndarray, mode: str = "mean") -> np.ndarray:
     raise ValueError(f"Unknown stack collapse mode '{mode}'")
 
 
+def write_caked_result(idx: int,
+                       polar_image,
+                       d_int,
+                       writer_lock: threading.Lock) -> None:
+    """
+    Save full cake data with output ordering:
+        d_int[eta_index, frame_index, q_index]
+    """
+    if np.ma.isMaskedArray(polar_image):
+        polar_out = np.ma.filled(polar_image, np.nan).astype(np.float32)
+    else:
+        polar_out = np.asarray(polar_image, dtype=np.float32)
+
+    with writer_lock:
+        d_int[:, idx, :] = polar_out
+
+
 def process_and_write_from_image(idx: int,
                                  image: np.ndarray,
                                  pv: PolarView,
@@ -111,24 +129,18 @@ def process_and_write_from_image(idx: int,
     local_imsd = {det_key: image for det_key in det_keys}
     polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
 
-    if np.ma.isMaskedArray(polar_image):
-        integrated_intensity = np.array(np.ma.average(polar_image, axis=0), dtype=np.float32)
-    else:
-        integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
+    write_caked_result(idx, polar_image, d_int, writer_lock)
 
-    with writer_lock:
-        d_int[idx, :] = integrated_intensity
-
-    del local_imsd, polar_image, image, integrated_intensity
+    del local_imsd, polar_image, image
     gc.collect()
 
 
 def process_and_write_from_multidet_images(idx: int,
-                                          images_3d: np.ndarray,
-                                          pv: PolarView,
-                                          det_keys: List[str],
-                                          d_int,
-                                          writer_lock: threading.Lock) -> None:
+                                           images_3d: np.ndarray,
+                                           pv: PolarView,
+                                           det_keys: List[str],
+                                           d_int,
+                                           writer_lock: threading.Lock) -> None:
     """
     images_3d: shape (n_det, ny, nx) where n_det == len(det_keys)
     """
@@ -162,15 +174,9 @@ def process_and_write_from_multidet_images(idx: int,
 
     polar_image = pv.warp_image(local_imsd, pad_with_nans=True, do_interpolation=True)
 
-    if np.ma.isMaskedArray(polar_image):
-        integrated_intensity = np.array(np.ma.average(polar_image, axis=0), dtype=np.float32)
-    else:
-        integrated_intensity = np.nanmean(polar_image, axis=0).astype(np.float32)
+    write_caked_result(idx, polar_image, d_int, writer_lock)
 
-    with writer_lock:
-        d_int[idx, :] = integrated_intensity
-
-    del local_imsd, polar_image, integrated_intensity
+    del local_imsd, polar_image
     gc.collect()
 
 
@@ -240,34 +246,44 @@ def integrate_em(h5_folder: str,
         instr,
         ETA_MIN,
         ETA_MAX,
-        pixel_size=(tth_stats[1] / NDIV, eta_stats[1] / NDIV),
+        pixel_size=(tth_stats[1] / NDIV, ETA_BIN_SIZE),
         cache_coordinate_map=True
     )
 
     print(f"2θ: {TTH_MIN}-{TTH_MAX}° | η: {ETA_MIN}-{ETA_MAX}°")
+    print(f"Eta cake size: {ETA_BIN_SIZE}°")
     print(f"Polar image shape (eta, tth): {pv.shape}")
 
     tth = np.linspace(pv.tth_min, pv.tth_max, pv.shape[1]) * 180 / np.pi
     q_values = tth_to_q(tth, wavelength)
+    eta_values = np.linspace(ETA_MIN + 0.5 * ETA_BIN_SIZE,
+                             ETA_MAX - 0.5 * ETA_BIN_SIZE,
+                             pv.shape[0])
     time_axis = np.arange(nframes) * FRAME_DURATION_MS / 1000.0
 
     print(f"\nSaving to {output_file}...")
     with h5py.File(output_file, 'w') as h5_file:
         d_int = h5_file.create_dataset(
             "int",
-            shape=(nframes, pv.shape[1]),
+            shape=(pv.shape[0], nframes, pv.shape[1]),
             dtype='f4',
-            chunks=(min(256, nframes), pv.shape[1]),
+            chunks=(1, min(64, nframes), pv.shape[1]),
             compression="gzip"
         )
         h5_file.create_dataset("q", data=q_values)
+        h5_file.create_dataset("eta", data=eta_values)
         h5_file.create_dataset("time", data=time_axis)
+
         h5_file.attrs["experiment_name"] = experiment_name
         h5_file.attrs["nframes"] = nframes
+        h5_file.attrs["neta"] = pv.shape[0]
+        h5_file.attrs["nq"] = pv.shape[1]
         h5_file.attrs["energy_kev"] = ENERGY_KEV
         h5_file.attrs["wavelength_angstrom"] = wavelength
         h5_file.attrs["input_frame_dataset"] = dataset_path
         h5_file.attrs["stack_mode"] = stack_mode
+        h5_file.attrs["eta_bin_size_deg"] = ETA_BIN_SIZE
+        h5_file.attrs["data_order"] = "int[eta_index, frame_index, q_index]"
 
         if max_workers is None:
             max_workers = min(16, os.cpu_count() or 1)
@@ -404,9 +420,13 @@ def integrate_em(h5_folder: str,
             intensity_stack = h5_file["int"][...]
             q_values = h5_file["q"][...]
             time_axis = h5_file["time"][...]
+
+        # quick preview: eta-averaged over all cakes
+        preview = np.nanmean(intensity_stack, axis=0)  # (nframes, nq)
+
         fig, ax = plt.subplots(figsize=(10, 6))
         im = ax.imshow(
-            intensity_stack,
+            preview,
             aspect='auto',
             extent=[q_values.min(), q_values.max(), time_axis.min(), time_axis.max()],
             origin='lower',
@@ -415,7 +435,7 @@ def integrate_em(h5_folder: str,
         plt.colorbar(im, ax=ax, label='Intensity')
         ax.set_xlabel('q (Å⁻¹)')
         ax.set_ylabel('Time (s)')
-        ax.set_title(f"{experiment_name}")
+        ax.set_title(f"{experiment_name} (eta-averaged preview)")
         plt.tight_layout()
         plt.show()
 
@@ -429,7 +449,7 @@ if __name__ == "__main__":
     parser.add_argument("h5_folder", help="Folder containing per-frame .h5/.hdf5 files")
     parser.add_argument("--instr_file", required=True, help="Instrument YAML file")
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help="Output directory")
-    parser.add_argument("--plot", action="store_true", help="Show plot")
+    parser.add_argument("--plot", action="store_true", help="Show preview plot")
     parser.add_argument("--max_workers", type=int, help="Parallel workers")
     parser.add_argument("--preload", choices=["none", "chunk", "all"], default="none",
                         help="Preloading mode: none (workers read), chunk (small batches), all (load all frames)")
